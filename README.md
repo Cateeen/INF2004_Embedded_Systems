@@ -1,7 +1,7 @@
 # INF2004_Embedded_Systems
 Embedded System Project
 
-## Buddy 2 — Motion Control
+## Buddy 2 - Motion Control
 
 **Status:** Initial implementation merged into `main`. Hardware integration and testing are pending.
 

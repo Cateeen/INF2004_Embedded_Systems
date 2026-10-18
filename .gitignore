@@ -1,0 +1,22 @@
+
+# Compiled executables
+*.exe
+
+# CMake build files
+build/
+cmake-build-*/
+
+# Python temporary files
+__pycache__/
+*.pyc
+
+# Generated firmware files
+*.elf
+*.uf2
+*.bin
+*.hex
+*.map
+*.dis
+
+# Local VS Code configuration
+.vscode/settings.json

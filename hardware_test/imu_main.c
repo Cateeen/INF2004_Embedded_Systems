@@ -53,15 +53,19 @@ int main(void) {
     // 1. Initialize USB Serial for printf
     stdio_init_all();
 
-    // Wait for the USB serial to connect (up to 5 seconds)
-    for (int i = 0; i < 50; i++) {
-        if (stdio_usb_connected()) break;
-        sleep_ms(100);
+    // Keep diagnostics visible when the monitor reconnects after a reset.
+    while (!stdio_usb_connected()) {
+        sleep_ms(50);
     }
     printf("\n=== Buddy 4: IMU LSM303DLHC Test ===\n");
+    stdio_flush();
+    printf("Starting Buddy 1 network initialization...\n");
+    stdio_flush();
 
     buddy1_t telemetry;
     buddy1_init(&telemetry, to_ms_since_boot(get_absolute_time()));
+    printf("Buddy 1 network initialization returned.\n");
+    stdio_flush();
     if (!telemetry.initialised) {
         printf("Wi-Fi/MQTT not initialized. Check include/wifi_mqtt_config.h "
                "and the Pico W network.\n");

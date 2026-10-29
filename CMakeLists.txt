@@ -55,3 +55,22 @@ target_link_libraries(buddy4_imu_test
 pico_enable_stdio_usb(buddy4_imu_test 1)
 pico_enable_stdio_uart(buddy4_imu_test 0)
 pico_add_extra_outputs(buddy4_imu_test)
+
+add_executable(buddy4_imu_only_test
+    hardware_test/imu_only_main.c
+    src/imu_driver.c
+    src/imu_processor.c
+)
+
+target_include_directories(buddy4_imu_only_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(buddy4_imu_only_test
+    pico_stdlib
+    hardware_i2c
+)
+
+pico_enable_stdio_usb(buddy4_imu_only_test 1)
+pico_enable_stdio_uart(buddy4_imu_only_test 0)
+pico_add_extra_outputs(buddy4_imu_only_test)

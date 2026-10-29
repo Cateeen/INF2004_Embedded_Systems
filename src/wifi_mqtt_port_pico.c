@@ -16,6 +16,7 @@
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define MQTT_COMMAND_PAYLOAD_SIZE 2U
@@ -198,15 +199,37 @@ static void resolve_broker(void)
 
 bool wifi_mqtt_port_init(void)
 {
+    int cyw43_result;
+
     if (initialized) {
+        printf("MQTT adapter: already initialized.\n");
+        stdio_flush();
         return true;
     }
-    if (!config_is_complete() || (cyw43_arch_init() != 0)) {
+    printf("MQTT adapter: checking local configuration...\n");
+    stdio_flush();
+    if (!config_is_complete()) {
+        printf("MQTT adapter: configuration is incomplete or invalid.\n");
+        stdio_flush();
         return false;
     }
 
+    printf("MQTT adapter: initializing Pico W networking...\n");
+    stdio_flush();
+    cyw43_result = cyw43_arch_init();
+    if (cyw43_result != 0) {
+        printf("MQTT adapter: Pico W networking init failed (%d).\n",
+               cyw43_result);
+        stdio_flush();
+        return false;
+    }
+
+    printf("MQTT adapter: Pico W networking initialized; allocating client...\n");
+    stdio_flush();
     mqtt_client = mqtt_client_new();
     if (mqtt_client == NULL) {
+        printf("MQTT adapter: MQTT client allocation failed.\n");
+        stdio_flush();
         cyw43_arch_deinit();
         return false;
     }
@@ -219,6 +242,8 @@ bool wifi_mqtt_port_init(void)
         (MQTT_PASSWORD[0] == '\0') ? NULL : MQTT_PASSWORD;
     mqtt_client_info.keep_alive = MQTT_KEEPALIVE_SECONDS;
     initialized = true;
+    printf("MQTT adapter: initialization complete.\n");
+    stdio_flush();
     return true;
 }
 

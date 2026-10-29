@@ -103,3 +103,18 @@ When using broker authentication, configure the MQTT username/password in the
 local header and pass equivalent options to the Mosquitto clients. The
 `buddy4_imu_test` target build checks compilation only; a live broker and
 physical Pico W are required to verify wireless operation.
+
+### IMU-only hardware diagnostic
+
+Use the independent `buddy4_imu_only_test` target to check the LSM303DLHC
+accelerometer without initializing the Pico W Wi-Fi stack or MQTT:
+
+```powershell
+ninja -C build buddy4_imu_only_test
+```
+
+Flash `build/buddy4_imu_only_test.uf2`, open the USB serial monitor, and press
+RESET. The test checks the accelerometer's `WHO_AM_I` register (expected
+`0x33`) and prints raw and scaled XYZ samples every 200 ms. If no device
+responds, it reports the configured I2C pins/address and retries once per
+second. This isolates the accelerometer test from Buddy 1 networking.

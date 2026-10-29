@@ -30,7 +30,7 @@
 #define GRAVITY_MS2         9.80665f
 #define ACCEL_SENS_2G       0.00105f   // g/LSB
 #define HUMP_THRESHOLD      0.3f        // m/s2
-#define SHOCK_THRESHOLD     2.5f        // g-force
+#define SHOCK_THRESHOLD     3.0f        // g-force
 #define TILT_THRESHOLD_DEG  45.0f
 #define ALPHA_HP            0.85f
 #define ALPHA_LP            0.20f

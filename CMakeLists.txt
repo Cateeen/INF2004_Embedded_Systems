@@ -34,9 +34,12 @@ pico_enable_stdio_uart(buddy2_hardware_test 0)
 pico_add_extra_outputs(buddy2_hardware_test)
 
 add_executable(buddy4_imu_test
-    hardware_test/imu_main.c        # Or whatever you named your test main file
+    hardware_test/imu_main.c
     src/imu_driver.c
     src/imu_processor.c
+    src/buddy1.c
+    src/telemetry_protocol.c
+    src/wifi_mqtt_port_pico.c
 )
 
 target_include_directories(buddy4_imu_test PRIVATE
@@ -45,7 +48,9 @@ target_include_directories(buddy4_imu_test PRIVATE
 
 target_link_libraries(buddy4_imu_test
     pico_stdlib
-    hardware_i2c                    # Required for your IMU
+    hardware_i2c
+    pico_cyw43_arch_lwip_poll
+    pico_lwip_mqtt
 )
 pico_enable_stdio_usb(buddy4_imu_test 1)
 pico_enable_stdio_uart(buddy4_imu_test 0)

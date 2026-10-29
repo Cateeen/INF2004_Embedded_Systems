@@ -25,6 +25,7 @@ typedef struct {
     uint8_t command_tail;
     uint8_t command_count;
     remote_command_t command_queue[BUDDY1_COMMAND_QUEUE_CAPACITY];
+    bool wifi_fault_pending;
     bool initialised;
 } buddy1_t;
 

@@ -21,17 +21,17 @@
 
 // Sensor Configuration Values
 #define LSM303_CTRL1_100HZ  0x57
-#define LSM303_CTRL4_4G     0x98
+#define LSM303_CTRL4_2G     0x00
 #define LSM303_CRA_M_15HZ   0x10
 #define LSM303_CRB_M_1_3G   0x20
 #define LSM303_MR_M_CONT    0x00
 
 // Algorithm Tunables
 #define GRAVITY_MS2         9.80665f
-#define ACCEL_SENS_4G       0.001197f   // g/LSB
+#define ACCEL_SENS_2G       0.00105f   // g/LSB
 #define HUMP_THRESHOLD      0.3f        // m/s2
-#define SHOCK_THRESHOLD     2.0f        // g-force
-#define TILT_THRESHOLD_DEG  30.0f
+#define SHOCK_THRESHOLD     2.5f        // g-force
+#define TILT_THRESHOLD_DEG  45.0f
 #define ALPHA_HP            0.85f
 #define ALPHA_LP            0.20f
 

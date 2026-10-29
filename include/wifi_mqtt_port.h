@@ -6,10 +6,9 @@
 #include <stdint.h>
 
 /*
- * Board/library adapter contract.
- * Implement these functions using the actual Wi-Fi hardware, MQTT library,
- * broker address, credentials and TLS policy selected by your team.
- * Functions should return promptly; do not put long waits inside them.
+ * Pico W adapter contract. Connection is asynchronous: call poll regularly
+ * while the application runs. Credentials and broker settings belong in the
+ * ignored local include/wifi_mqtt_config.h file.
  */
 
 typedef void (*mqtt_payload_callback_t)(const char *topic,
@@ -19,6 +18,7 @@ typedef void (*mqtt_payload_callback_t)(const char *topic,
 bool wifi_mqtt_port_init(void);
 bool wifi_mqtt_port_wifi_connected(void);
 bool wifi_mqtt_port_mqtt_connected(void);
+bool wifi_mqtt_port_connection_failed(void);
 bool wifi_mqtt_port_connect(void);
 void wifi_mqtt_port_disconnect(void);
 bool wifi_mqtt_port_subscribe(const char *topic);

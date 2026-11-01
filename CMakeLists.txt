@@ -3,13 +3,13 @@ cmake_minimum_required(VERSION 3.13)
 
 set(PICO_BOARD pico_w CACHE STRING "Target board")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
-
-project(INF2004_Embedded_Systems C CXX ASM)
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+
+set(PICO_SDK_PATH "C:/Users/User/.pico-sdk/sdk/1.5.1" CACHE PATH "Pico SDK")
+include(pico_sdk_import.cmake)
+
+project(INF2004_Embedded_Systems C CXX ASM)
 
 pico_sdk_init()
 
@@ -50,3 +50,26 @@ target_link_libraries(buddy4_imu_test
 pico_enable_stdio_usb(buddy4_imu_test 1)
 pico_enable_stdio_uart(buddy4_imu_test 0)
 pico_add_extra_outputs(buddy4_imu_test)
+
+add_executable(buddy5_obs
+    hardware_test/obs_main.c
+    src/obs_port_pico_bare.c
+    src/obs_pack.c
+    src/obs_profile.c
+    src/obs_scan.c
+)
+
+target_include_directories(buddy5_obs PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(buddy5_obs
+    pico_stdlib
+    hardware_pwm
+    hardware_clocks
+    m
+)
+
+pico_enable_stdio_usb(buddy5_obs 1)
+pico_enable_stdio_uart(buddy5_obs 0)
+pico_add_extra_outputs(buddy5_obs)

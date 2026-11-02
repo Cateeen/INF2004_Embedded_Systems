@@ -4,6 +4,16 @@
 #include "pico/stdlib.h"
 #include "motor_driver.h"
 
+/*
+ * Buddy 2 - Motor Driver Hardware Test
+ *
+ * Safe startup verification.
+ *
+ * Both motors remain stopped.
+ * Movement testing requires a separate,
+ * explicitly selected test program.
+ */
+
 int main(void)
 {
     stdio_init_all();

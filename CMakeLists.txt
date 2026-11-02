@@ -23,6 +23,7 @@ add_executable(buddy2_hardware_test
     src/wheel_feedback.c
     src/wheel_speed_control.c
     src/wheel_feedback_pid.c
+    src/motion_feedback_bridge.c
 )
 
 target_include_directories(buddy2_hardware_test PRIVATE

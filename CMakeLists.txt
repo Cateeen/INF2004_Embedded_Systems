@@ -1,4 +1,3 @@
-
 cmake_minimum_required(VERSION 3.13)
 
 set(PICO_BOARD pico_w CACHE STRING "Target board")
@@ -57,3 +56,20 @@ target_link_libraries(buddy4_imu_test
 pico_enable_stdio_usb(buddy4_imu_test 1)
 pico_enable_stdio_uart(buddy4_imu_test 0)
 pico_add_extra_outputs(buddy4_imu_test)
+
+add_executable(buddy3_ir_test
+    hardware_test/ir_sensor_test.c
+)
+
+target_include_directories(buddy3_ir_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(buddy3_ir_test
+    pico_stdlib
+    hardware_adc
+)
+
+pico_enable_stdio_usb(buddy3_ir_test 1)
+pico_enable_stdio_uart(buddy3_ir_test 0)
+pico_add_extra_outputs(buddy3_ir_test)

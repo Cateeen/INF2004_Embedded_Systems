@@ -77,6 +77,7 @@ pico_add_extra_outputs(buddy4_imu_test)
 
 add_executable(buddy3_ir_test
     hardware_test/ir_sensor_test.c
+    src/line_following.c
 )
 
 target_include_directories(buddy3_ir_test PRIVATE
@@ -91,6 +92,56 @@ target_link_libraries(buddy3_ir_test
 pico_enable_stdio_usb(buddy3_ir_test 1)
 pico_enable_stdio_uart(buddy3_ir_test 0)
 pico_add_extra_outputs(buddy3_ir_test)
+
+add_executable(buddy3_line_following_motion_test
+    tests/line_following_motion_test.c
+    src/line_following.c
+    src/motor_driver.c
+)
+
+target_include_directories(buddy3_line_following_motion_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(buddy3_line_following_motion_test
+    pico_stdlib
+    hardware_adc
+    hardware_pwm
+    hardware_clocks
+)
+
+pico_enable_stdio_usb(buddy3_line_following_motion_test 1)
+pico_enable_stdio_uart(buddy3_line_following_motion_test 0)
+pico_add_extra_outputs(buddy3_line_following_motion_test)
+
+add_library(barcode_scanner STATIC
+    src/barcode_scanner.c
+)
+
+target_include_directories(barcode_scanner PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+add_executable(buddy3_barcode_test
+    tests/barcode_test.c
+    src/barcode_scanner.c
+    src/line_following.c
+    src/encoder.c
+)
+
+target_include_directories(buddy3_barcode_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(buddy3_barcode_test
+    pico_stdlib
+    hardware_adc
+    hardware_gpio
+)
+
+pico_enable_stdio_usb(buddy3_barcode_test 1)
+pico_enable_stdio_uart(buddy3_barcode_test 0)
+pico_add_extra_outputs(buddy3_barcode_test)
 
 add_executable(buddy5_obs
     hardware_test/obs_main.c
@@ -121,6 +172,7 @@ add_executable(picocar
     src/obs_profile.c 
     src/obs_pack.c
     src/motor_driver.c
+    src/line_following.c
     integration/obs_port_pico_car.c
     integration/vehicle_ctrl.c)
 
@@ -130,7 +182,7 @@ target_include_directories(picocar PRIVATE
 
 # target_compile_definitions(picocar PRIVATE CAR_LINE_PIN=2 CAR_LINE_ACTIVE_LEVEL=0)   # real TCRT5000 D0, when wired
 target_link_libraries(picocar pico_stdlib pico_multicore pico_util
-    hardware_gpio hardware_pwm hardware_clocks m)
+    hardware_adc hardware_gpio hardware_pwm hardware_clocks m)
  
 pico_enable_stdio_usb(picocar 1)
 pico_enable_stdio_uart(picocar 0)

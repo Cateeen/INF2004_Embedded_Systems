@@ -16,6 +16,13 @@ add_executable(buddy2_hardware_test
     hardware_test/main.c
     src/motor_driver.c
     src/encoder.c
+    src/motion_control.c
+    src/pid_controller.c
+    src/wheel_odometry.c
+    src/wheel_feedback.c
+    src/wheel_speed_control.c
+    src/wheel_feedback_pid.c
+    src/motion_feedback_bridge.c
 )
 
 target_include_directories(buddy2_hardware_test PRIVATE

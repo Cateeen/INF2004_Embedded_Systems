@@ -1,5 +1,6 @@
 #include "imu_driver.h"
 #include "imu_config.h"
+#include "imu_types.h"
 #include "hardware/i2c.h"
 #include "pico/stdlib.h"
 
@@ -27,7 +28,7 @@ void imu_driver_init(void) {
 
     // config accelerometer
     lsm_write_reg(LSM303_ACCEL_ADDR, LSM303_REG_CTRL1_A, LSM303_CTRL1_100HZ);
-    lsm_write_reg(LSM303_ACCEL_ADDR, LSM303_REG_CTRL4_A, LSM303_CTRL4_4G);
+    lsm_write_reg(LSM303_ACCEL_ADDR, LSM303_REG_CTRL4_A, LSM303_CTRL4_2G);
 
     // config magnetometer
     lsm_write_reg(LSM303_MAG_ADDR, LSM303_REG_CRA_M, LSM303_CRA_M_15HZ);
@@ -41,11 +42,18 @@ void imu_driver_read_accel(accel_data_t *out) {
     uint8_t buf[6];
     lsm_read_regs(LSM303_ACCEL_ADDR, LSM303_REG_OUT_X_L_A, buf, 6);
 
-    out->raw_x = (int16_t)((buf[1] << 8) | buf[0]);
-    out->raw_y = (int16_t)((buf[3] << 8) | buf[2]);
-    out->raw_z = (int16_t)((buf[5] << 8) | buf[4]);
+    // 2. Shift right by 4 for 12-bit data alignment
+    int16_t raw_x = (int16_t)(buf[1] << 8 | buf[0]);
+    int16_t raw_y = (int16_t)(buf[3] << 8 | buf[2]);
+    int16_t raw_z = (int16_t)(buf[5] << 8 | buf[4]);
 
-    out->ax = out->raw_x * ACCEL_SENS_4G * GRAVITY_MS2;
-    out->ay = out->raw_y * ACCEL_SENS_4G * GRAVITY_MS2;
-    out->az = out->raw_z * ACCEL_SENS_4G * GRAVITY_MS2;
+    out->raw_x = raw_x >> 4;
+    out->raw_y = raw_y >> 4;
+    out->raw_z = raw_z >> 4;
+
+    // 3. Apply calibration factor and axis inversions
+    out->ax = -(out->raw_x * ACCEL_SENS_2G * GRAVITY_MS2);
+    out->ay = (out->raw_y * ACCEL_SENS_2G * GRAVITY_MS2);
+    out->az = -(out->raw_z * ACCEL_SENS_2G * GRAVITY_MS2);
+
 }

@@ -80,7 +80,7 @@ void imu_processor_update(imu_state_t *state, accel_data_t *accel) {
             state->tilt_detected = true;
             state->fsm_state = IMU_STATE_TILT;
         }
-        else if (dynamic_az > HUMP_THRESHOLD) {
+        else if (!check_tilt(accel) && dynamic_az > HUMP_THRESHOLD) {
             hump_start_ms = now;
             peak_velocity = 0.0f;
             state->hump_active = true;

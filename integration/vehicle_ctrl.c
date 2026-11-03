@@ -252,7 +252,7 @@ static void handle(const obs_msg_t *m)
         break;
 
     case OBS_MSG_FAULT_EVT:                      /* stay stopped (use motor_emergency_stop() for a latch) */
-        motor_brake_all();
+        motor_emergency_stop();    
         set_following(false);
         break;
 
@@ -275,6 +275,9 @@ void vc_task(void)
         bool go = vc_port_run_enabled();
 
         if (go && !s_prev_run) {
+            if (obs_get_state() != (uint8_t)OBS_STATE_FAULT) {
+                motor_clear_emergency_stop();
+            }
             set_following(true);                 /* (re)start from the bench "go" key */
         }
         s_prev_run = go;

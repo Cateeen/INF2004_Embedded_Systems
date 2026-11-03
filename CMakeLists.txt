@@ -6,7 +6,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-set(PICO_SDK_PATH "C:/Users/User/.pico-sdk/sdk/1.5.1" CACHE PATH "Pico SDK")
 include(pico_sdk_import.cmake)
 
 project(INF2004_Embedded_Systems C CXX ASM)

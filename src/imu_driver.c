@@ -42,7 +42,6 @@ void imu_driver_read_accel(accel_data_t *out) {
     uint8_t buf[6];
     lsm_read_regs(LSM303_ACCEL_ADDR, LSM303_REG_OUT_X_L_A, buf, 6);
 
-    // 2. Shift right by 4 for 12-bit data alignment
     int16_t raw_x = (int16_t)(buf[1] << 8 | buf[0]);
     int16_t raw_y = (int16_t)(buf[3] << 8 | buf[2]);
     int16_t raw_z = (int16_t)(buf[5] << 8 | buf[4]);
@@ -55,5 +54,4 @@ void imu_driver_read_accel(accel_data_t *out) {
     out->ax = -(out->raw_x * ACCEL_SENS_2G * GRAVITY_MS2);
     out->ay = (out->raw_y * ACCEL_SENS_2G * GRAVITY_MS2);
     out->az = -(out->raw_z * ACCEL_SENS_2G * GRAVITY_MS2);
-
 }

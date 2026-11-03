@@ -83,7 +83,10 @@ void obs_port_delay_ms(uint32_t ms) { g_ms += ms; }
 /**
  * Fake port: remembers the servo angle so measurements use it.
  */
-void obs_port_servo_deg(uint8_t deg) { g_deg = (float)deg; }
+void obs_port_servo_deg(uint8_t deg)
+{
+    g_deg = (float)deg - ((float)OBS_ANGLE_AHEAD_DEG - 90.0f);
+}
 
 /**
  * Fake port: simulated ultrasonic measurement.

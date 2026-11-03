@@ -143,6 +143,8 @@ bool obs_profile_compute(const uint8_t *packed, uint8_t n, uint8_t angle0_deg, u
                 if (c < right_c) { right_c = c; }
             }
         }
+        if (blocked_first) { right_c = 0.0f; }
+        if (blocked_last)  { left_c = 0.0f; }
         out->right_mm = ((right_c < 1.0e8f) ? sat16(right_c, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
         out->left_mm  = ((left_c < 1.0e8f) ? sat16(left_c, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
     }

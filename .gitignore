@@ -20,3 +20,6 @@ __pycache__/
 
 # Local VS Code configuration
 .vscode/settings.json
+
+# Local Wi-Fi and MQTT credentials
+include/wifi_mqtt_config.h

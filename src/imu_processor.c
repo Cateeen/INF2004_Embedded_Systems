@@ -80,7 +80,7 @@ void imu_processor_update(imu_state_t *state, accel_data_t *accel) {
             state->tilt_detected = true;
             state->fsm_state = IMU_STATE_TILT;
         }
-        else if (dynamic_az > HUMP_THRESHOLD) {
+        else if (!check_tilt(accel) && dynamic_az > HUMP_THRESHOLD) {
             hump_start_ms = now;
             peak_velocity = 0.0f;
             state->hump_active = true;
@@ -103,8 +103,12 @@ void imu_processor_update(imu_state_t *state, accel_data_t *accel) {
             state->current_hump_m = (peak_velocity * peak_velocity) / (2.0f * GRAVITY_MS2);
 
             // record the highest hump
-            if (state->current_hump_m > state->hump_peak_m) {
+            if (state->current_hump_m > 0.015f) {
+                if (state->current_hump_m > state->hump_peak_m) {
                 state->hump_peak_m = state->current_hump_m;
+                }
+            } else {
+                state->current_hump_m = 0.0f; // reject noise
             }
             // descending
             state->fsm_state = IMU_STATE_HUMP_FALLING;

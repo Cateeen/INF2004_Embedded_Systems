@@ -25,9 +25,9 @@
 /* ------------------------------------------------------------------ */
 /* Configuration                                                       */
 /* ------------------------------------------------------------------ */
-#define IR_BARCODE_GPIO         (26U)   /* ADC0 - EDIT to match wiring */
+#define IR_BARCODE_GPIO         (28U)   /* ADC2 - EDIT to match wiring */
 #define IR_CENTER_GPIO          (27U)   /* ADC1 - EDIT to match wiring */
-#define IR_RIGHT_GPIO           (28U)   /* ADC2 - EDIT to match wiring */
+#define IR_RIGHT_GPIO           (26U)   /* ADC0 - EDIT to match wiring */
 
 #define ADC_GPIO_BASE           (26U)   /* GPIO26 == ADC input 0       */
 #define NUM_SENSORS             (3U)

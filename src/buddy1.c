@@ -10,6 +10,7 @@
 
 #define PUBLISH_INTERVAL_MS 1000U
 #define RETRY_INTERVAL_MS   1000U
+#define CONNECTION_TIMEOUT_MS 15000U
 #define MQTT_QOS             0U
 
 static buddy1_t *g_instance;
@@ -77,7 +78,11 @@ void buddy1_set_telemetry(buddy1_t *b, const telemetry_data_t *data)
     if ((b == NULL) || (data == NULL)) return;
     /* Validate by attempting to pack; do not accept out-of-range fields. */
     uint8_t packet[TELEMETRY_PACKET_SIZE];
-    if (telemetry_pack(data, packet)) b->latest = *data;
+    if (telemetry_pack(data, packet)) {
+        uint8_t sequence = b->latest.sequence;
+        b->latest = *data;
+        b->latest.sequence = sequence;
+    }
 }
 
 void buddy1_set_faults(buddy1_t *b, uint8_t fault_flags)
@@ -90,16 +95,13 @@ void buddy1_set_faults(buddy1_t *b, uint8_t fault_flags)
 static void try_connect(buddy1_t *b, uint32_t now_ms)
 {
     b->network_state = NET_CONNECTING;
-    if (wifi_mqtt_port_connect() &&
-        wifi_mqtt_port_wifi_connected() &&
-        wifi_mqtt_port_mqtt_connected()) {
-        (void)wifi_mqtt_port_subscribe(COMMAND_TOPIC);
-        b->network_state = NET_CONNECTED;
-        b->latest.fault_flags &= (uint8_t)~FAULT_WIFI_LOSS;
-        b->last_publish_ms = now_ms - PUBLISH_INTERVAL_MS;
+    if (wifi_mqtt_port_connect()) {
+        b->next_retry_ms = now_ms + CONNECTION_TIMEOUT_MS;
     } else {
+        wifi_mqtt_port_disconnect();
         b->network_state = NET_RECONNECT_WAIT;
         b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+        b->wifi_fault_pending = true;
         b->latest.fault_flags |= FAULT_WIFI_LOSS;
     }
 }
@@ -110,12 +112,17 @@ static void publish_status(buddy1_t *b, uint32_t now_ms)
     b->latest.message_type = MSG_TELEMETRY;
     b->latest.sequence = (uint8_t)((b->latest.sequence + 1U) & 0x7FU);
     b->latest.fault_flags = (uint8_t)(b->fault_flags & FAULT_ALL);
+    if (b->wifi_fault_pending) {
+        b->latest.fault_flags |= FAULT_WIFI_LOSS;
+    }
 
     if (!telemetry_pack(&b->latest, packet)) return;
     if (!wifi_mqtt_port_publish(TELEMETRY_TOPIC, packet,
                                 TELEMETRY_PACKET_SIZE, MQTT_QOS, false)) {
+        wifi_mqtt_port_disconnect();
         b->network_state = NET_RECONNECT_WAIT;
         b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+        b->wifi_fault_pending = true;
         b->latest.fault_flags |= FAULT_WIFI_LOSS;
         return;
     }
@@ -132,6 +139,7 @@ static void publish_status(buddy1_t *b, uint32_t now_ms)
                                      sizeof(b->latest.fault_flags),
                                      MQTT_QOS, false);
     }
+    b->wifi_fault_pending = false;
     b->last_publish_ms = now_ms;
 }
 
@@ -142,18 +150,42 @@ void buddy1_poll(buddy1_t *b, uint32_t now_ms)
     /* Must be a short, cooperative poll; adapter must not busy-wait. */
     wifi_mqtt_port_poll();
 
-    if (!wifi_mqtt_port_wifi_connected() ||
-        !wifi_mqtt_port_mqtt_connected()) {
-        if (b->network_state != NET_RECONNECT_WAIT) {
-            b->latest.fault_flags |= FAULT_WIFI_LOSS;
-            b->network_state = NET_RECONNECT_WAIT;
-            b->next_retry_ms = now_ms;
-        }
-    }
-
     if (b->network_state == NET_DISCONNECTED) {
         b->next_retry_ms = now_ms;
         b->network_state = NET_RECONNECT_WAIT;
+    }
+
+    if (b->network_state == NET_CONNECTED &&
+        (!wifi_mqtt_port_wifi_connected() ||
+         !wifi_mqtt_port_mqtt_connected())) {
+        wifi_mqtt_port_disconnect();
+        b->latest.fault_flags |= FAULT_WIFI_LOSS;
+        b->wifi_fault_pending = true;
+        b->network_state = NET_RECONNECT_WAIT;
+        b->next_retry_ms = now_ms;
+    }
+
+    if (b->network_state == NET_CONNECTING) {
+        if (wifi_mqtt_port_wifi_connected() &&
+            wifi_mqtt_port_mqtt_connected()) {
+            if (wifi_mqtt_port_subscribe(COMMAND_TOPIC)) {
+                b->network_state = NET_CONNECTED;
+                b->last_publish_ms = now_ms - PUBLISH_INTERVAL_MS;
+            } else {
+                wifi_mqtt_port_disconnect();
+                b->network_state = NET_RECONNECT_WAIT;
+                b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+                b->wifi_fault_pending = true;
+                b->latest.fault_flags |= FAULT_WIFI_LOSS;
+            }
+        } else if (wifi_mqtt_port_connection_failed() ||
+                   time_reached(now_ms, b->next_retry_ms)) {
+            wifi_mqtt_port_disconnect();
+            b->network_state = NET_RECONNECT_WAIT;
+            b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+            b->wifi_fault_pending = true;
+            b->latest.fault_flags |= FAULT_WIFI_LOSS;
+        }
     }
 
     if (b->network_state == NET_RECONNECT_WAIT &&

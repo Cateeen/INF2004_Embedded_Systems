@@ -11,6 +11,7 @@
 #include "obs_port.h"
 #include "obs_profile.h"
 #include <string.h>
+#include <stdio.h>
 
 typedef struct {                 // 31 bits, task-private
     uint32_t state          : 3; // 3 bits for state obs_state_t
@@ -28,7 +29,7 @@ typedef enum { MEAS_OK = 0, MEAS_NONE, MEAS_FAULT } meas_t;
 
 static obs_ctx_t s_ctx;
 static uint8_t   s_cur_deg;
-static uint8_t   s_coarse[8];                    /* 5 x 12 bit = 60 bit */
+static uint8_t   s_coarse[(OBS_COARSE_COUNT * OBS_DIST_BITS + 7U) / 8U];   /* 6 x 12 bit = 72 bit = 9 bytes */
 static uint8_t   s_coarse_blocked;               /* 5-bit mask          */
 static uint8_t   s_fine[(OBS_FINE_MAX_SAMPLES * OBS_DIST_BITS + 7U) / 8U];
 static uint16_t  s_scan_t0, s_phase_t0;          /* 16-bit ms, wraps ~65 s */
@@ -259,7 +260,7 @@ static void step_idle(void)
 }
 
 /**
- * step_coarse - COARSE_SCAN state: look at five angles (30, 60, 90, 120, 150).
+ * step_coarse - COARSE_SCAN state: look at five angles (80, 90, 100, 110, 120).
  * What it does: measures each angle, stores the distances and builds a 5-bit mask
  * of angles with something closer than OBS_BLOCK_MM. The sweep direction
  * alternates each scan to save servo travel. Records the duration (NFR3 evidence).
@@ -270,6 +271,7 @@ static void step_coarse(void)
 {
     uint16_t t0 = now16();
     uint8_t k;
+    uint8_t j;
 
     s_coarse_blocked = 0U;
     for (k = 0U; k < OBS_COARSE_COUNT; k++) {
@@ -293,6 +295,13 @@ static void step_coarse(void)
     s_last_coarse_ms = since(t0);                              /* NFR3 evidence */
 
     if (s_coarse_blocked == 0U) {
+        printf("[COARSE]");
+        for (j = 0U; j < OBS_COARSE_COUNT; j++) {
+            uint32_t d = obs_bits_get(s_coarse, (uint32_t)j * OBS_DIST_BITS, OBS_DIST_BITS);
+            printf(" %u:", (unsigned)(OBS_ANGLE_MIN_DEG + (uint32_t)j * OBS_COARSE_STEP_DEG));
+            if (d == OBS_DIST_NONE) { printf("--"); } else { printf("%lu", (unsigned long)d); }
+        }
+        printf("\n");
         send_simple(OBS_MSG_SCAN_CLEAR, (s_last_coarse_ms > 1023U) ? 1023U : s_last_coarse_ms);
         s_ctx.rescans = 0U;
         to_idle();
@@ -302,9 +311,9 @@ static void step_coarse(void)
 }
 
 /**
- * step_fine - FINE_SCAN state: sweep in 5-degree steps around the blocked region.
+ * step_fine - FINE_SCAN state: s   weep in 5-degree steps around the blocked region.
  * What it does: finds the first and last blocked coarse angle, widens the range by
- * one coarse step on each side (clipped to 30..150 deg), then measures every
+ * one coarse step on each side (clipped to 80..120 deg), then measures every
  * OBS_FINE_STEP_DEG degrees and stores the results. Remembers the start angle and
  * sample count for the profiling step.
  * Next state: PROFILING; sensor fault -> FAULT; ABORT -> IDLE.
@@ -328,7 +337,11 @@ static void step_fine(void)
     hi = OBS_ANGLE_MIN_DEG + (uint32_t)last * OBS_COARSE_STEP_DEG;
     lo = (lo > (OBS_ANGLE_MIN_DEG + OBS_COARSE_STEP_DEG)) ? (lo - OBS_COARSE_STEP_DEG) : OBS_ANGLE_MIN_DEG;
     hi = ((hi + OBS_COARSE_STEP_DEG) < OBS_ANGLE_MAX_DEG) ? (hi + OBS_COARSE_STEP_DEG) : OBS_ANGLE_MAX_DEG;
+    lo = OBS_ANGLE_MIN_DEG + ((lo - OBS_ANGLE_MIN_DEG) / OBS_FINE_STEP_DEG) * OBS_FINE_STEP_DEG;   /* snap to the 5 deg grid so profiling rebuilds the same angles */
     n = ((hi - lo) / OBS_FINE_STEP_DEG) + 1U;
+    if (n > OBS_FINE_MAX_SAMPLES) {
+        n = OBS_FINE_MAX_SAMPLES;
+    }
 
     for (k = 0U; k < n; k++) {
         uint16_t mm = 0U;
@@ -366,6 +379,13 @@ static void step_profiling(void)
     obs_msg_t m;
 
     s_last_scan_ms = since(s_scan_t0);
+    printf("[FINE]");
+    for (uint8_t j = 0U; j < s_ctx.fine_n; j++) {
+        uint32_t d = obs_bits_get(s_fine, j * OBS_DIST_BITS, OBS_DIST_BITS);
+        printf(" %u:", (unsigned)(OBS_ANGLE_MIN_DEG + (s_ctx.fine_lo_idx + j) * OBS_FINE_STEP_DEG));
+        if (d == OBS_DIST_NONE) { printf("--"); } else { printf("%lu", (unsigned long)d); }
+    }
+    printf("\n");
     if (!obs_profile_compute(s_fine, (uint8_t)s_ctx.fine_n,
                              (uint8_t)(OBS_ANGLE_MIN_DEG + s_ctx.fine_lo_idx * OBS_FINE_STEP_DEG),
                              OBS_FINE_STEP_DEG, &p)) {
@@ -443,7 +463,13 @@ static void step_bypassing(void)
         if (r == MEAS_FAULT) {
             raise_fault(OBS_FAULT_NO_ECHO);
         } else if ((r == MEAS_OK) && (mm < OBS_ABORT_MM)) {
-            raise_fault(OBS_FAULT_BYPASS_BLOCKED);
+            printf("[BYPASS] close ping %u mm\n", (unsigned)mm);   /* temporary; add #include <stdio.h> */
+            s_ctx.deb = (s_ctx.deb < 3U) ? (s_ctx.deb + 1U) : 3U;
+            if (s_ctx.deb >= 2U) {                  /* need 2 in a row */
+                raise_fault(OBS_FAULT_BYPASS_BLOCKED);
+            }   
+        } else {
+            s_ctx.deb = 0U;
         }
     }
 }

@@ -73,3 +73,24 @@ target_link_libraries(buddy5_obs
 pico_enable_stdio_usb(buddy5_obs 1)
 pico_enable_stdio_uart(buddy5_obs 0)
 pico_add_extra_outputs(buddy5_obs)
+
+add_executable(picocar
+    integration/car_main.c
+    src/obs_scan.c 
+    src/obs_profile.c 
+    src/obs_pack.c
+    src/motor_driver.c
+    integration/obs_port_pico_car.c
+    integration/vehicle_ctrl.c)
+
+target_include_directories(picocar PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+# target_compile_definitions(picocar PRIVATE CAR_LINE_PIN=2 CAR_LINE_ACTIVE_LEVEL=0)   # real TCRT5000 D0, when wired
+target_link_libraries(picocar pico_stdlib pico_multicore pico_util
+    hardware_gpio hardware_pwm hardware_clocks m)
+ 
+pico_enable_stdio_usb(picocar 1)
+pico_enable_stdio_uart(picocar 0)
+pico_add_extra_outputs(picocar)

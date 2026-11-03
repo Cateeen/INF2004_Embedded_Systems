@@ -45,7 +45,7 @@ bool obs_profile_compute(const uint8_t *packed, uint8_t n, uint8_t angle0_deg, u
     }
 
     for (i = 0U; i < n; i++) {
-        float rad = (float)(angle0_deg + (uint32_t)i * step_deg) * (PI_F / 180.0f);
+        float rad = ((float)(angle0_deg + (uint32_t)i * step_deg) - (float)(OBS_ANGLE_AHEAD_DEG - 90U))* (PI_F / 180.0f);
         dist[i] = obs_bits_get(packed, (uint32_t)i * OBS_DIST_BITS, OBS_DIST_BITS);
         px[i] = (float)dist[i] * cosf(rad);
         py[i] = (float)dist[i] * sinf(rad);
@@ -95,6 +95,13 @@ bool obs_profile_compute(const uint8_t *packed, uint8_t n, uint8_t angle0_deg, u
     blocked_first = (cid[0] == best);
     blocked_last = (cid[n - 1U] == best);
 
+    /* Window filled: that edge is outside the scan, so push it out by the beam half-angle. */
+    {
+        float beam = tanf(15.0f * (PI_F / 180.0f));
+        if (blocked_first) { xr += d_xr * beam; }
+        if (blocked_last)  { xl -= d_xl * beam; }
+    }
+
     /* Pull each edge in by the beam half-angle error (calibrate). */
     {
         float trim = tanf(OBS_BEAM_TRIM_DEG * (PI_F / 180.0f));
@@ -107,21 +114,37 @@ bool obs_profile_compute(const uint8_t *packed, uint8_t n, uint8_t angle0_deg, u
         }
     }
 
-    /* Nearest non-obstacle object on each side, for clearance. */
+    /* Nearest non-obstacle object on each side, for clearance.
+     * Side is decided by sample index, not by x: a lower angle is the robot's right, a higher
+     * angle is its left. An object that lies inside the obstacle's x-span but sits on one side
+     * of it in the scan therefore gives 0 clearance instead of being ignored. */
     {
-        float right_obj = 1.0e9f, left_obj = -1.0e9f;
+        uint8_t i_first = 0xFFU, i_last = 0U;
+        float right_c = 1.0e9f, left_c = 1.0e9f;
+
         for (i = 0U; i < n; i++) {
-            uint32_t d = dist[i];
-            if ((cid[i] != best) && (d != OBS_DIST_NONE) && (d < OBS_SIDE_RANGE_MM)) {
-                float x = px[i];
-                if ((x > xr) && (x < right_obj)) { right_obj = x; }
-                if ((x < xl) && (x > left_obj)) { left_obj = x; }
+            if (cid[i] == best) {
+                if (i_first == 0xFFU) { i_first = i; }
+                i_last = i;
             }
         }
-        out->right_mm = blocked_first ? 0U
-                      : ((right_obj < 1.0e8f) ? sat16(right_obj - xr, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
-        out->left_mm  = blocked_last ? 0U
-                      : ((left_obj > -1.0e8f) ? sat16(xl - left_obj, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
+        for (i = 0U; i < n; i++) {
+            if ((cid[i] == best) || (dist[i] == OBS_DIST_NONE) || (dist[i] >= OBS_SIDE_RANGE_MM)) {
+                continue;
+            }
+            if (i > i_last) {                         /* left of the obstacle */
+                float c = xl - px[i];
+                if (c < 0.0f) { c = 0.0f; }
+                if (c < left_c) { left_c = c; }
+            }
+            if (i < i_first) {                        /* right of the obstacle */
+                float c = px[i] - xr;
+                if (c < 0.0f) { c = 0.0f; }
+                if (c < right_c) { right_c = c; }
+            }
+        }
+        out->right_mm = ((right_c < 1.0e8f) ? sat16(right_c, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
+        out->left_mm  = ((left_c < 1.0e8f) ? sat16(left_c, 2047U) : (uint16_t)OBS_MAX_RANGE_MM);
     }
 
     out->closest_mm = closest;

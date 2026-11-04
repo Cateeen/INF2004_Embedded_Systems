@@ -248,3 +248,19 @@ add_library(line_steering STATIC
 target_include_directories(line_steering PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/include
 )
+
+# ==========================================
+# BUDDY 3 + BUDDY 5 SHARED LINE STATUS
+# ==========================================
+
+add_library(line_status STATIC
+    src/line_status.c
+)
+
+target_include_directories(line_status PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(line_status PUBLIC
+    pico_sync
+)

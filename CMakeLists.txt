@@ -227,3 +227,15 @@ pico_add_extra_outputs(wifi_test)
 pico_enable_stdio_usb(buddy4_imu_only_test 1)
 pico_enable_stdio_uart(buddy4_imu_only_test 0)
 pico_add_extra_outputs(buddy4_imu_only_test)
+
+# ==========================================
+# BUDDY 2 + BUDDY 3 LINE STEERING ADAPTER
+# ==========================================
+
+add_library(line_steering STATIC
+    src/line_steering.c
+)
+
+target_include_directories(line_steering PUBLIC
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)

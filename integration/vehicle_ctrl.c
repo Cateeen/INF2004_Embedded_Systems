@@ -23,6 +23,8 @@
 #include "obs_pack.h"
 #include "obs_port.h"
 #include "obs_scan.h"
+#include "buddy3.h"
+#include "line_steering.h"
 
 /* 1 = this file cruises straight ahead whenever line following would be active (bench test). 0 = only call the hook. */
 #ifndef VC_BUILTIN_CRUISE
@@ -57,6 +59,9 @@ typedef bool (*stop_fn_t)(void);
 static bool s_following = true;         /* true = "line follower / cruise owns the motors" */
 static bool s_prev_run  = false;
 
+/* Buddy 3 line steering state, owned by the Vehicle Controller. */
+static line_steering_t s_line_steering;
+
 __attribute__((weak)) void vc_line_follow_enable(bool on)
 {
     (void)on;
@@ -75,6 +80,62 @@ static void set_lr(int left, int right)
 {
     motor_set_speed(VC_LEFT_MOTOR,  (int16_t)(VC_LEFT_SIGN  * left));
     motor_set_speed(VC_RIGHT_MOTOR, (int16_t)(VC_RIGHT_SIGN * right));
+}
+
+/*
+ * Normal line following.
+ *
+ * This function runs only in the Vehicle Controller context.
+ * Buddy 5 obstacle manoeuvres take priority.
+ *
+ * The steering adapter supplies signed PWM commands
+ * using Buddy 2's physical motor polarity.
+ */
+static void update_line_following(void)
+{
+    if (!s_following ||
+        !vc_port_run_enabled() ||
+        motor_is_emergency_stopped() ||
+        obs_get_state() == (uint8_t)OBS_STATE_FAULT)
+    {
+        motor_brake_all();
+        return;
+    }
+
+    ir_readings_t readings = {0};
+
+    if (!line_following_read(&readings))
+    {
+        motor_emergency_stop();
+        set_following(false);
+        return;
+    }
+
+    uint8_t position = line_following_position(&readings);
+
+    line_steering_command_t command =
+        line_steering_update(
+            &s_line_steering,
+            position,
+            obs_port_ms()
+        );
+
+    if (command.stop_latched)
+    {
+        motor_brake_all();
+        return;
+    }
+
+    /*
+     * Commands are already signed:
+     * M1 positive = forward
+     * M2 negative = forward
+     *
+     * Do not pass through set_lr(), which applies
+     * motor polarity again.
+     */
+    motor_set_speed(MOTOR_1, command.motor_1_pwm);
+    motor_set_speed(MOTOR_2, command.motor_2_pwm);
 }
 
 /* settle - brake and wait so the robot is (nearly) still before the next move. */
@@ -246,9 +307,20 @@ static void handle(const obs_msg_t *m)
         break;
     }
 
-    case OBS_MSG_SCAN_CLEAR:                     /* false alarm: carry on */
+    case OBS_MSG_SCAN_CLEAR:
     case OBS_MSG_LINE_REACQUIRED:
-        set_following(true);
+        if (!s_line_steering.stop_latched &&
+            !motor_is_emergency_stopped() &&
+            vc_port_run_enabled() &&
+            obs_get_state() != (uint8_t)OBS_STATE_FAULT)
+        {
+            set_following(true);
+        }
+        else
+        {
+            motor_brake_all();
+            set_following(false);
+        }
         break;
 
     case OBS_MSG_FAULT_EVT:                      /* stay stopped (use motor_emergency_stop() for a latch) */
@@ -266,7 +338,11 @@ void vc_task(void)
     obs_msg_t m;
 
     motor_driver_init();
-    motor_clear_emergency_stop();                /* start-up only; the Safety Monitor should own this later */
+    motor_clear_emergency_stop();
+
+    line_following_init();
+    line_steering_reset(&s_line_steering);
+
     s_following = true;
     s_prev_run = false;
 
@@ -277,17 +353,30 @@ void vc_task(void)
         if (go && !s_prev_run) {
             if (obs_get_state() != (uint8_t)OBS_STATE_FAULT) {
                 motor_clear_emergency_stop();
+                line_steering_reset(&s_line_steering);
+                set_following(true);
             }
-            set_following(true);                 /* (re)start from the bench "go" key */
         }
+
         s_prev_run = go;
 
-        if (have) {
-            handle(&m);
-        } else if (!go) {
+        if (!go)
+        {
             motor_brake_all();
-        } else if (VC_BUILTIN_CRUISE && s_following) {
-            set_lr(VC_CRUISE_PCT, VC_CRUISE_PCT);
         }
+        else if (motor_is_emergency_stopped() ||
+                obs_get_state() == (uint8_t)OBS_STATE_FAULT)
+        {
+            motor_brake_all();
+        }
+        else if (have)
+        {
+            handle(&m);
+        }
+        else if (s_following)
+        {
+            update_line_following();
+        }
+
     }
 }

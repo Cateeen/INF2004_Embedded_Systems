@@ -181,8 +181,17 @@ target_include_directories(picocar PRIVATE
 )
 
 # target_compile_definitions(picocar PRIVATE CAR_LINE_PIN=2 CAR_LINE_ACTIVE_LEVEL=0)   # real TCRT5000 D0, when wired
-target_link_libraries(picocar pico_stdlib pico_multicore pico_util
-    hardware_adc hardware_gpio hardware_pwm hardware_clocks m)
+target_link_libraries(picocar
+    pico_stdlib
+    pico_multicore
+    pico_util
+    hardware_adc
+    hardware_gpio
+    hardware_pwm
+    hardware_clocks
+    line_steering
+    m
+)
  
 pico_enable_stdio_usb(picocar 1)
 pico_enable_stdio_uart(picocar 0)

@@ -203,6 +203,27 @@ target_link_libraries(buddy4_imu_only_test
     hardware_i2c
 )
 
+# ==========================================
+# PICO W WIFI TEST
+# ==========================================
+add_executable(wifi_test
+    hardware_test/wifi_test.c
+)
+
+target_include_directories(wifi_test PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/include
+)
+
+target_link_libraries(wifi_test
+    pico_stdlib
+    pico_cyw43_arch_lwip_poll
+)
+
+pico_enable_stdio_usb(wifi_test 1)
+pico_enable_stdio_uart(wifi_test 0)
+
+pico_add_extra_outputs(wifi_test)
+
 pico_enable_stdio_usb(buddy4_imu_only_test 1)
 pico_enable_stdio_uart(buddy4_imu_only_test 0)
 pico_add_extra_outputs(buddy4_imu_only_test)

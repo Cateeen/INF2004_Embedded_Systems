@@ -33,6 +33,11 @@ int main(void)
     in.battery_pct = 101U;
     assert(!telemetry_pack(&in, packet));
     printf("PASS: invalid battery value rejected\n");
+    in.battery_pct = 87U;
+    in.line_state = 3U; /* reserved 2-bit encoding */
+    assert(!telemetry_pack(&in, packet));
+    printf("PASS: reserved telemetry state rejected\n");
+    in.line_state = LINE_FOUND;
 
     remote_command_t cmd = { .type = CMD_STOP, .argument = 0U, .sequence = 44U };
     uint8_t command_packet[COMMAND_PACKET_SIZE];

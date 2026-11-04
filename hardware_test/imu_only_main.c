@@ -33,7 +33,8 @@ int main(void)
 
     while (true) {
         imu_driver_read_accel(&accel);
-        imu_processor_update(&state, &accel);
+        const float test_distance_m = 0.0f;
+        imu_processor_update(&state, &accel, test_distance_m);
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
         if (now - last_print_ms >= 200U) {

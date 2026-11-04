@@ -97,7 +97,8 @@ int main(void) {
         imu_driver_read_accel(&accel);
 
         // 2. Pass data through the filter and FSM
-        imu_processor_update(&state, &accel);
+        const float test_distance_m = 0.0f;
+        imu_processor_update(&state, &accel, test_distance_m);
 
         uint32_t now = to_ms_since_boot(get_absolute_time());
         bool hump_event = state.hump_active && state.current_hump_m > 0.0f;

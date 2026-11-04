@@ -28,6 +28,7 @@ static struct mqtt_connect_client_info_t mqtt_client_info;
 static mqtt_payload_callback_t payload_callback;
 static ip_addr_t broker_address;
 static char incoming_topic[MQTT_COMMAND_TOPIC_SIZE];
+static char subscription_topic[MQTT_COMMAND_TOPIC_SIZE];
 static uint8_t incoming_payload[MQTT_COMMAND_PAYLOAD_SIZE];
 static u32_t incoming_expected_length;
 static size_t incoming_received_length;
@@ -38,6 +39,8 @@ static bool broker_resolved;
 static bool mqtt_connecting;
 static bool connection_failed;
 static bool discard_incoming;
+static bool subscription_pending;
+static bool subscription_active;
 
 static void mqtt_incoming_publish_callback(void *arg, const char *topic,
                                            u32_t total_length);
@@ -59,6 +62,9 @@ static void reset_broker_resolution(void)
     broker_resolved = false;
     mqtt_connecting = false;
     connection_failed = false;
+    subscription_pending = false;
+    subscription_active = false;
+    subscription_topic[0] = '\0';
 }
 
 static void mqtt_connection_callback(mqtt_client_t *client, void *arg,
@@ -134,7 +140,10 @@ static void mqtt_incoming_data_callback(void *arg, const u8_t *data,
 static void mqtt_subscribe_callback(void *arg, err_t result)
 {
     (void)arg;
-    if (result != ERR_OK) {
+    subscription_pending = false;
+    if (result == ERR_OK) {
+        subscription_active = true;
+    } else {
         connection_failed = true;
     }
 }
@@ -224,6 +233,8 @@ bool wifi_mqtt_port_init(void)
         return false;
     }
 
+    cyw43_arch_enable_sta_mode();
+
     printf("MQTT adapter: Pico W networking initialized; allocating client...\n");
     stdio_flush();
     mqtt_client = mqtt_client_new();
@@ -304,10 +315,38 @@ void wifi_mqtt_port_disconnect(void)
 
 bool wifi_mqtt_port_subscribe(const char *topic)
 {
-    return (topic != NULL) && (mqtt_client != NULL) &&
-           (mqtt_client_is_connected(mqtt_client) != 0U) &&
-           (mqtt_subscribe(mqtt_client, topic, 0U,
-                           mqtt_subscribe_callback, NULL) == ERR_OK);
+    size_t topic_length;
+
+    if ((topic == NULL) || (mqtt_client == NULL) ||
+        (mqtt_client_is_connected(mqtt_client) == 0U)) {
+        return false;
+    }
+
+    topic_length = strlen(topic);
+    if (topic_length >= sizeof(subscription_topic)) {
+        return false;
+    }
+
+    if (subscription_pending || subscription_active) {
+        return strcmp(topic, subscription_topic) == 0;
+    }
+
+    memcpy(subscription_topic, topic, topic_length + 1U);
+    subscription_pending = true;
+    if (mqtt_subscribe(mqtt_client, topic, 0U,
+                       mqtt_subscribe_callback, NULL) != ERR_OK) {
+        subscription_pending = false;
+        connection_failed = true;
+        return false;
+    }
+
+    return true;
+}
+
+bool wifi_mqtt_port_subscribed(void)
+{
+    return initialized && subscription_active && (mqtt_client != NULL) &&
+           (mqtt_client_is_connected(mqtt_client) != 0U);
 }
 
 bool wifi_mqtt_port_publish(const char *topic, const uint8_t *payload,

@@ -31,6 +31,10 @@ typedef struct {
     bool shock_detected;
     bool tilt_detected;
     imu_fsm_state_t fsm_state;
+
+    float last_distance_m; // track encoder distance from previous loop
+    float hump_start_distance_m; // distance when hump started
+    float current_pitch_deg; // current calculated tilt angle
 } imu_state_t;
 
 // --- UPDATED FOR MQTT INTEGRATION ---
@@ -46,14 +50,14 @@ typedef enum {
 // 2. Your internal RTOS queue message (used between IMU task and Vehicle Controller)
 typedef struct {
     imu_event_type_t event_type;  // Changed from uint8_t to enum for clarity
-    float value;                  // Hump height in meters (0.0 for shock/tilt)
+    uint8_t value;                  // Hump height in meters (0.0 for shock/tilt)
 } imu_event_msg_t;
 
 // Optional application snapshot; Buddy 1's current MQTT wire format is the
 // packed telemetry_data_t binary packet, not JSON.
 typedef struct {
     uint32_t timestamp_ms;
-    float hump_peak_cm;
+    uint8_t hump_peak_cm;
     bool is_tilted;
     bool is_shock;
     imu_fsm_state_t current_state;

@@ -9,6 +9,6 @@ Separate math and logic from hardware
 #include "imu_types.h"
 
 void imu_processor_init(imu_state_t *state);
-void imu_processor_update(imu_state_t *state, accel_data_t *accel);
+void imu_processor_update(imu_state_t *state, accel_data_t *accel, float current_distance_m);
 
 #endif

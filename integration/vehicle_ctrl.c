@@ -254,7 +254,20 @@ static void do_line_search(uint8_t dir_side, uint16_t max_mm)
             settle();
             if (turn(opposite(dir_side), 90U) != RUN_DONE) { give_up(); return; }
             settle();
-            set_following(true);
+
+            if (!s_line_steering.stop_latched &&
+                !motor_is_emergency_stopped() &&
+                vc_port_run_enabled() &&
+                obs_get_state() != (uint8_t)OBS_STATE_FAULT)
+            {
+                set_following(true);
+            }
+            else
+            {
+                motor_brake_all();
+                set_following(false);
+            }
+
         }
         /* else: the obstacle task will raise LINE_NOT_REACQUIRED by itself */
     }
@@ -364,11 +377,17 @@ void vc_task(void)
         {
             motor_brake_all();
         }
-        else if (motor_is_emergency_stopped() ||
-                obs_get_state() == (uint8_t)OBS_STATE_FAULT)
+
+        else if (obs_get_state() == (uint8_t)OBS_STATE_FAULT)
+        {
+            motor_emergency_stop();
+            set_following(false);
+        }
+        else if (motor_is_emergency_stopped())
         {
             motor_brake_all();
         }
+
         else if (have)
         {
             handle(&m);

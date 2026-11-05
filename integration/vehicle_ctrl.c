@@ -57,6 +57,17 @@ static bool s_following = true;
 static bool s_prev_run = false;
 static line_steering_t s_line_steering;
 
+/*
+ * Shared safety interlock.
+ * Fault bits are latched by Buddy 5 and read safely from Core 1.
+ */
+static bool car_motion_allowed(void)
+{
+    return vc_port_run_enabled() &&
+           !motor_is_emergency_stopped() &&
+           car_fault_bits_get() == 0U;
+}
+
 __attribute__((weak)) void vc_line_follow_enable(bool on)
 {
     (void)on;
@@ -99,10 +110,7 @@ static bool sample_line_status(uint8_t *position)
 
 static void update_line_following(void)
 {
-    if (!s_following ||
-        !vc_port_run_enabled() ||
-        motor_is_emergency_stopped() ||
-        obs_get_state() == (uint8_t)OBS_STATE_FAULT) {
+    if (!s_following || !car_motion_allowed() || car_obstacle_present()){
         motor_brake_all();
         return;
     }
@@ -133,9 +141,7 @@ static bool settle(void)
     motor_brake_all();
 
     while ((uint32_t)(obs_port_ms() - start_ms) < VC_SETTLE_MS) {
-        if (!vc_port_run_enabled() ||
-            motor_is_emergency_stopped() ||
-            obs_get_state() == (uint8_t)OBS_STATE_FAULT) {
+        if (!car_motion_allowed()) {
             motor_brake_all();
             return false;
         }
@@ -148,9 +154,7 @@ static bool settle(void)
         obs_port_delay_ms(VC_TICK_MS);
     }
 
-    if (!vc_port_run_enabled() ||
-        motor_is_emergency_stopped() ||
-        obs_get_state() == (uint8_t)OBS_STATE_FAULT) {
+    if (!car_motion_allowed()) {
         motor_brake_all();
         return false;
     }
@@ -164,9 +168,7 @@ static run_t run(int left, int right, uint32_t ms, stop_fn_t stop)
     uint32_t t0 = obs_port_ms();
 
     while ((uint32_t)(obs_port_ms() - t0) < ms) {
-        if (motor_is_emergency_stopped() ||
-            obs_get_state() == (uint8_t)OBS_STATE_FAULT ||
-            !vc_port_run_enabled()) {
+        if (!car_motion_allowed()) {
             motor_brake_all();
             return RUN_ABORTED;
         }
@@ -232,9 +234,7 @@ static bool wait_for(obs_msg_type_t type, uint32_t ms)
     obs_msg_t m;
 
     while ((uint32_t)(obs_port_ms() - t0) < ms) {
-        if (obs_get_state() == (uint8_t)OBS_STATE_FAULT ||
-            !vc_port_run_enabled() ||
-            motor_is_emergency_stopped()) {
+        if (!car_motion_allowed()) {
             return false;
         }
 
@@ -308,9 +308,7 @@ static void do_line_search(uint8_t dir_side, uint16_t max_mm)
             if (!settle()) { give_up(); return; }
 
             if (!s_line_steering.stop_latched &&
-                !motor_is_emergency_stopped() &&
-                vc_port_run_enabled() &&
-                obs_get_state() != (uint8_t)OBS_STATE_FAULT) {
+            car_motion_allowed() && !car_obstacle_present()) {
                 set_following(true);
             } else {
                 motor_brake_all();
@@ -375,9 +373,7 @@ static void handle(const obs_msg_t *m)
     case OBS_MSG_SCAN_CLEAR:
     case OBS_MSG_LINE_REACQUIRED:
         if (!s_line_steering.stop_latched &&
-            !motor_is_emergency_stopped() &&
-            vc_port_run_enabled() &&
-            obs_get_state() != (uint8_t)OBS_STATE_FAULT) {
+            car_motion_allowed() && !car_obstacle_present()) {
             set_following(true);
         } else {
             motor_brake_all();
@@ -413,8 +409,9 @@ void vc_task(void)
         bool go = vc_port_run_enabled();
 
         if (go && !s_prev_run) {
-            if (obs_get_state() != (uint8_t)OBS_STATE_FAULT) {
-                motor_clear_emergency_stop();
+            if (car_fault_bits_get() == 0U &&
+                !motor_is_emergency_stopped() &&
+                !car_obstacle_present()) {
                 line_steering_reset(&s_line_steering);
                 set_following(true);
             }
@@ -422,11 +419,11 @@ void vc_task(void)
 
         s_prev_run = go;
 
-        if (!go) {
-            motor_brake_all();
-        } else if (obs_get_state() == (uint8_t)OBS_STATE_FAULT) {
+        if (car_fault_bits_get() != 0U) {
             motor_emergency_stop();
             set_following(false);
+        } else if (!go) {
+            motor_brake_all();
         } else if (motor_is_emergency_stopped()) {
             motor_brake_all();
         } else if (have) {

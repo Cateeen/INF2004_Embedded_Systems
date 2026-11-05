@@ -190,6 +190,7 @@ target_link_libraries(picocar
     hardware_pwm
     hardware_clocks
     line_steering
+    line_status
     m
 )
  

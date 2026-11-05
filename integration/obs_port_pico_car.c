@@ -25,6 +25,7 @@
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
+#include "line_status.h"
 
 /* Optional real line sensor (TCRT5000 D0). Define CAR_LINE_PIN (any free GPIO) in CMake to use it.
  * CAR_LINE_ACTIVE_LEVEL = pin level that means "line under sensor" (check your module: often 0 = dark/black). */
@@ -243,10 +244,25 @@ void obs_port_obstacle_flag(bool present)
 
 bool obs_port_line_detected(void)
 {
-#ifdef CAR_LINE_PIN
-    if (gpio_get(CAR_LINE_PIN) == CAR_LINE_ACTIVE_LEVEL) {
+    uint32_t now_ms = obs_port_ms();
+
+    /*
+     * Real Buddy 3 line status.
+     * Freshness and synchronization are handled
+     * by the line_status module.
+     */
+    if (line_status_is_present(now_ms))
+    {
         return true;
     }
+
+    /*
+     * Optional bench-only simulated line.
+     * Enable only in a dedicated test build.
+     */
+#ifdef CAR_ENABLE_FAKE_LINE
+    return ((int32_t)(s_line_until_ms - now_ms) > 0);
+#else
+    return false;
 #endif
-    return ((int32_t)(s_line_until_ms - obs_port_ms()) > 0);
 }

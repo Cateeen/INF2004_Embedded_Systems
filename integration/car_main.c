@@ -6,6 +6,7 @@
 #include "car_link.h"
 #include "obs_scan.h"
 #include "vehicle_ctrl.h"
+#include "line_status.h"
 
 /* vc_core - core 1. The motors live on this core only. */
 static void vc_core(void)
@@ -27,7 +28,8 @@ int main(void)
     printf("obs_core = core 0, vc_core = core 1\n");
     printf("keys: g=GO  x=STOP  l=fake line (1 s)  a=ABORT  r=RESET  h=help\n");
 
-    car_link_init();                            /* queues must exist before vc_core starts */
+    car_link_init();
+    line_status_init();
     multicore_launch_core1(vc_core);
     obs_core();
     return 0;

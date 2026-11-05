@@ -19,6 +19,10 @@
 #include "buddy3.h"
 #include "line_steering.h"
 #include "line_status.h"
+#include "car_gate.h"
+#include "car_feedback.h"
+#include "car_measurements.h"
+#include <stdio.h>
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -63,9 +67,9 @@ static line_steering_t s_line_steering;
  */
 static bool car_motion_allowed(void)
 {
-    return vc_port_run_enabled() &&
-           !motor_is_emergency_stopped() &&
-           car_fault_bits_get() == 0U;
+    return car_gate_motion(vc_port_run_enabled(),
+                           motor_is_emergency_stopped(),
+                           car_fault_bits_get());
 }
 
 __attribute__((weak)) void vc_line_follow_enable(bool on)
@@ -98,6 +102,18 @@ static bool sample_line_status(uint8_t *position)
         return false;
     }
 
+    car_feedback_line_sample(readings.barcode.black, obs_port_ms());
+    float meters;
+    if (car_feedback_distance_m(&meters)) {
+        car_measurements_publish_distance(meters);
+    }
+    uint8_t code[BARCODE_MAX_PAYLOAD];
+    uint8_t length = 0U;
+    if (car_feedback_take_barcode(code, &length)) {
+        /* Print metadata only: payload content may be arbitrary bytes. */
+        printf("[BARCODE] decoded %u bytes (verification pending)\n",
+               (unsigned)length);
+    }
     uint8_t detected_position = line_following_position(&readings);
     line_status_publish(detected_position != POS_LOST, obs_port_ms());
 
@@ -399,6 +415,7 @@ void vc_task(void)
     motor_clear_emergency_stop();
 
     line_following_init();
+    car_feedback_init();
     line_steering_reset(&s_line_steering);
 
     s_following = true;
@@ -409,9 +426,8 @@ void vc_task(void)
         bool go = vc_port_run_enabled();
 
         if (go && !s_prev_run) {
-            if (car_fault_bits_get() == 0U &&
-                !motor_is_emergency_stopped() &&
-                !car_obstacle_present()) {
+            if (car_gate_rearm(true, motor_is_emergency_stopped(),
+                               car_fault_bits_get(), car_obstacle_present())) {
                 line_steering_reset(&s_line_steering);
                 set_following(true);
             }

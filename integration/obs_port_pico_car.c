@@ -198,7 +198,7 @@ obs_echo_t obs_port_measure(uint16_t *pulse_us)
 
 static void help(void)
 {
-    printf("keys: g=GO  x=STOP  l=fake line (1 s) s=Scan  a=ABORT  r=RESET  h=help\n");
+    printf("keys: g=GO  x=STOP  s=Scan  a=ABORT  r=RESET_DISABLED  h=help\n");
 }
 
 /* obs_port_cmd_recv - commands from the Vehicle Controller queue; also polls the USB keys. */
@@ -215,7 +215,7 @@ bool obs_port_cmd_recv(uint8_t *cmd, uint32_t timeout_ms)
             case 'l': s_line_until_ms = obs_port_ms() + LINE_PULSE_MS; ts(); printf("[KEY] fake line for 1 s\n"); break;
             case 's': ts(); printf("[KEY] SCAN\n"); *cmd = (uint8_t)OBS_CMD_SCAN_REQ; return true;
             case 'a': ts(); printf("[KEY] ABORT\n"); *cmd = (uint8_t)OBS_CMD_ABORT; return true;
-            case 'r': ts(); printf("[KEY] RESET\n"); *cmd = (uint8_t)OBS_CMD_RESET; return true;
+            case 'r': ts(); printf("[KEY] RESET disabled: power cycle required after latched fault\n"); break;
             case 'h': help(); break;
             default: break;
             }

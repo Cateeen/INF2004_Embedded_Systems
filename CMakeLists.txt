@@ -166,8 +166,22 @@ pico_enable_stdio_usb(buddy5_obs 1)
 pico_enable_stdio_uart(buddy5_obs 0)
 pico_add_extra_outputs(buddy5_obs)
 
+option(PICOCAR_ENABLE_IMU "Enable experimental IMU monitor on Core 0" OFF)
+option(PICOCAR_ENABLE_MQTT "Enable experimental MQTT telemetry on Core 0" OFF)
+
 add_executable(picocar
     integration/car_main.c
+    integration/car_observer.c
+    src/car_gate.c
+    src/car_measurements.c
+    src/car_feedback.c
+    src/pid_controller.c
+    src/wheel_speed_control.c
+    src/wheel_feedback_pid.c
+    src/encoder.c
+    src/wheel_odometry.c
+    src/wheel_feedback.c
+    src/barcode_scanner.c
     src/obs_scan.c 
     src/obs_profile.c 
     src/obs_pack.c
@@ -193,6 +207,25 @@ target_link_libraries(picocar
     line_status
     m
 )
+
+target_compile_definitions(picocar PRIVATE
+    PICOCAR_ENABLE_IMU=$<BOOL:${PICOCAR_ENABLE_IMU}>
+    PICOCAR_ENABLE_MQTT=$<BOOL:${PICOCAR_ENABLE_MQTT}>
+)
+
+if(PICOCAR_ENABLE_IMU)
+    target_sources(picocar PRIVATE src/imu_driver.c src/imu_processor.c)
+    target_link_libraries(picocar hardware_i2c)
+endif()
+
+if(PICOCAR_ENABLE_MQTT)
+    target_sources(picocar PRIVATE
+        src/buddy1.c
+        src/telemetry_protocol.c
+        src/wifi_mqtt_port_pico.c)
+    target_link_libraries(picocar pico_cyw43_arch_lwip_poll pico_lwip_mqtt)
+endif()
+
  
 pico_enable_stdio_usb(picocar 1)
 pico_enable_stdio_uart(picocar 0)

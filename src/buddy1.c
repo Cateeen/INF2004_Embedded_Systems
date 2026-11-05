@@ -132,12 +132,26 @@ static void publish_status(buddy1_t *b, uint32_t now_ms)
                   ((b->latest.vehicle_state & 0x07U) << 2U)),
         b->latest.sequence
     };
-    (void)wifi_mqtt_port_publish(HEARTBEAT_TOPIC, heartbeat,
-                                 sizeof(heartbeat), MQTT_QOS, false);
+    if (!wifi_mqtt_port_publish(HEARTBEAT_TOPIC, heartbeat,
+                                sizeof(heartbeat), MQTT_QOS, false)) {
+        wifi_mqtt_port_disconnect();
+        b->network_state = NET_RECONNECT_WAIT;
+        b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+        b->wifi_fault_pending = true;
+        b->latest.fault_flags |= FAULT_WIFI_LOSS;
+        return;
+    }
     if (b->latest.fault_flags != 0U) {
-        (void)wifi_mqtt_port_publish(FAULT_TOPIC, &b->latest.fault_flags,
-                                     sizeof(b->latest.fault_flags),
-                                     MQTT_QOS, false);
+        if (!wifi_mqtt_port_publish(FAULT_TOPIC, &b->latest.fault_flags,
+                                    sizeof(b->latest.fault_flags),
+                                    MQTT_QOS, false)) {
+            wifi_mqtt_port_disconnect();
+            b->network_state = NET_RECONNECT_WAIT;
+            b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+            b->wifi_fault_pending = true;
+            b->latest.fault_flags |= FAULT_WIFI_LOSS;
+            return;
+        }
     }
     b->wifi_fault_pending = false;
     b->last_publish_ms = now_ms;
@@ -149,6 +163,14 @@ void buddy1_poll(buddy1_t *b, uint32_t now_ms)
 
     /* Must be a short, cooperative poll; adapter must not busy-wait. */
     wifi_mqtt_port_poll();
+
+    if (wifi_mqtt_port_connection_failed()) {
+        wifi_mqtt_port_disconnect();
+        b->latest.fault_flags |= FAULT_WIFI_LOSS;
+        b->wifi_fault_pending = true;
+        b->network_state = NET_RECONNECT_WAIT;
+        b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;
+    }
 
     if (b->network_state == NET_DISCONNECTED) {
         b->next_retry_ms = now_ms;
@@ -169,8 +191,10 @@ void buddy1_poll(buddy1_t *b, uint32_t now_ms)
         if (wifi_mqtt_port_wifi_connected() &&
             wifi_mqtt_port_mqtt_connected()) {
             if (wifi_mqtt_port_subscribe(COMMAND_TOPIC)) {
-                b->network_state = NET_CONNECTED;
-                b->last_publish_ms = now_ms - PUBLISH_INTERVAL_MS;
+                if (wifi_mqtt_port_subscribed()) {
+                    b->network_state = NET_CONNECTED;
+                    b->last_publish_ms = now_ms - PUBLISH_INTERVAL_MS;
+                }
             } else {
                 wifi_mqtt_port_disconnect();
                 b->network_state = NET_RECONNECT_WAIT;
@@ -178,8 +202,7 @@ void buddy1_poll(buddy1_t *b, uint32_t now_ms)
                 b->wifi_fault_pending = true;
                 b->latest.fault_flags |= FAULT_WIFI_LOSS;
             }
-        } else if (wifi_mqtt_port_connection_failed() ||
-                   time_reached(now_ms, b->next_retry_ms)) {
+        } else if (time_reached(now_ms, b->next_retry_ms)) {
             wifi_mqtt_port_disconnect();
             b->network_state = NET_RECONNECT_WAIT;
             b->next_retry_ms = now_ms + RETRY_INTERVAL_MS;

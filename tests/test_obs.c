@@ -269,10 +269,34 @@ static void scenario(const char *name, float x0, float x1, float y0, float y1, b
  * dead sensor with reset, line never found) and prints PASS/FAIL for each check.
  * Returns: 0 if everything passed, 1 otherwise.
  */
+
+/* Regression: a stopped controller does not ACK; no timeout may clear an
+ * obstacle which the sensor still sees. An explicit scan can still proceed. */
+static void test_unacknowledged_proximity(void)
+{
+    printf("[7] unacknowledged proximity remains latched\n");
+    reset_world();
+    g_vc_auto = false;
+    add_box(-50, 50, 150, 250);
+    for (int i = 0; i < 100 && !has_type(OBS_MSG_PROXIMITY); i++) obs_step();
+    CHECK(has_type(OBS_MSG_PROXIMITY) && g_obs_flag,
+          "obstacle flag raised before scan acknowledgement");
+    uint32_t until = g_ms + OBS_SCAN_WAIT_MS + 600U;
+    while (g_ms < until) obs_step();
+    CHECK(g_obs_flag && obs_get_state() == OBS_STATE_IDLE,
+          "scan-wait timeout cannot clear an unacknowledged obstacle");
+    push_cmd(OBS_CMD_SCAN_REQ);
+    obs_step();
+    CHECK(obs_get_state() == OBS_STATE_COARSE,
+          "late explicit SCAN_REQ still starts scan");
+    g_vc_auto = true;
+}
+
 int main(void)
 {
     test_pack();
     test_clear();
+    test_unacknowledged_proximity();
     scenario("obstacle 100 mm wide, open arena", -50, 50, 250, 350, false, false, OBS_ACT_RIGHT, 100.0f);
     scenario("obstacle with wall on LEFT -> go right", -50, 50, 250, 350, true, false, OBS_ACT_RIGHT, 100.0f);
     scenario("obstacle with wall on RIGHT -> go left", -50, 50, 250, 350, false, true, OBS_ACT_LEFT, 100.0f);

@@ -59,6 +59,8 @@ typedef bool (*stop_fn_t)(void);
 
 static bool s_following = true;
 static bool s_prev_run = false;
+/* A proximity event received while STOP is active must not be discarded. */
+static bool s_pending_proximity = false;
 static line_steering_t s_line_steering;
 
 /*
@@ -124,15 +126,11 @@ static bool sample_line_status(uint8_t *position)
     return true;
 }
 
-static void update_line_following(void)
+/* Position is sampled independently of motor authority in vc_task(). */
+static void update_line_following(uint8_t position)
 {
-    if (!s_following || !car_motion_allowed() || car_obstacle_present()){
+    if (!s_following || !car_motion_allowed() || car_obstacle_present()) {
         motor_brake_all();
-        return;
-    }
-
-    uint8_t position = POS_LOST;
-    if (!sample_line_status(&position)) {
         return;
     }
 
@@ -355,6 +353,7 @@ static void handle(const obs_msg_t *m)
 {
     switch (obs_msg_type(m)) {
     case OBS_MSG_PROXIMITY:
+        s_pending_proximity = false;
         set_following(false);
         if (!settle()) { give_up(); return; }
         vc_port_cmd_send((uint8_t)OBS_CMD_SCAN_REQ);
@@ -420,32 +419,78 @@ void vc_task(void)
 
     s_following = true;
     s_prev_run = false;
+    s_pending_proximity = false;
 
     for (;;) {
         bool have = vc_port_msg_recv(&m, 2U * VC_TICK_MS);
         bool go = vc_port_run_enabled();
+        bool faulted = car_fault_bits_get() != 0U;
+        bool estopped = motor_is_emergency_stopped();
+        bool obstacle = car_obstacle_present();
+        uint8_t position = POS_LOST;
 
-        if (go && !s_prev_run) {
-            if (car_gate_rearm(true, motor_is_emergency_stopped(),
-                               car_fault_bits_get(), car_obstacle_present())) {
-                line_steering_reset(&s_line_steering);
-                set_following(true);
+        /*
+         * Keep the line status fresh while stopped or avoiding an obstacle.
+         * A read failure latches motor emergency-stop; never bypass it.
+         */
+        if (!sample_line_status(&position)) {
+            motor_brake_all();
+            set_following(false);
+            s_prev_run = go;
+            continue;
+        }
+
+        if (faulted) {
+            motor_emergency_stop();
+            set_following(false);
+        } else if (!go) {
+            /* No event handler may actuate motors while STOP is active. */
+            motor_brake_all();
+            set_following(false);
+
+            if (have && obs_msg_type(&m) == OBS_MSG_PROXIMITY) {
+                s_pending_proximity = true;
+            }
+            if (obstacle) {
+                s_pending_proximity = true;
+            }
+
+            /* Cancel an in-progress scan on a transition from GO to STOP. */
+            if (s_prev_run) {
+                vc_port_cmd_send((uint8_t)OBS_CMD_ABORT);
+            }
+        } else if (estopped) {
+            motor_brake_all();
+            set_following(false);
+        } else if (go && !s_prev_run &&
+                   (s_pending_proximity || obstacle) &&
+                   !(have && obs_msg_type(&m) == OBS_MSG_PROXIMITY)) {
+            /*
+             * A pending obstacle blocks normal line following, but may be
+             * scanned after an explicit GO. Scanning itself never drives.
+             * A later BYPASS_REQ still goes through the safety checks.
+             */
+            set_following(false);
+            s_pending_proximity = false;
+            motor_brake_all();
+            vc_port_cmd_send((uint8_t)OBS_CMD_SCAN_REQ);
+        } else {
+            if (go && !s_prev_run && !obstacle && !s_pending_proximity) {
+                if (car_gate_rearm(true, estopped, car_fault_bits_get(), obstacle)) {
+                    line_steering_reset(&s_line_steering);
+                    set_following(true);
+                }
+            }
+
+            if (have) {
+                handle(&m);
+            } else if (s_following) {
+                update_line_following(position);
+            } else {
+                motor_brake_all();
             }
         }
 
         s_prev_run = go;
-
-        if (car_fault_bits_get() != 0U) {
-            motor_emergency_stop();
-            set_following(false);
-        } else if (!go) {
-            motor_brake_all();
-        } else if (motor_is_emergency_stopped()) {
-            motor_brake_all();
-        } else if (have) {
-            handle(&m);
-        } else if (s_following) {
-            update_line_following();
-        }
     }
 }

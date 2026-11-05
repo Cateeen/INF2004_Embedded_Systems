@@ -208,8 +208,8 @@ static void store12(uint8_t *buf, uint32_t idx, meas_t r, uint16_t mm)
  *  - Keeps the servo pointing straight ahead.
  *  - Waits up to OBS_IDLE_PING_MS for a command. SCAN_REQ starts the coarse scan,
  *    ABORT clears everything.
- *  - If PROXIMITY was already sent it only waits for SCAN_REQ, and re-arms after
- *    OBS_SCAN_WAIT_MS if the Vehicle Controller never answers.
+ *  - If PROXIMITY was already sent, the safety flag remains asserted until
+ *    an explicit scan or ABORT; a timeout must NOT imply a clear path.
  *  - Otherwise it pings ahead. Two consecutive readings below OBS_TRIGGER_MM set
  *    the obstacle flag (Safety Monitor) and send PROXIMITY. The robot is stopped by
  *    the Vehicle Controller, not by this task.
@@ -232,10 +232,12 @@ static void step_idle(void)
         }
         return;
     }
-    if (s_ctx.prox != 0U) {                      /* told the VC, waiting for SCAN_REQ */
-        if (since(s_phase_t0) > OBS_SCAN_WAIT_MS) {
-            to_idle();                           /* VC never answered: re-arm */
-        }
+    if (s_ctx.prox != 0U) {
+        /*
+         * Do not turn obstacle_present off merely because the vehicle controller
+         * has not acknowledged PROXIMITY (e.g. while STOP is selected).
+         * Retain the obstacle and wait for SCAN_REQ or an explicit ABORT.
+         */
         return;
     }
     {

@@ -142,9 +142,21 @@ pico_enable_stdio_usb(buddy3_line_following_motion_test 1)
 pico_enable_stdio_uart(buddy3_line_following_motion_test 0)
 pico_add_extra_outputs(buddy3_line_following_motion_test)
 
-add_executable(buddy3_barcode_test tests/barcode_test.c src/line_following.c src/encoder.c)
+add_executable(buddy3_barcode_test
+    tests/barcode_test.c
+    src/line_following.c
+    src/encoder.c
+    src/motor_driver.c
+)
 target_include_directories(buddy3_barcode_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
-target_link_libraries(buddy3_barcode_test pico_stdlib barcode_scanner hardware_adc hardware_gpio)
+target_link_libraries(buddy3_barcode_test
+    pico_stdlib
+    barcode_scanner
+    hardware_adc
+    hardware_gpio
+    hardware_pwm
+    hardware_clocks
+)
 pico_enable_stdio_usb(buddy3_barcode_test 1)
 pico_enable_stdio_uart(buddy3_barcode_test 0)
 pico_add_extra_outputs(buddy3_barcode_test)
@@ -159,6 +171,25 @@ target_link_libraries(buddy4_imu_only_test pico_stdlib hardware_i2c)
 pico_enable_stdio_usb(buddy4_imu_only_test 1)
 pico_enable_stdio_uart(buddy4_imu_only_test 0)
 pico_add_extra_outputs(buddy4_imu_only_test)
+
+add_executable(buddy4_imu_test
+    hardware_test/imu_main.c
+    src/imu_driver.c
+    src/imu_processor.c
+    src/buddy1.c
+    src/telemetry_protocol.c
+    src/wifi_mqtt_port_pico.c
+)
+target_include_directories(buddy4_imu_test PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
+target_link_libraries(buddy4_imu_test
+    pico_stdlib
+    hardware_i2c
+    pico_cyw43_arch_lwip_poll
+    pico_lwip_mqtt
+)
+pico_enable_stdio_usb(buddy4_imu_test 1)
+pico_enable_stdio_uart(buddy4_imu_test 0)
+pico_add_extra_outputs(buddy4_imu_test)
 
 add_executable(buddy5_obs
     hardware_test/obs_main.c

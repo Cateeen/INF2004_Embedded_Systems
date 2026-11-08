@@ -127,6 +127,7 @@ add_executable(buddy3_barcode_test
     src/barcode_scanner.c
     src/line_following.c
     src/encoder.c
+    src/motor_driver.c
 )
 
 target_include_directories(buddy3_barcode_test PRIVATE
@@ -137,6 +138,8 @@ target_link_libraries(buddy3_barcode_test
     pico_stdlib
     hardware_adc
     hardware_gpio
+    hardware_pwm
+    hardware_clocks
 )
 
 pico_enable_stdio_usb(buddy3_barcode_test 1)

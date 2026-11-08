@@ -64,8 +64,11 @@ typedef struct
     bool initialized;
     bool last_black;
     int32_t last_encoder_count;
-    uint8_t bit_buffer[48U];
-    uint16_t bit_count;
+    uint32_t run_counts[9U];
+    uint8_t run_count;
+    bool collecting;
+    bool in_frame;
+    int8_t scan_direction;
     uint8_t payload[BARCODE_MAX_PAYLOAD];
     uint8_t payload_length;
     bool result_ready;

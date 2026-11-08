@@ -2,9 +2,23 @@
 
 #include <string.h>
 
-#define BARCODE_SYNC       0xD5U
-#define BARCODE_STOP       0x7EU
-#define BARCODE_MAX_BITS   ((8U + 8U + (BARCODE_MAX_PAYLOAD * 8U) + 8U + 8U))
+static const char code39_characters[] =
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. $/+%";
+
+static const char *const code39_patterns[] =
+{
+    "nnnwwnwnn", "wnnwnnnnw", "nnwwnnnnw", "wnwwnnnnn",
+    "nnnwwnnnw", "wnnwwnnnn", "nnwwwnnnn", "nnnwnnwnw",
+    "wnnwnnwnn", "nnwwnnwnn", "wnnnnwnnw", "nnwnnwnnw",
+    "wnwnnwnnn", "nnnnwwnnw", "wnnnwwnnn", "nnwnwwnnn",
+    "nnnnnwwnw", "wnnnnwwnn", "nnwnnwwnn", "nnnnwwwnn",
+    "wnnnnnnww", "nnwnnnnww", "wnwnnnnwn", "nnnnwnnww",
+    "wnnnwnnwn", "nnwnwnnwn", "nnnnnnwwn", "wnnnnnwwn",
+    "nnwnnnwwn", "nnnnwnwwn", "wwnnnnnnw", "nwwnnnnnw",
+    "wwwnnnnnn", "nwnnwnnnw", "wwnnwnnnn", "nwwnwnnnn",
+    "nwnnnnwnw", "wwnnnnwnn", "nwwnnnwnn", "nwnwnwnnn",
+    "nwnwnnnwn", "nwnnnwnwn", "nnnwnwnwn"
+};
 
 static uint32_t absolute_count_delta(int32_t first, int32_t second)
 {
@@ -12,143 +26,118 @@ static uint32_t absolute_count_delta(int32_t first, int32_t second)
     return (uint32_t)((delta < 0) ? -delta : delta);
 }
 
-static void clear_bits(barcode_scanner_t *scanner)
+static void reset_character(barcode_scanner_t *scanner)
 {
-    memset(scanner->bit_buffer, 0, sizeof(scanner->bit_buffer));
-    scanner->bit_count = 0U;
+    memset(scanner->run_counts, 0, sizeof(scanner->run_counts));
+    scanner->run_count = 0U;
 }
 
-static void append_bit(barcode_scanner_t *scanner, bool black)
-{
-    uint16_t byte_index;
-    uint8_t bit_index;
-
-    if (scanner->bit_count >= BARCODE_MAX_BITS)
-    {
-        clear_bits(scanner);
-    }
-
-    byte_index = (uint16_t)(scanner->bit_count / 8U);
-    bit_index = (uint8_t)(7U - (scanner->bit_count % 8U));
-    if (black)
-    {
-        scanner->bit_buffer[byte_index] |= (uint8_t)(1U << bit_index);
-    }
-    scanner->bit_count++;
-}
-
-static uint8_t read_bits(
+static char decode_character(
     const barcode_scanner_t *scanner,
-    uint16_t offset,
-    uint8_t width)
+    bool reverse)
 {
-    uint8_t value = 0U;
-    uint8_t bit;
+    char pattern[10];
+    uint8_t i;
+    uint8_t j;
+    uint32_t wide_threshold;
 
-    for (bit = 0U; bit < width; bit++)
+    if ((scanner->run_count != 9U) ||
+        (scanner->config.counts_per_module == 0U))
     {
-        uint16_t index = (uint16_t)(offset + bit);
-        uint8_t byte = scanner->bit_buffer[index / 8U];
-        uint8_t shift = (uint8_t)(7U - (index % 8U));
-        value = (uint8_t)((value << 1U) | ((byte >> shift) & 1U));
+        return '\0';
     }
-    return value;
+
+    /*
+     * Code 39 has narrow and wide elements. A wide element is normally at
+     * least twice the narrow width; 1.5 times gives margin for calibration.
+     */
+    wide_threshold = scanner->config.counts_per_module * 150U;
+    for (i = 0U; i < 9U; i++)
+    {
+        uint8_t source_index = reverse ? (uint8_t)(8U - i) : i;
+        pattern[i] = (scanner->run_counts[source_index] * 100U >=
+                      wide_threshold) ?
+                     'w' : 'n';
+    }
+    pattern[9] = '\0';
+
+    for (j = 0U; j < (uint8_t)(sizeof(code39_patterns) /
+                               sizeof(code39_patterns[0])); j++)
+    {
+        if (memcmp(pattern, code39_patterns[j], 9U) == 0)
+        {
+            return (j == 42U) ? '*' : code39_characters[j];
+        }
+    }
+
+    return '\0';
 }
 
-static bool module_count(
-    const barcode_scanner_t *scanner,
-    uint32_t width_counts,
-    uint32_t *modules)
+static void accept_character(barcode_scanner_t *scanner, char character)
 {
-    uint32_t count;
-    uint32_t remainder;
-    uint32_t tolerance;
-
-    if ((scanner->config.counts_per_module == 0U) ||
-        (width_counts == 0U))
+    if (character == '\0')
     {
-        return false;
-    }
-
-    count = (width_counts + scanner->config.counts_per_module / 2U) /
-            scanner->config.counts_per_module;
-    if ((count == 0U) || (count > 8U))
-    {
-        return false;
-    }
-
-    remainder = width_counts % scanner->config.counts_per_module;
-    if (remainder > scanner->config.counts_per_module - remainder)
-    {
-        remainder = scanner->config.counts_per_module - remainder;
-    }
-    tolerance = (scanner->config.counts_per_module *
-                 scanner->config.module_tolerance_percent) / 100U;
-    if (remainder > tolerance)
-    {
-        return false;
-    }
-
-    *modules = count;
-    return true;
-}
-
-static void parse_buffer(barcode_scanner_t *scanner)
-{
-    uint16_t offset;
-
-    if (scanner->bit_count < 32U)
-    {
+        scanner->in_frame = false;
+        scanner->payload_length = 0U;
         return;
     }
 
-    for (offset = 0U; (uint32_t)offset + 32U <= scanner->bit_count; offset++)
+    if (character == '*')
     {
-        uint8_t length;
-        uint16_t frame_bits;
-        uint8_t checksum;
-        uint8_t i;
+        if (!scanner->in_frame)
+        {
+            scanner->in_frame = true;
+            scanner->payload_length = 0U;
+        }
+        else if (scanner->payload_length > 0U)
+        {
+            uint8_t i;
+            uint8_t half_length = scanner->payload_length / 2U;
 
-        if (read_bits(scanner, offset, 8U) != BARCODE_SYNC)
-        {
-            continue;
+            if (scanner->scan_direction < 0)
+            {
+                for (i = 0U; i < half_length; i++)
+                {
+                    uint8_t opposite = (uint8_t)(
+                        scanner->payload_length - 1U - i);
+                    uint8_t value = scanner->payload[i];
+                    scanner->payload[i] = scanner->payload[opposite];
+                    scanner->payload[opposite] = value;
+                }
+            }
+            scanner->result_ready = true;
+            scanner->in_frame = false;
         }
-
-        length = read_bits(scanner, (uint16_t)(offset + 8U), 8U);
-        if ((length == 0U) || (length > BARCODE_MAX_PAYLOAD))
-        {
-            continue;
-        }
-
-        frame_bits = (uint16_t)(8U + 8U + (length * 8U) + 8U + 8U);
-        if ((uint32_t)offset + frame_bits > scanner->bit_count)
-        {
-            continue;
-        }
-        if (read_bits(scanner, (uint16_t)(offset + frame_bits - 8U), 8U) !=
-            BARCODE_STOP)
-        {
-            continue;
-        }
-
-        checksum = 0U;
-        for (i = 0U; i < length; i++)
-        {
-            scanner->payload[i] = read_bits(
-                scanner, (uint16_t)(offset + 16U + (i * 8U)), 8U);
-            checksum ^= scanner->payload[i];
-        }
-        if (checksum != read_bits(
-                scanner, (uint16_t)(offset + 16U + (length * 8U)), 8U))
-        {
-            continue;
-        }
-
-        scanner->payload_length = length;
-        scanner->result_ready = true;
-        clear_bits(scanner);
         return;
     }
+
+    if (scanner->in_frame)
+    {
+        if (scanner->payload_length < BARCODE_MAX_PAYLOAD)
+        {
+            scanner->payload[scanner->payload_length++] = (uint8_t)character;
+        }
+        else
+        {
+            scanner->in_frame = false;
+            scanner->payload_length = 0U;
+        }
+    }
+}
+
+static void finish_character(barcode_scanner_t *scanner)
+{
+    if (scanner->run_count == 9U)
+    {
+        accept_character(scanner, decode_character(
+            scanner, scanner->scan_direction < 0));
+    }
+    else
+    {
+        scanner->in_frame = false;
+        scanner->payload_length = 0U;
+    }
+    reset_character(scanner);
 }
 
 bool barcode_scanner_init(
@@ -169,6 +158,8 @@ bool barcode_scanner_init(
     scanner->initialized = true;
     scanner->last_black = initial_black;
     scanner->last_encoder_count = initial_encoder_count;
+    scanner->collecting = initial_black;
+    scanner->scan_direction = 0;
     return true;
 }
 
@@ -177,9 +168,8 @@ bool barcode_scanner_update(
     bool black,
     int32_t encoder_count)
 {
+    int32_t count_delta;
     uint32_t width_counts;
-    uint32_t modules;
-    uint32_t i;
 
     if ((scanner == NULL) || !scanner->initialized)
     {
@@ -190,19 +180,33 @@ bool barcode_scanner_update(
         return true;
     }
 
+    count_delta = encoder_count - scanner->last_encoder_count;
     width_counts = absolute_count_delta(
         scanner->last_encoder_count, encoder_count);
-    if (!module_count(scanner, width_counts, &modules))
+
+    if (!scanner->collecting)
     {
-        clear_bits(scanner);
+        if (!scanner->last_black && black)
+        {
+            scanner->collecting = true;
+            scanner->scan_direction = (count_delta < 0) ? -1 : 1;
+            reset_character(scanner);
+        }
+    }
+    else if (scanner->run_count < 9U)
+    {
+        scanner->run_counts[scanner->run_count++] = width_counts;
+        if (scanner->last_black && !black &&
+            scanner->run_count == 9U)
+        {
+            finish_character(scanner);
+            scanner->collecting = false;
+        }
     }
     else
     {
-        for (i = 0U; i < modules; i++)
-        {
-            append_bit(scanner, scanner->last_black);
-        }
-        parse_buffer(scanner);
+        scanner->collecting = false;
+        reset_character(scanner);
     }
 
     scanner->last_black = black;
@@ -233,6 +237,11 @@ void barcode_scanner_reset(barcode_scanner_t *scanner)
     {
         return;
     }
-    clear_bits(scanner);
+
+    reset_character(scanner);
+    scanner->collecting = false;
+    scanner->in_frame = false;
+    scanner->scan_direction = 0;
+    scanner->payload_length = 0U;
     scanner->result_ready = false;
 }

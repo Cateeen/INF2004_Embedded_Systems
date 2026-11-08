@@ -28,11 +28,15 @@
 
 // Algorithm Tunables
 #define GRAVITY_MS2         9.80665f
-#define ACCEL_SENS_2G       0.00105f   // g/LSB
-#define HUMP_THRESHOLD      0.3f        // m/s2
+#define ACCEL_SENS_2G       0.00105f    // g/LSB
 #define SHOCK_THRESHOLD     3.0f        // g-force
-#define TILT_THRESHOLD_DEG  15.0f
-#define ALPHA_HP            0.85f
-#define ALPHA_LP            0.20f
+#define TILT_THRESHOLD_DEG  30.0f       // safety threshold
+
+#define PITCH_START_DEG     3.0f
+#define PITCH_END_DEG       1.5f
+#define MIN_HUMP_HEIGHT_M   0.005f
+
+// Buddy 2 needs to verify this number (if timothy u integrating it take note of this)
+#define TICKS_PER_METER     1000.0f
 
 #endif // IMU_CONFIG_H

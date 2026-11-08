@@ -22,6 +22,8 @@ bool wifi_mqtt_port_connection_failed(void);
 bool wifi_mqtt_port_connect(void);
 void wifi_mqtt_port_disconnect(void);
 bool wifi_mqtt_port_subscribe(const char *topic);
+/* True only after the broker acknowledges the subscription. */
+bool wifi_mqtt_port_subscribed(void);
 bool wifi_mqtt_port_publish(const char *topic,
                             const uint8_t *payload,
                             size_t length,

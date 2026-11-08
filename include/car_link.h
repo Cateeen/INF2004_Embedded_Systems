@@ -6,6 +6,13 @@
 #include <stdbool.h>
 #include "obs_pack.h"
 
+/*
+ * Integration-level fault bits.
+ * Separate from Buddy 5's four packed OBS_FAULT_* bits
+ * and Buddy 1's telemetry fault-bit definitions.
+ */
+#define CAR_FAULT_QUEUE_OVERFLOW (1UL << 16)
+
 /* Create the two queues. Call once in main(), BEFORE starting vc_core. */
 void car_link_init(void);
 
@@ -17,5 +24,13 @@ void vc_port_cmd_send(uint8_t cmd);
 
 /* Bench "go" switch: USB-serial key g = true, key x = false. Motors never move while false. */
 bool vc_port_run_enabled(void);
+
+/*
+ * Cross-core safety status.
+ * Fault bits remain latched until a validated reset mechanism
+ * is implemented.
+ */
+uint32_t car_fault_bits_get(void);
+bool car_obstacle_present(void);
 
 #endif

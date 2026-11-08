@@ -1,5 +1,3 @@
-// Contains struct and enum
-
 #ifndef IMU_TYPES_H
 #define IMU_TYPES_H
 
@@ -13,50 +11,58 @@ typedef struct {
     float   ax;
     float   ay;
     float   az;
+    bool    i2c_ok;
 } accel_data_t;
 
+/* 3-bit IMU FSM States (0..5 fit in 3 bits) */
 typedef enum {
-    IMU_STATE_MONITORING,
-    IMU_STATE_HUMP_RISING,
-    IMU_STATE_HUMP_FALLING,
-    IMU_STATE_SHOCK,
-    IMU_STATE_TILT,
-    IMU_STATE_FAULT
+    IMU_STATE_MONITORING   = 0,
+    IMU_STATE_HUMP_RISING  = 1,
+    IMU_STATE_HUMP_FALLING = 2,
+    IMU_STATE_SHOCK        = 3,
+    IMU_STATE_TILT         = 4,
+    IMU_STATE_FAULT        = 5
 } imu_fsm_state_t;
 
-typedef struct {
-    float hump_peak_m;
-    float current_hump_m;
-    bool hump_active;
-    bool shock_detected;
-    bool tilt_detected;
-    imu_fsm_state_t fsm_state;
-} imu_state_t;
-
-// --- UPDATED FOR MQTT INTEGRATION ---
-
-// 1. Define clear event types so Buddy 1 knows what to publish
+/* 3-bit Motion Events (0..4 fit in 3 bits) */
 typedef enum {
-    IMU_EVENT_HUMP = 0,
-    IMU_EVENT_SHOCK = 1,
-    IMU_EVENT_TILT = 2,
-    IMU_EVENT_NONE = 3
+    IMU_EVENT_STATIONARY = 0,
+    IMU_EVENT_ACCEL      = 1,
+    IMU_EVENT_CLIMBING   = 2,
+    IMU_EVENT_DESCENDING = 3,
+    IMU_EVENT_SHOCK      = 4
 } imu_event_type_t;
 
-// 2. Your internal RTOS queue message (used between IMU task and Vehicle Controller)
 typedef struct {
-    imu_event_type_t event_type;  // Changed from uint8_t to enum for clarity
-    float value;                  // Hump height in meters (0.0 for shock/tilt)
-} imu_event_msg_t;
+    float           hump_peak_m;
+    float           current_hump_m;
+    bool            hump_active;
+    bool            shock_detected;
+    bool            tilt_detected;
+    imu_fsm_state_t fsm_state;
+    imu_event_type_t motion_event;
 
-// Optional application snapshot; Buddy 1's current MQTT wire format is the
-// packed telemetry_data_t binary packet, not JSON.
-typedef struct {
-    uint32_t timestamp_ms;
-    float hump_peak_cm;
-    bool is_tilted;
-    bool is_shock;
-    imu_fsm_state_t current_state;
-} imu_telemetry_t;
+    float           last_distance_m;
+    float           hump_start_distance_m;
+    float           current_pitch_deg;
+    float           current_roll_deg;
+    uint16_t        packed_telemetry; /* 16-bit Minimum-Bit packed word */
+} imu_state_t;
+
+/* Minimum-Bit Data Representation (16 bits / 2 bytes total):
+ * Bits [2:0]   = fsm_state       (3 bits: 0..5)
+ * Bits [5:3]   = motion_event    (3 bits: 0..4)
+ * Bits [11:6]  = hump_height_qcm (6 bits: 0..62 -> 0.00..15.50 cm in 0.25 cm steps)
+ * Bits [15:12] = pitch_bucket    (4 bits: 0..15 -> -35..+40 deg in 5 deg steps)
+ */
+static inline uint16_t imu_pack_telemetry(uint8_t state,
+                                          uint8_t event,
+                                          uint8_t height_qcm,
+                                          uint8_t pitch_idx) {
+    return (uint16_t)(((uint16_t)(state      & 0x07U))        |
+                      ((uint16_t)(event      & 0x07U) << 3U)  |
+                      ((uint16_t)(height_qcm & 0x3FU) << 6U)  |
+                      ((uint16_t)(pitch_idx  & 0x0FU) << 12U));
+}
 
 #endif // IMU_TYPES_H

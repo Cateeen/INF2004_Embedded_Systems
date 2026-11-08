@@ -10,6 +10,8 @@
 static bool fake_wifi_connected;
 static bool fake_mqtt_connected;
 static bool fake_connection_failed;
+static bool fake_subscription_pending;
+static bool fake_subscribed;
 static unsigned int connect_calls;
 static unsigned int subscribe_calls;
 static unsigned int telemetry_publish_calls;
@@ -46,13 +48,23 @@ void wifi_mqtt_port_disconnect(void)
 {
     fake_mqtt_connected = false;
     fake_connection_failed = false;
+    fake_subscription_pending = false;
+    fake_subscribed = false;
 }
 
 bool wifi_mqtt_port_subscribe(const char *topic)
 {
     assert(strcmp(topic, "robot/command") == 0);
-    subscribe_calls++;
+    if (!fake_subscription_pending && !fake_subscribed) {
+        subscribe_calls++;
+        fake_subscription_pending = true;
+    }
     return true;
+}
+
+bool wifi_mqtt_port_subscribed(void)
+{
+    return fake_subscribed;
 }
 
 bool wifi_mqtt_port_publish(const char *topic, const uint8_t *payload,
@@ -102,6 +114,12 @@ int main(void)
     fake_wifi_connected = true;
     fake_mqtt_connected = true;
     buddy1_poll(&buddy, 10U);
+    assert(buddy1_network_state(&buddy) == NET_CONNECTING);
+    assert(subscribe_calls == 1U);
+    assert(telemetry_publish_calls == 0U);
+
+    fake_subscribed = true;
+    buddy1_poll(&buddy, 20U);
     assert(buddy1_network_state(&buddy) == NET_CONNECTED);
     assert(subscribe_calls == 1U);
     assert(telemetry_publish_calls == 1U);
@@ -110,7 +128,7 @@ int main(void)
     telemetry.fault_flags = FAULT_IMU;
     buddy1_set_telemetry(&buddy, &telemetry);
     buddy1_set_faults(&buddy, FAULT_IMU);
-    buddy1_poll(&buddy, 1010U);
+    buddy1_poll(&buddy, 1020U);
 
     telemetry_data_t decoded;
     assert(telemetry_unpack(last_telemetry_packet, &decoded));
@@ -135,26 +153,33 @@ int main(void)
     assert(!buddy1_take_command(&buddy, &received));
 
     fake_mqtt_connected = false;
-    buddy1_poll(&buddy, 1020U);
+    buddy1_poll(&buddy, 1030U);
     assert(buddy1_network_state(&buddy) == NET_CONNECTING);
     assert(connect_calls == 2U);
 
     fake_connection_failed = true;
-    buddy1_poll(&buddy, 1021U);
+    buddy1_poll(&buddy, 1031U);
     assert(buddy1_network_state(&buddy) == NET_RECONNECT_WAIT);
-    buddy1_poll(&buddy, 2021U);
+    buddy1_poll(&buddy, 2031U);
     assert(buddy1_network_state(&buddy) == NET_CONNECTING);
     assert(connect_calls == 3U);
 
     fake_mqtt_connected = true;
-    buddy1_poll(&buddy, 2030U);
+    buddy1_poll(&buddy, 2040U);
+    assert(buddy1_network_state(&buddy) == NET_CONNECTING);
+    fake_subscribed = true;
+    buddy1_poll(&buddy, 2050U);
     assert(buddy1_network_state(&buddy) == NET_CONNECTED);
     assert(telemetry_unpack(last_telemetry_packet, &decoded));
     assert(decoded.fault_flags == (FAULT_IMU | FAULT_WIFI_LOSS));
 
-    buddy1_poll(&buddy, 3030U);
+    buddy1_poll(&buddy, 3050U);
     assert(telemetry_unpack(last_telemetry_packet, &decoded));
     assert(decoded.fault_flags == FAULT_IMU);
+
+    fake_connection_failed = true;
+    buddy1_poll(&buddy, 3051U);
+    assert(buddy1_network_state(&buddy) == NET_RECONNECT_WAIT);
 
     puts("PASS: Buddy 1 connect/retry, telemetry, and command handling");
     return 0;

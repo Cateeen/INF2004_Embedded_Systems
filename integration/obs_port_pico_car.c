@@ -25,6 +25,8 @@
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
+#include "line_status.h"
+#include "pico/critical_section.h"
 
 /* Optional real line sensor (TCRT5000 D0). Define CAR_LINE_PIN (any free GPIO) in CMake to use it.
  * CAR_LINE_ACTIVE_LEVEL = pin level that means "line under sensor" (check your module: often 0 = dark/black). */
@@ -38,7 +40,16 @@
 
 static queue_t s_q_to_vc;               /* obs_msg_t */
 static queue_t s_q_to_obs;              /* uint8_t   */
-static volatile bool     s_run = false;
+
+/*
+ * Shared safety status.
+ * Core 0 publishes; Core 1 reads.
+ */
+static critical_section_t s_safety_lock;
+static uint32_t s_fault_bits = 0U;
+static bool s_obstacle_present = false;
+
+static bool s_run = false;
 static volatile uint32_t s_line_until_ms = 0U;
 
 static const char *k_type[8]   = { "NONE", "PROXIMITY", "PROFILE", "BYPASS_REQ",
@@ -58,6 +69,12 @@ void car_link_init(void)
 {
     queue_init(&s_q_to_vc, sizeof(obs_msg_t), QUEUE_DEPTH);
     queue_init(&s_q_to_obs, 1U, QUEUE_DEPTH);
+
+    critical_section_init(&s_safety_lock);
+
+    s_fault_bits = 0U;
+    s_obstacle_present = false;
+    s_run = false;
 }
 
 bool vc_port_msg_recv(obs_msg_t *m, uint32_t timeout_ms)
@@ -75,12 +92,31 @@ bool vc_port_msg_recv(obs_msg_t *m, uint32_t timeout_ms)
 
 void vc_port_cmd_send(uint8_t cmd)
 {
-    (void)queue_try_add(&s_q_to_obs, &cmd);
+    if (!queue_try_add(&s_q_to_obs, &cmd))
+    {
+        /*
+         * A failed command delivery could lose ABORT,
+         * SCAN_REQ or another control command.
+         */
+        obs_port_fault_set(CAR_FAULT_QUEUE_OVERFLOW);
+    }
+}
+
+static void car_run_set(bool enabled)
+{
+    critical_section_enter_blocking(&s_safety_lock);
+    /* Fault latched: GO cannot re-arm the vehicle. */
+    s_run = enabled && (s_fault_bits == 0U);
+    critical_section_exit(&s_safety_lock);
 }
 
 bool vc_port_run_enabled(void)
 {
-    return s_run;
+    bool enabled;
+    critical_section_enter_blocking(&s_safety_lock);
+    enabled = s_run && (s_fault_bits == 0U);
+    critical_section_exit(&s_safety_lock);
+    return enabled;
 }
 
 /* ---------------- obs_port.h ---------------- */
@@ -162,7 +198,7 @@ obs_echo_t obs_port_measure(uint16_t *pulse_us)
 
 static void help(void)
 {
-    printf("keys: g=GO  x=STOP  l=fake line (1 s) s=Scan  a=ABORT  r=RESET  h=help\n");
+    printf("keys: g=GO  x=STOP  s=Scan  a=ABORT  r=RESET_DISABLED  h=help\n");
 }
 
 /* obs_port_cmd_recv - commands from the Vehicle Controller queue; also polls the USB keys. */
@@ -174,12 +210,12 @@ bool obs_port_cmd_recv(uint8_t *cmd, uint32_t timeout_ms)
         int c = getchar_timeout_us(0);
         if (c != PICO_ERROR_TIMEOUT) {
             switch (c) {
-            case 'g': s_run = true;  ts(); printf("[KEY] GO\n");   break;
-            case 'x': s_run = false; ts(); printf("[KEY] STOP\n"); break;
+            case 'g': car_run_set(true);  ts(); printf("[KEY] GO\n");   break;
+            case 'x': car_run_set(false); ts(); printf("[KEY] STOP\n"); break;
             case 'l': s_line_until_ms = obs_port_ms() + LINE_PULSE_MS; ts(); printf("[KEY] fake line for 1 s\n"); break;
             case 's': ts(); printf("[KEY] SCAN\n"); *cmd = (uint8_t)OBS_CMD_SCAN_REQ; return true;
             case 'a': ts(); printf("[KEY] ABORT\n"); *cmd = (uint8_t)OBS_CMD_ABORT; return true;
-            case 'r': ts(); printf("[KEY] RESET\n"); *cmd = (uint8_t)OBS_CMD_RESET; return true;
+            case 'r': ts(); printf("[KEY] RESET disabled: power cycle required after latched fault\n"); break;
             case 'h': help(); break;
             default: break;
             }
@@ -199,9 +235,21 @@ void obs_port_msg_send(const obs_msg_t *m)
 {
     unsigned t = (unsigned)obs_msg_type(m);
 
-    if (!queue_try_add(&s_q_to_vc, m)) {
-        ts(); printf("[WARN] queue to VC full, message dropped\n");
+    if (!queue_try_add(&s_q_to_vc, m))
+    {
+        /*
+        * A lost PROXIMITY, FAULT_EVT or movement request
+        * must be treated as a communication failure.
+        *
+        * Fault storage does not depend on either queue.
+        */
+        obs_port_fault_set(CAR_FAULT_QUEUE_OVERFLOW);
+
+        ts();
+        printf("[ERROR] Queue to VC full - communication fault latched\n");
+        return;
     }
+
     ts();
     printf("[OBS -> VC] %s", (t < 8U) ? k_type[t] : "?");
     if (t == (unsigned)OBS_MSG_PROXIMITY) {
@@ -230,23 +278,79 @@ void obs_port_msg_send(const obs_msg_t *m)
 
 void obs_port_fault_set(uint32_t bits)
 {
+    critical_section_enter_blocking(&s_safety_lock);
+
+    /* Latch fault bits without clearing previous faults. */
+    s_fault_bits |= bits;
+    s_run = false;
+
+    critical_section_exit(&s_safety_lock);
+
     ts();
-    printf("[FAULT] bits=0x%lX (1=NO_ECHO 2=NO_CLEAR_SIDE 4=BYPASS_BLOCKED 8=LINE_NOT_REACQUIRED)\n",
+    printf("[FAULT] bits=0x%lX\n",
            (unsigned long)bits);
 }
 
 void obs_port_obstacle_flag(bool present)
 {
+    critical_section_enter_blocking(&s_safety_lock);
+
+    s_obstacle_present = present;
+
+    critical_section_exit(&s_safety_lock);
+
     ts();
-    printf("[SAFETY FLAG] obstacle present = %s\n", present ? "YES" : "no");
+    printf("[SAFETY FLAG] obstacle present = %s\n",
+           present ? "YES" : "no");
+}
+
+uint32_t car_fault_bits_get(void)
+{
+    uint32_t bits;
+
+    critical_section_enter_blocking(&s_safety_lock);
+
+    bits = s_fault_bits;
+
+    critical_section_exit(&s_safety_lock);
+
+    return bits;
+}
+
+bool car_obstacle_present(void)
+{
+    bool present;
+
+    critical_section_enter_blocking(&s_safety_lock);
+
+    present = s_obstacle_present;
+
+    critical_section_exit(&s_safety_lock);
+
+    return present;
 }
 
 bool obs_port_line_detected(void)
 {
-#ifdef CAR_LINE_PIN
-    if (gpio_get(CAR_LINE_PIN) == CAR_LINE_ACTIVE_LEVEL) {
+    uint32_t now_ms = obs_port_ms();
+
+    /*
+     * Real Buddy 3 line status.
+     * Freshness and synchronization are handled
+     * by the line_status module.
+     */
+    if (line_status_is_present(now_ms))
+    {
         return true;
     }
+
+    /*
+     * Optional bench-only simulated line.
+     * Enable only in a dedicated test build.
+     */
+#ifdef CAR_ENABLE_FAKE_LINE
+    return ((int32_t)(s_line_until_ms - now_ms) > 0);
+#else
+    return false;
 #endif
-    return ((int32_t)(s_line_until_ms - obs_port_ms()) > 0);
 }

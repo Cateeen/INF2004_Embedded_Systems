@@ -36,9 +36,9 @@
 /* Raw ADC above this = dark surface (black line). Calibrate by
  * reading values on white and on black, then set midpoint here.
  * Flip IR_BLACK_IS_HIGH if your module outputs LOW on black.        */
-#define IR_BARCODE_THRESHOLD    (2000U)
-#define IR_CENTER_THRESHOLD     (2000U)
-#define IR_RIGHT_THRESHOLD      (2000U)
+#define IR_BARCODE_THRESHOLD    (1000U)
+#define IR_CENTER_THRESHOLD     (1000U)
+#define IR_RIGHT_THRESHOLD      (1000U)
 #define IR_BLACK_IS_HIGH        (true)
 
 #define SAMPLE_PERIOD_MS        (100U)

@@ -22,7 +22,7 @@
  * measuring the encoder-count change. It is intentionally not inferred from
  * wheel diameter because gearbox and quadrature resolution vary by hardware.
  */
-#define BARCODE_COUNTS_PER_MODULE 5U
+#define BARCODE_COUNTS_PER_MODULE 35U
 #define BARCODE_MODULE_TOLERANCE_PERCENT 35U
 #define BARCODE_SAMPLE_PERIOD_MS 1U
 #define BARCODE_MOTOR_PWM 10
@@ -51,6 +51,14 @@ static int32_t average_encoder_count(
     return (int32_t)(total / 2);
 }
 
+static void wait_for_serial_monitor(void)
+{
+    while (!stdio_usb_connected())
+    {
+        sleep_ms(50U);
+    }
+}
+
 int main(void)
 {
     encoder_t left_encoder;
@@ -69,20 +77,24 @@ int main(void)
     int32_t previous_barcode_count;
 
     stdio_init_all();
-    while (!stdio_usb_connected())
-    {
-        sleep_ms(50U);
-    }
-
-    printf("\n=== Buddy 3 Code 39 barcode test ===\n");
-    printf("Connect the left IR sensor and both wheel encoders.\n");
-    printf("The motors will start moving forward automatically.\n");
-    stdio_flush();
 
     line_following_init();
     encoder_gpio_init(LEFT_ENCODER_A_GPIO, LEFT_ENCODER_B_GPIO);
     encoder_gpio_init(RIGHT_ENCODER_A_GPIO, RIGHT_ENCODER_B_GPIO);
     motor_driver_init();
+
+    /*
+     * Keep the motor driver's emergency stop active until the USB serial
+     * monitor has connected. This guarantees that opening the monitor is
+     * required before the test can start commanding the motors.
+     */
+    wait_for_serial_monitor();
+
+    printf("\n=== Buddy 3 Code 39 barcode test ===\n");
+    printf("Connect the left IR sensor and both wheel encoders.\n");
+    printf("Serial monitor connected; starting forward motion.\n");
+    stdio_flush();
+
     motor_clear_emergency_stop();
 
     encoder_init(

@@ -349,6 +349,22 @@ static void do_backoff(void)
     vc_port_cmd_send((uint8_t)OBS_CMD_SCAN_REQ);
 }
 
+static void execute_manual_motion(uint8_t motion)
+{
+    if (!car_motion_allowed()) return;
+    set_following(false);
+    motor_brake_all();
+    switch (motion) {
+    case 0U: (void)drive_fwd(VC_MM_PER_S_FWD); break;
+    case 1U: (void)drive_rev(VC_REVERSE_MM); break;
+    case 2U: (void)turn((uint8_t)OBS_SIDE_LEFT, 90U); break;
+    case 3U: (void)turn((uint8_t)OBS_SIDE_RIGHT, 90U); break;
+    case 4U: (void)turn((uint8_t)OBS_SIDE_RIGHT, 180U); break;
+    default: break;
+    }
+    motor_brake_all();
+}
+
 static void handle(const obs_msg_t *m)
 {
     switch (obs_msg_type(m)) {
@@ -409,6 +425,7 @@ static void handle(const obs_msg_t *m)
 void vc_task(void)
 {
     obs_msg_t m;
+    uint8_t manual_motion;
 
     motor_driver_init();
     motor_clear_emergency_stop();
@@ -428,6 +445,12 @@ void vc_task(void)
         bool estopped = motor_is_emergency_stopped();
         bool obstacle = car_obstacle_present();
         uint8_t position = POS_LOST;
+
+        if (go && vc_port_motion_recv(&manual_motion)) {
+            execute_manual_motion(manual_motion);
+            s_prev_run = go;
+            continue;
+        }
 
         /*
          * Keep the line status fresh while stopped or avoiding an obstacle.

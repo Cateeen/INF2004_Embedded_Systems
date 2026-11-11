@@ -28,6 +28,7 @@ static bool command_allowed(uint8_t type)
         case CMD_RESUME:
         case CMD_STOP:
         case CMD_REQUEST_STATUS:
+        case CMD_JUNCTION:
             return true;
         default:
             return false;

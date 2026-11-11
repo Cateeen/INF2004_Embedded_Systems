@@ -55,7 +55,7 @@ bool command_pack(const remote_command_t *c,
                   uint8_t out[COMMAND_PACKET_SIZE])
 {
     if ((c == NULL) || (out == NULL)) return false;
-    if (c->type > CMD_REQUEST_STATUS || c->argument > 31U) return false;
+    if (c->type > CMD_JUNCTION || c->argument > 31U) return false;
     out[0] = (uint8_t)((c->type << 5U) | (c->argument & 0x1FU));
     out[1] = c->sequence;
     return true;
@@ -68,6 +68,6 @@ bool command_unpack(const uint8_t in[COMMAND_PACKET_SIZE],
     c->type = (uint8_t)(in[0] >> 5U);
     c->argument = (uint8_t)(in[0] & 0x1FU);
     c->sequence = in[1];
-    if (c->type > CMD_REQUEST_STATUS) return false;
+    if (c->type > CMD_JUNCTION) return false;
     return true;
 }

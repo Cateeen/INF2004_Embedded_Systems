@@ -77,9 +77,15 @@ void car_observer_poll(void)
         s_last_status_ms = now_ms;
     }
     buddy1_poll(&s_buddy1, now_ms);
-    /* Remote commands are deliberately NOT executed. In particular, START,
-       RESUME and STOP are not connected to motion without a safety protocol. */
-    remote_command_t ignored;
-    while (buddy1_take_command(&s_buddy1, &ignored)) { (void)ignored; }
+    remote_command_t command;
+    while (buddy1_take_command(&s_buddy1, &command)) {
+        if (command.type == CMD_START) {
+            vc_port_set_run(true);
+        } else if (command.type == CMD_STOP) {
+            vc_port_set_run(false);
+        } else if (command.type == CMD_JUNCTION && command.argument <= 4U) {
+            vc_port_motion_send(command.argument);
+        }
+    }
 #endif
 }

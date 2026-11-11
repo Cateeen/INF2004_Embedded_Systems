@@ -66,7 +66,8 @@ typedef enum {
     CMD_PAUSE = 2,
     CMD_RESUME = 3,
     CMD_STOP = 4,
-    CMD_REQUEST_STATUS = 5
+    CMD_REQUEST_STATUS = 5,
+    CMD_JUNCTION = 6
 } command_type_t;
 
 typedef struct {

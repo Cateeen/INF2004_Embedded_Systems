@@ -1,7 +1,26 @@
-/* car_main.c - obs_core (core 0): obstacle task.  vc_core (core 1): Vehicle Controller + motors.
- * Bring-up build, no RTOS. */
+/*
+ * car_main.c - application entry point.
+ *
+ * The default build remains the existing bare-metal bring-up until the
+ * uT-Kernel task modules are migrated. Define PICOCAR_USE_UTKERNEL when the
+ * vehicle_system startup module is included in the target.
+ */
 #include <stdio.h>
 #include "pico/stdlib.h"
+
+#if defined(PICOCAR_USE_UTKERNEL)
+
+#include "vehicle_system.h"
+
+int main(void)
+{
+    stdio_init_all();
+    vehicle_system_run();
+    return 0;
+}
+
+#else
+
 #include "pico/multicore.h"
 #include "car_link.h"
 #include "obs_scan.h"
@@ -42,3 +61,5 @@ int main(void)
     obs_core();
     return 0;
 }
+
+#endif

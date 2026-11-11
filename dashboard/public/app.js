@@ -64,8 +64,6 @@ async function post(url,obj){
 $('robot-start').addEventListener('click',()=>post('/api/command',{type:'start'}));
 $('robot-stop').addEventListener('click',()=>post('/api/command',{type:'stop'}));
 document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>post('/api/command',{type:button.dataset.command})));
-const letters='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-for(const letter of letters){const option=document.createElement('option');option.value=letter;option.textContent=letter;$('mapping-letter').append(option);}
 async function loadMapping(){try{const r=await fetch('/api/mapping');const mappings=await r.json();$('mapping-movement').value=mappings[$('mapping-letter').value]||'forward';}catch(e){console.warn('Mapping load failed',e);}}
 $('mapping-letter').addEventListener('change',loadMapping);
 $('save-mapping').addEventListener('click',()=>post('/api/mapping',{letter:$('mapping-letter').value,movement:$('mapping-movement').value}));

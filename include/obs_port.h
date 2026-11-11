@@ -15,6 +15,9 @@ typedef enum {
 /* Set up the hardware and kernel objects: TRIG/ECHO pins, ECHO edge interrupt, servo PWM, echo event flag. Call once before the task runs.*/
 void     obs_port_init(void);
 
+/* Shared Pico GPIO dispatcher entry point for the ultrasonic echo IRQ. */
+void     obs_echo_irq(unsigned int gpio, uint32_t events);
+
 /* Return a millisecond timestamp (monotonic, 32 bit). */
 uint32_t obs_port_ms(void);
 

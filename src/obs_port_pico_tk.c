@@ -9,17 +9,19 @@
  */
 #include "obs_port.h"
 #include "obs_cfg.h"
+#include "vehicle_messages.h"
+#include "vehicle_system.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
 #include <tk/tkernel.h>                   /* VERIFY: header path in the template */
+#include <stdio.h>
+#include <string.h>
 
 /* ---- Objects owned elsewhere (agree names with the team) --------------- */
 extern ID g_flg_fault;                    /* team fault word, event flag (32 bit)      */
 extern ID g_flg_status;                   /* status flags: obstacle present            */
-extern ID g_mbf_obs_out;                  /* Obstacle -> Vehicle Controller, 8-byte msgs */
-extern ID g_mbf_obs_in;                   /* Vehicle Controller -> Obstacle, 1-byte cmds */
 extern bool line_following_line_detected(void);   /* Buddy 3 API (name to agree) */
 
 #define STATUS_OBSTACLE_PRESENT   (1UL << 0)      /* PROPOSAL: bit in g_flg_status */
@@ -31,6 +33,8 @@ extern bool line_following_line_detected(void);   /* Buddy 3 API (name to agree)
 static ID s_flg_echo;
 static volatile uint16_t s_rise_us;               /* written only by the ISR            */
 static volatile uint16_t s_pulse_us;              /* written only by the ISR            */
+static uint32_t s_obstacle_sequence;
+static uint32_t s_fault_sequence;
 
 /**
  * obs_echo_irq - ECHO pin edge handler (runs in interrupt context).
@@ -46,7 +50,7 @@ static volatile uint16_t s_pulse_us;              /* written only by the ISR    
  * the SDK keeps one callback per core, shared with the encoders (GP16-19) and
  * any IMU INT1. The team's single GPIO dispatcher calls this (see INTEGRATION.md).
  */
-void obs_echo_irq(uint gpio, uint32_t events)
+void obs_echo_irq(unsigned int gpio, uint32_t events)
 {
     (void)gpio;
     if ((events & GPIO_IRQ_EDGE_RISE) != 0U) {
@@ -169,19 +173,91 @@ obs_echo_t obs_port_measure(uint16_t *pulse_us)
  */
 bool obs_port_cmd_recv(uint8_t *cmd, uint32_t timeout_ms)
 {
-    INT n = tk_rcv_mbf(g_mbf_obs_in, cmd, (TMO)timeout_ms);   /* timeout 0 = poll; VERIFY */
-    return (n > 0);
+    obstacle_command_message_t message;
+    INT received;
+
+    if (cmd == NULL) {
+        return false;
+    }
+
+    received = tk_rcv_mbf(g_mbf_obstacle_commands, &message,
+                          (TMO)timeout_ms);
+    if (received != (INT)sizeof(message)) {
+        return false;
+    }
+
+    switch (message.command) {
+        case VEHICLE_OBSTACLE_SCAN_REQUEST:
+            *cmd = (uint8_t)OBS_CMD_SCAN_REQ;
+            return true;
+        case VEHICLE_OBSTACLE_BYPASS_COMPLETE:
+            *cmd = (uint8_t)OBS_CMD_BYPASS_DONE;
+            return true;
+        case VEHICLE_OBSTACLE_ABORT:
+            *cmd = (uint8_t)OBS_CMD_ABORT;
+            return true;
+        case VEHICLE_OBSTACLE_RESET:
+            *cmd = (uint8_t)OBS_CMD_RESET;
+            return true;
+        default:
+            return false;
+    }
 }
 
 /**
- * obs_port_msg_send - send one 8-byte message to the Vehicle Controller.
- * What it does: the kernel copies the message into the message buffer, so no
- * memory is shared and nothing can race. It does not wait if the buffer is full.
+ * obs_port_msg_send - translate one legacy event into a typed message.
+ * What it does: the kernel copies the typed value into its message buffer.
  */
 void obs_port_msg_send(const obs_msg_t *m)
 {
-    /* 8-byte message copied by the kernel: no shared memory, no race. */
-    (void)tk_snd_mbf(g_mbf_obs_out, (void *)m, (INT)sizeof(obs_msg_t), TMO_POL);   /* VERIFY drop policy when full */
+    obstacle_event_message_t obstacle;
+    fault_message_t fault;
+    obs_msg_type_t type;
+    uint16_t distance_mm = 0U;
+    INT result;
+
+    if (m == NULL) {
+        return;
+    }
+
+    type = obs_msg_type(m);
+    if (type == OBS_MSG_FAULT_EVT) {
+        memset(&fault, 0, sizeof(fault));
+        fault.header.type = VEHICLE_MESSAGE_FAULT;
+        fault.header.version = VEHICLE_MESSAGE_VERSION;
+        fault.header.sequence = ++s_fault_sequence;
+        fault.header.timestamp_ms = obs_port_ms();
+        fault.source = VEHICLE_FAULT_SENSOR;
+        fault.recoverable = 1U;
+        fault.code = (uint16_t)obs_msg_unpack_fault(m);
+        result = tk_snd_mbf(g_mbf_faults, &fault, (INT)sizeof(fault), TMO_POL);
+    } else {
+        if (type == OBS_MSG_PROXIMITY) {
+            distance_mm = (uint16_t)obs_msg_unpack_proximity(m);
+        } else if (type == OBS_MSG_PROFILE) {
+            obs_profile_msg_t profile;
+            obs_msg_unpack_profile(m, &profile);
+            distance_mm = profile.closest_mm;
+        } else {
+            return;
+        }
+
+        memset(&obstacle, 0, sizeof(obstacle));
+        obstacle.header.type = VEHICLE_MESSAGE_OBSTACLE_EVENT;
+        obstacle.header.version = VEHICLE_MESSAGE_VERSION;
+        obstacle.header.sequence = ++s_obstacle_sequence;
+        obstacle.header.timestamp_ms = obs_port_ms();
+        obstacle.distance_mm = distance_mm;
+        obstacle.obstacle_class = (distance_mm != 0U) ? 1U : 0U;
+        obstacle.emergency = (distance_mm != 0U && distance_mm <= 120U) ?
+                             1U : 0U;
+        result = tk_snd_mbf(g_mbf_obstacle_events, &obstacle,
+                            (INT)sizeof(obstacle), TMO_POL);
+    }
+
+    if (result != E_OK) {
+        printf("obstacle port: typed event send failed (%d)\n", (int)result);
+    }
 }
 
 /**

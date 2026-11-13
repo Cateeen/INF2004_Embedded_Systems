@@ -27,6 +27,44 @@ Test IDs never change and are never reused, even if a test is dropped.
 
 ## How to run and record a test
 
+The RP2040 I2C register-mock tests run on a host, not on the robot. From
+`testing/integration/i2c_host` in Ubuntu/WSL:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -Wno-old-style-declaration -I. test.c -o /tmp/i2c_host_test
+/tmp/i2c_host_test
+```
+
+They do not verify electrical timing or actual I2C hardware.
+
+The LSM303DLHC transport tests also run against a host I2C/API mock, not the
+robot. From `testing/integration/imu_i2c_host`:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -Isys -I../../../app_program/imu \
+  test.c ../../../app_program/imu/lsm303dlhc_i2c.c \
+  ../../../app_program/imu/lsm303dlhc_reader.c \
+  ../../../app_program/imu/lsm303dlhc_accel.c -o imu_i2c_host_test
+./imu_i2c_host_test
+```
+
+These tests verify software configuration and mocked transfer handling only;
+they do not verify the sensor, address selection, bus timing, or timestamp
+accuracy on the robot.
+
+The HSR04 distance conversion test is hardware-independent. From
+`testing/integration/hcsr04_host`:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -I../../../app_program/obstacle \
+  test.c ../../../app_program/obstacle/hcsr04.c \
+  ../../../app_program/obstacle/hcsr04_capture.c -o hcsr04_host_test
+./hcsr04_host_test
+```
+
+It checks only Echo pulse-width conversion and input validation, not GPIO,
+level shifting, sensor acquisition, or servo operation.
+
 1. **Define it first.** Add a row to the *Test cases* table in the right
    `TEST_LOG.md`: ID, what it checks, how, and the expected result.
 2. **Automate it if you can.** Add a `TEST_CHECK` with the same ID to
@@ -36,9 +74,11 @@ Test IDs never change and are never reused, even if a test is dropped.
 3. **Build the test image and flash it.**
    ```sh
    cd build_make
-   make TEST=1 -j8        # -> mtk3pico_smp1_usb_cdc_wifi_test.uf2
+   make TEST=1 -j8        # software startup tests; template examples disabled
+   make TEST=1 EXAMPLES=1 -j8  # also run template tests; drives GP19
    ```
-   The test image runs every subsystem's tests at power-up and prints one
+   With `EXAMPLES=1`, the test image runs every template subsystem's tests
+   at power-up and prints one
    `[TEST] <ID> PASS|FAIL` line per check. (A normal `make` leaves the tests out.)
 4. **Save the console output** to `logs/`, named `YYYY-MM-DD_<what>.txt`:
    ```sh

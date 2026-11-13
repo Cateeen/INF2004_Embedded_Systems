@@ -2,6 +2,8 @@
 
 The tables are pre-filled with the **example** in `app_program/` (marked
 *example*). Replace those rows with your own as you replace the example code.
+The examples are disabled by default. `EXAMPLES=1` enables them and drives
+GP19; disconnect the robot's GP19 encoder wire before using that build.
 
 Fill this in at the start of the project and keep it up to date. It is the
 single place that says **who owns what**, so that five people can work in
@@ -50,30 +52,37 @@ fixed.
 | GP23, GP24, GP25, GP29 | *reserved* | Pico W radio |
 | GP0 | | (taken whenever the team builds with `CRASH_REPORT=1`) |
 | GP1 | | (taken whenever the team builds with `CRASH_REPORT=1`) |
-| GP2 | | |
-| GP3 | | |
-| GP4 | | |
-| GP5 | | |
+| GP2 | IMU | I2C1 SDA |
+| GP3 | IMU | I2C1 SCL |
+| GP4 | obstacle detection | ultrasonic echo input |
+| GP5 | obstacle detection | ultrasonic trigger output |
 | GP6 | | |
 | GP7 | | |
-| GP8 | | |
-| GP9 | | |
-| GP10 | | |
-| GP11 | | |
+| GP8 | motion control | motor 1 A, left wheel |
+| GP9 | motion control | motor 1 B, left wheel |
+| GP10 | motion control | motor 2 A, right wheel |
+| GP11 | motion control | motor 2 B, right wheel |
 | GP12 | | |
 | GP13 | | |
 | GP14 | | |
-| GP15 | | |
-| GP16 | | |
-| GP17 | | |
-| GP18 | | |
-| GP19 | *example:* S1 | external LED (LED + 330 Ω to GND) |
+| GP15 | obstacle detection | scanning servo PWM |
+| GP16 | odometry bring-up | left encoder A |
+| GP17 | odometry bring-up | left encoder B |
+| GP18 | odometry bring-up | right encoder A |
+| GP19 | odometry bring-up / *example:* S1 | right encoder B / example LED; never enable both |
 | GP20 | | |
 | GP21 | | |
 | GP22 | | |
-| GP26 | | (ADC0 capable) |
-| GP27 | | (ADC1 capable) |
-| GP28 | | (ADC2 capable) |
+| GP26 | line/barcode | right IR sensor, ADC0 |
+| GP27 | line/barcode | center IR sensor, ADC1 |
+| GP28 | line/barcode | left IR sensor, ADC2 |
+
+These assignments record the supplied pin-connection table; they do not
+enable any device or establish safe electrical levels. The table's ADC0 and
+ADC2 labels were reversed relative to its GPIO numbers; the GPIO numbers were
+confirmed. Verify sensor output voltages and calibration before activation.
+The sensor used for barcode acquisition and the motor driver remain
+unverified. No independent motor-disable arrangement is available.
 
 ## 3. Peripherals
 
@@ -107,12 +116,20 @@ the drivers have no locking to stop it.
 |---|---|---|---|
 | UART1 | | | |
 | I2C0 | | | |
-| I2C1 | | | |
+| I2C1 | IMU | IMU task (planned) | GP2, GP3 |
 | SPI0 | | | |
 | SPI1 | | | |
-| ADC | | | GP26–GP28 |
-| PWM slices (list) | | | |
+| ADC | line/barcode | line/barcode task (planned) | GP26–GP28 |
+| PWM slices 4, 5 | motion control | motion task (planned) | GP8–GP11 |
+| PWM slice 7 | obstacle detection | obstacle task (planned) | GP15 |
 | WiFi radio, TCP/IP, MQTT | *kernel* | `cyw43_utk_task` (built in) | GP23–25, GP29 |
+
+I2C1 sharing with other devices is not yet confirmed. The kernel I2C driver
+remains disabled; when enabled, startup initializes only I2C1 on GP2/GP3 as
+`iicb`. I2C0 still has GP8/GP9 configured and must not be initialized without
+reassigning its motor pins. Confirm bus ownership before enabling I2C. PWM
+ownership covers the entire slice, including any unused channel on the same
+slice.
 
 ### WiFi and MQTT are special
 
@@ -151,6 +168,7 @@ change it only by team agreement. Write down every task you create.
 | 3 | 16–17 | *example:* consumer_task – 16 – core 0 |
 | 4 | 18–19 | *example:* monitor_task – 18 – any |
 | 5 | 20–21 | |
+| Vehicle controller | 10 | `vehicle_controller_task` – 10 – any (opt-in) |
 
 Core: `TP_PRC1` = core 0, `TP_PRC2` = core 1, or "any".
 
@@ -168,6 +186,12 @@ sends to it or waits on it. Agree on the data format before coding.
 | IF-04 | S4 → S3 | shared data under a mutex (owned by S3) | `app_stats`, `mtx_stats` | `APP_STATS`, read only while locked | *example* |
 | IF-05 | S4 → S1 | task control | `tid_led` | `tk_sus_tsk` / `tk_rsm_tsk` / `tk_chg_pri` | *example* |
 | IF-06 | | | | | |
+| IF-07 | application WiFi service → built-in network owner | copied message buffer, nonblocking | bridge-owned, private | legacy five-byte telemetry on `robot/telemetry`, QoS 0; opt-in, no delivery guarantee | team and instructor agreement confirmed |
+| IF-08 | built-in network owner → application WiFi service | atomic link snapshot | bridge-owned, private | link and MQTT readiness with operating-clock timestamp; stale snapshots fault the service | team and instructor agreement confirmed |
+| IF-09 | telemetry producer → application WiFi service | copied message buffer, nonblocking | `g_mbf_telemetry` | ordered telemetry messages; producer handles full-buffer and other errors | pending |
+| IF-10 | motion task → controller | copied message buffer | `g_mbf_motion_status` | sequenced 100 ms commanded-PWM, active-command and latched-fault state; controller period ≤50 ms; no ARM acknowledgement or physical feedback | implementation draft; hardware validation pending |
+| IF-11 | vehicle controller → motion task | copied message buffer, nonblocking | `g_mbf_motion_commands` | ARM/STOP/emergency-stop; VELOCITY is not yet issued | implementation in progress |
+| IF-12 | trusted local input provider → vehicle controller | task-context callback | configured callback/context | GO and emergency-stop levels; callback is bounded and context remains alive for task lifetime | hardware binding pending |
 
 Each interface is tested by at least one integration test
 (`testing/integration/TEST_LOG.md`).

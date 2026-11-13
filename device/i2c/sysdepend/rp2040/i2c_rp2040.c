@@ -79,6 +79,7 @@ LOCAL T_SPLOCK ll_lock[DEV_I2C_UNITNM];
 #endif
 
 #define I2C_INT_ERROR	(I2C_INT_TX_ABRT|I2C_INT_TX_OVER|I2C_INT_RX_OVER|I2C_INT_RX_UNDER)
+#define I2C_STS_WAIT_STOP 0x0006
 
 /*-------------------------------------------------------
  * Interrupt handler
@@ -117,7 +118,7 @@ LOCAL void i2c_inthdr( UINT intno )
 			} else {	// Last data
 				clr_w(I2C_INTR_MASK(unit), I2C_INT_TX_EMPTY);
 				if(p_cb->rdat_num) {
-					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_RESTART;
+					cmd |= I2C_DATA_CMD_CMD_WRITE;
 					p_cb->state = I2C_STS_START;
 				} else {
 					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_STOP;
@@ -135,6 +136,7 @@ LOCAL void i2c_inthdr( UINT intno )
 			*(p_cb->rbuf)++ = in_w(I2C_DATA_CMD(unit)) & I2C_DATA_CMD_DAT;
 			if(--(p_cb->rdat_num)) {
 				cmd = I2C_DATA_CMD_CMD_READ;
+				if(p_cb->rdat_num == 1) cmd |= I2C_DATA_CMD_STOP;
 				out_w(I2C_DATA_CMD(unit), cmd);
 			} else {	// Last data
 				clr_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL);
@@ -143,6 +145,15 @@ LOCAL void i2c_inthdr( UINT intno )
 			}
 		} else {
 			abort = TRUE;	// Error
+		}
+		break;
+	case I2C_STS_WAIT_STOP:
+		if(i2c_sts & I2C_INT_STOP_DET) {
+			(void)in_w(I2C_CLR_STOP_DET(unit));
+			p_cb->state = I2C_STS_STOP;
+			wup = TRUE;
+		} else {
+			abort = TRUE;
 		}
 		break;
 	default:
@@ -158,7 +169,9 @@ LOCAL void i2c_inthdr( UINT intno )
 		wup = TRUE;
 	}
 
-	(void)in_w(I2C_CLR_INTR(unit));	// Clear all Interrupt Registers
+	/* Keep STOP_DET latched until the completion wait, even if it arrives
+	 * before the final receive interrupt. */
+	if(abort) (void)in_w(I2C_CLR_INTR(unit));
 	ClearInt(intno);		// Clear interrupt
 
 	if(wup) {
@@ -176,6 +189,7 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 	UINT	imask;
 	UINT	flgptn;
 	ER	err;
+	BOOL	restart_pending = p_cb->sdat_num > 0 && p_cb->rdat_num > 0;
 
 	p_cb->ioerr = err = E_OK;
 
@@ -196,6 +210,10 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 				cmd = I2C_DATA_CMD_CMD_READ;
 			} else {	// Last data
 				cmd = I2C_DATA_CMD_CMD_READ | I2C_DATA_CMD_STOP;
+			}
+			if(restart_pending) {
+				cmd |= I2C_DATA_CMD_RESTART;
+				restart_pending = FALSE;
 			}
 			set_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL|I2C_INT_ERROR);
 			out_w(I2C_DATA_CMD(unit), cmd);				
@@ -220,6 +238,20 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 		}
 		else err = p_cb->ioerr;
 	}
+	if(err == E_OK && p_cb->ioerr == E_OK) {
+		I2C_LOCK(unit, imask);
+		(void)tk_clr_flg(p_cb->done_flgid, 0);
+		p_cb->state = I2C_STS_WAIT_STOP;
+		set_w(I2C_INTR_MASK(unit), I2C_INT_STOP_DET | I2C_INT_ERROR);
+		I2C_UNLOCK(unit, imask);
+		err = tk_wai_flg(p_cb->done_flgid, 1, TWF_ORW | TWF_BITCLR,
+				 &flgptn, ll_devdat[unit].timout);
+		if(err == E_OK) err = p_cb->ioerr;
+	}
+	I2C_LOCK(unit, imask);
+	out_w(I2C_INTR_MASK(unit), 0);
+	p_cb->state = I2C_STS_STOP;
+	I2C_UNLOCK(unit, imask);
 	out_w(I2C_ENABLE(unit), 0);				// Disable I2C
 
 	return err;

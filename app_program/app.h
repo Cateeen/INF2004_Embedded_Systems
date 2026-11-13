@@ -12,6 +12,7 @@
 #include <tk/tkernel.h>		/* micro T-Kernel API (tk_xxx_yyy) */
 #include <tm/tmonitor.h>	/* T-Monitor API: tm_printf() console output */
 #include <bsp/libbsp.h>		/* Board helpers: gpio_set_pin/val, pwm_... */
+#include "vehicle_messages.h"
 
 /* ---------------------------------------------------------------------
  *  Pins: free for projects are GP0..GP22 and GP26..GP28.  GP0/GP1 are

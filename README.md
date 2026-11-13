@@ -122,17 +122,38 @@ screen /dev/ttyACM0 115200            # Linux
 ```
 
 On Windows, use PuTTY or the VS Code *Serial Monitor* on the new COM port.
-You should see the task reports. Connect an LED with a 330 Ω resistor from
-**GP19** to GND to see subsystem 1's LED blink.
+Template example tasks are disabled by default while the robot is migrated.
+With `EXAMPLES=1`, the template reports appear and subsystem 1 drives GP19
+for an LED. Disconnect the robot's GP19 encoder wire before using that build.
 
 **2.5 Write your own code**
 
 Your code lives in **`app_program/`**. Every `.c` file there, and in its
 subfolders, is compiled automatically.
 
-- **`app_main.c` → `usermain()` is where the program starts.** It first calls
-  every subsystem's `subsystemN_init()` (create kernel objects), then every
-  `subsystemN_start()` (start tasks). Read its comments first.
+- **`app_main.c` → `usermain()` is where the program starts.** It creates
+  vehicle message buffers first. With `EXAMPLES=1`, it then calls every
+  example subsystem's `subsystemN_init()` and `subsystemN_start()`.
+- Do not copy the source `integration/car_main.c` as another entry point.
+  Its default path is a bare-metal `main()` that launches core-specific loops;
+  µT-Kernel already owns startup and calls `usermain()`. The source file's
+  optional `PICOCAR_USE_UTKERNEL` branch delegates to the source
+  `vehicle_system_run()`, not this target's startup configuration. Map its
+  responsibilities as follows:
+  - `vc_core()` / `vc_task()` → the vehicle-controller and motion tasks;
+    kernel tasks and message buffers replace the hand-launched core loop.
+  - `obs_core()` / `obs_step()` → the obstacle task, which owns its sensor and
+    scan operations.
+  - `line_status_init()` / `car_measurements_init()` → line/barcode and
+    odometry producers, which publish copied messages instead of shared state.
+  - Source `line_steering.c` is preserved under `app_program/controller/` as a
+    hardware-independent decision module. It retains its PWM intent values
+    but is not wired to the motion task or started by application startup.
+  - `car_link_init()` → still needs a target-local input provider. Do not call
+    blocking `tm_getchar()` from the controller callback; the callback must
+    return within its task period.
+  Vehicle tasks remain opt-in until local-input binding, motion authorization,
+  and hardware configurations are verified.
 - **One folder per student:** `app_program/subsystem1/` … `subsystem5/`.
   Subsystems 1–4 hold a working example, one task each (LED, producer,
   consumer, monitor). Together they use the main micro T-Kernel APIs and
@@ -149,9 +170,307 @@ subfolders, is compiled automatically.
 
 **Working as a team:** record owners, pins, priorities and the interfaces
 between subsystems in **`TEAM.md`**, and record every test in **`testing/`**
-(see `testing/README.md`). `make TEST=1` builds a test image that runs all
-the subsystem tests at power-up. Short videos of tests and demos are shared
-as unlisted YouTube links, listed in **`videos/`**.
+(see `testing/README.md`). `make TEST=1` tests the vehicle buffers, the
+hardware-independent encoder/odometry calculations, line classification, and
+Code 39 barcode decoding, IMU processing, obstacle profiling, wheel control
+controller safety predicates and GPIO interrupt routing;
+`make TEST=1 EXAMPLES=1` also runs the template subsystem tests. Short videos
+of tests and demos are shared as unlisted YouTube links, listed in **`videos/`**.
+
+The line/barcode task consumes line odometry and publishes line observations
+and decoded barcodes. It and the ADC reader are not started by default.
+The reader exclusively opens the kernel ADC, configures only the explicitly
+selected GP26–GP28 inputs, and requires per-sensor thresholds and polarity.
+Its `line_adc_reader_default_config()` imports the original repository's
+barcode/center/right ADC channels (2/1/0), 1000-count thresholds, and
+black-above polarity; callers still choose the acquisition-span limit.
+The supplied pin map assigns left to GP28 (ADC2), center to GP27
+(ADC1), and right to GP26 (ADC0); the GPIO numbers were confirmed despite
+reversed ADC0/ADC2 labels in the supplied table. The sensor used for barcode
+acquisition is not yet confirmed, and no thresholds are assumed.
+Verify wiring, pin ownership and 3.3 V-compatible sensor outputs before use;
+GP29 is reserved for the radio. A conversion or timing failure latches the
+reader faulted and retains ADC ownership until restart. ADC pins remain analog
+after a normal close. The barcode timestamp precedes its eight conversions;
+the configured maximum span rejects completed reads that took too long, but
+does not bound blocking inside the ADC driver or detect missed edges. The
+driver can wait indefinitely for ADC readiness or synchronous completion;
+independent safety supervision is required. Keep the reader storage alive
+until a normal close, or until reboot after a fault, because an interrupted
+device request may still access its conversion buffer.
+Startup requires an owned sensor-reader callback, barcode settings,
+sampling period and maximum sample/odometry age. The reader timestamps
+barcode acquisition using the same operating clock as odometry. It stops on stale, missing or
+out-of-sequence odometry, unsynchronized barcode edges, read or delivery errors,
+and retries fault delivery. Consumers must also fail safe on stale data when a
+fault cannot be delivered. The scanner uses the mean of polarity-normalized
+wheel count changes, so compatible wheel count scales are required. Tests use
+simulated samples; sensor thresholds, encoder direction, sampling/odometry
+timing and barcode behavior must be verified on hardware before use.
+`line_adc_reader_start_task()` optionally binds the actual ADC reader to the
+line/barcode task; ADC open and pin setup occur inside that task. It requires
+caller-supplied channel selection, thresholds, polarity and timing limits.
+No application startup calls it, and barcode acquisition on GP28 is not
+confirmed by the pin plan.
+
+The IMU processor consumes simulated or caller-provided acceleration,
+distance and timestamps; it does not start a task or access the sensor.
+Its thresholds, mounting orientation and odometry inputs need hardware
+verification before use in the vehicle. The single-owner IMU producer converts
+successful accelerometer samples and fresh, ordered odometry into copied
+estimate messages. Only accelerometer-derived roll and pitch are marked
+valid; dynamic acceleration can make them inaccurate. Yaw and gyro fields are
+not measured. The message includes packed terrain telemetry and latched shock and
+tilt indicators. The caller must report rejected samples, check sample age,
+retain future odometry until its timestamp, and deliver messages; no IMU task
+or hardware reader is started by default. The inactive IMU task owns its
+reader callback, consumes the dedicated odometry buffer, and publishes
+estimates. It stops on invalid or stale inputs, clock, scheduling or delivery
+errors, and retries fault delivery. It requires explicitly configured sampling
+and age limits. Consumers must also fail safe on stale estimates if fault
+delivery fails or the reader blocks; real timing and sensor behavior are
+unverified.
+
+The reported IMU is an LSM303DLHC on I2C1 GP2/GP3. The portable accelerometer
+decoder expects a verified fresh six-byte read configured for little-endian,
+normal-mode +/-2g operation, and an explicit vehicle-axis mapping. It does not
+configure the sensor or access I2C. Bus ownership and any other devices are
+not yet confirmed. The kernel I2C driver is disabled; if explicitly enabled,
+startup initializes only I2C1 on GP2/GP3 as `iicb`. Confirm ownership before
+enabling it. I2C0 is still configured on motor pins GP8/GP9 and must not be
+initialized until its pins are reassigned.
+The RP2040 I2C driver's transaction sequencing has host-level register-mock
+tests, but it has not been validated on the physical bus. Timeouts and bus
+faults must be handled independently; do not treat a software build as sensor
+verification.
+The inactive LSM303DLHC reader adapter connects a supplied fresh-transfer
+callback to the IMU task. The transport must configure the verified mode,
+establish that each sample is new, supply all six bytes and a valid acquisition
+timestamp, and own the bus; the adapter cannot independently verify those
+claims. An opt-in I2C1 transport is now available in
+`app_program/imu/lsm303dlhc_i2c.c`: it opens `iicb` exclusively, accepts the
+sensor address as configuration (the imported default is 0x19), checks
+WHO_AM_I and control registers, configures 100 Hz normal-mode +/-2g acquisition,
+uses the original 1.05 mg/LSB scale and X/Y/Z signs (-,+,-), waits for
+ZYXDA, and reads all six output bytes. It supplies timestamps on the
+`tk_get_otm` clock that precede the corresponding acquisition. The ready wait
+is capped at 100 ms; kernel I2C transaction timeouts can add up to the driver's
+configured timeout for each bus operation. Any transport error latches a
+fault. `lsm303dlhc_i2c_start_imu_task()` wires this reader into the IMU task
+with static context lifetime; sensor initialization and reads execute in the
+IMU task context. No application startup calls it.
+I2C remains disabled by default; bus sharing and timestamps have not been
+verified on physical hardware. The original source also initialized the
+magnetometer, but the current vehicle message/processor path consumes only
+accelerometer data.
+
+The obstacle task has an opt-in Pico callback adapter in
+`app_program/obstacle/obs_pico_port.c`. It uses the shared GPIO dispatcher for
+Echo edges and runs the task on core 0. It is not registered or started by
+application startup. Its default configuration deliberately leaves Echo
+voltage safety and servo endpoint confirmations false and servo pulse limits
+unset; do not enable it until the Echo signal is confirmed 3.3 V-safe and the
+servo endpoints are measured. The original source's Pico-car port itself says
+it was not compiled or hardware-tested, and its servo values are placeholders.
+
+The obstacle profile module processes simulated distance scans only. Its
+geometry and thresholds are placeholders; a clear scan or computed bypass is
+not proof that the path is safe. The obstacle producer emits typed ahead and
+scan observations with an explicitly configured emergency distance; emergency
+indications are not latched. Scan distance is the minimum measured range,
+while target distance belongs to the selected profile. Consumers must check
+freshness, latch safety conditions and independently veto motion. Bypass
+directions are advisory and unverified. The inactive obstacle task monitors
+ahead and starts scans only on controller request. With the reported single
+scanning sensor, forward monitoring pauses during scans: the controller must
+confirm the vehicle is stopped before requesting a scan and keep it stopped
+until a fresh ahead observation arrives after scanning or cancellation.
+The task cannot independently stop motors or verify that precondition. Its
+optional initialization callback, polling callback and stop callback share the
+obstacle task's owner context. The polling and stop callbacks must return
+promptly; a blocked callback or failed fault delivery requires independent
+freshness supervision. The reported ultrasonic sensor is an HSR04, but its
+Echo voltage/level shifting and the servo's safe pulse limits are unknown.
+Do not connect a 5 V Echo directly to the Pico W or activate the sensor/servo
+until those details are verified. The opt-in callback adapter described above
+is not started by application startup and has not been hardware-tested.
+The inactive `hcsr04_distance_mm()` helper converts a measured Echo high-pulse
+width to millimetres using an explicitly supplied sound speed; it does not
+measure the Echo pulse or initialize GPIO. The companion Echo capture state
+machine validates rising/falling edge timestamps, timer wrap and timeout, but
+also does not access GPIO; a hardware integration must capture both edges
+without missing the short pulse.
+
+Wheel-speed control calculates PWM magnitudes only. The opt-in hardware motion
+task can now apply them through `app_program/motion/motor_driver.c`; application
+startup does not call it. The driver starts braked with emergency stop latched
+and only its initializing task may control it. Hardware mode requires an
+explicit, fresh ARM command while stopped, followed by a fresh VELOCITY command;
+STOP does not re-arm it. It applies the original left/right motor polarity
+mapping, but wiring and direction must be checked with the wheels raised.
+Keep I2C0 disabled or move its GP8/GP9 pins before using the motors. Gains,
+encoder signs, emergency-stop behavior, independent stopping and real-time
+behavior remain unverified; this port has only build-level validation.
+The motion feedback adapter calculates signed wheel speeds from consecutive,
+fresh odometry messages with explicit per-wheel calibration and timing limits.
+The standalone motion control step combines it with the PID for straight
+forward or reverse movement. It waits for two fresh samples, rejects unexpected
+wheel direction, and latches a zero-output fault on stale or invalid feedback.
+It must be checked periodically even without new messages; it cannot stop
+hardware or replace an independent watchdog if its caller stalls. Neither
+component consumes a buffer or drives motors. The feedback age and interval
+limits must not exceed 250 ms.
+
+The motion task has a simulation entry point and a separate opt-in hardware
+entry point. Both consume the dedicated command and odometry buffers; only
+hardware mode publishes motion status, and neither entry point is started by
+default. Straight velocity commands use signed cm/s and expire from their
+timestamp; turns and nonzero angular velocities are rejected. Hardware mode
+requires the controller to send ARM only after its safety checks; an unarmed
+velocity command faults. Ordinary stop takes precedence over movement already
+queued, while emergency stop latches a fault until restart. Start the controller
+before the hardware motion task so the status buffer has a consumer; status
+delivery failure faults and stops the motion task. The controller must handle
+faults, supervise freshness independently, and have active consumers for the
+other odometry buffers. Its task period must be no more than 50 ms to keep up
+with the 100 ms status publication interval. The hardware path has only
+build-level validation and has not been flashed or tested on the robot.
+
+The motion-status message reports task-commanded signed PWM, command activity
+and latched faults, with sequence numbers and timestamps. It does not report
+ARM acceptance, is not motor telemetry, and cannot prove that the vehicle has
+physically stopped. The controller requires a fresh status reporting zero
+commanded output before requesting ARM, and faults on stale, invalid, faulted
+or non-idle status. Do not enable VELOCITY control until an explicit arm-ready
+acknowledgement and an independently validated physical-stop contract exist.
+
+The standalone controller safety monitor validates line, IMU and obstacle
+freshness and ordering, latches faults, and requires a new go edge after a
+veto. Its thresholds require robot validation. During a scan it blocks
+following until a post-scan ahead reading; the caller must independently verify
+the vehicle is stopped before requesting the scan and keep it stopped.
+The monitor does not start a controller task, send commands, verify a motor
+stop, or clear an emergency stop. The controller and motion task must enforce
+those responsibilities when integrated, including a watchdog independent of
+the monitor's periodic checks.
+An opt-in controller monitor task connects these checks to the line, IMU,
+forward-obstacle and fault buffers for diagnostics only. Start it before the
+producers and never alongside another consumer of those buffers. It never
+arms motion, requests scans, sends commands or verifies a physical stop; keep
+motor power safely disabled. It steps the advisory state machine with go held
+low; faults enter the faulted state and stop monitoring until restart. This is
+not the vehicle controller task or a substitute for independent motor safety.
+
+The standalone controller state machine is an advisory simulation of waiting,
+following, blocked, scanning and faulted states. Its single owner supplies
+sensor observations to its safety monitor and calls it every cycle with a
+current trusted local go input. A go signal already high at startup, or held
+high through a veto, cannot arm or rearm; release and press it again after
+conditions clear. Faults and emergency stop remain latched until restart.
+The state machine does not start a task, steer, send motion commands, request
+scans or verify physical stopping. `FOLLOWING` is permission to follow, not
+proof that a vehicle is following a line. Scanning still requires independently
+verified stopping and a fresh post-scan ahead observation. Remote commands are
+not connected. Independent motor-stop and watchdog mechanisms remain required.
+
+An opt-in `vehicle_controller_task` now connects this safety gate to the line,
+IMU, obstacle, fault and motion-status buffers and sends
+ARM/STOP/emergency-stop messages. Its required local-input callback supplies
+trusted GO and emergency-stop levels; dashboard commands alone cannot arm. It
+sends no VELOCITY commands yet because the motion task still rejects steering
+commands. The motion status is commanded state, not physical feedback. The
+controller exclusively consumes those buffers, so do not start it alongside
+`controller_monitor_start()`. It is not started by application startup and has
+not been hardware-tested.
+
+The opt-in application WiFi service supports simulated callbacks or an outbound
+MQTT bridge backend.
+The template's built-in `cyw43_utk_task` owns CYW43, lwIP and MQTT; neither the
+application task nor its callbacks may call those APIs. The service consumes copied
+telemetry and reports connection status; it holds a message when the backend
+reports temporary backpressure and faults on stale or invalid telemetry and
+delivery failures. A ready controller must consume status and faults, and
+publishers must handle full buffers. No service backend or remote command
+handling is started by default. Callbacks must return
+promptly and an independent supervisor must detect a stalled service.
+The standalone command decoder understands the earlier dashboard's two-byte
+packet, but is not connected to the service or controller. Its sequence wraps
+at 255, and the packet has no sender timestamp or authentication; decoding
+alone cannot prove freshness, prevent replay or authorize movement.
+
+The outbound MQTT bridge adds a separate copied message buffer for the network
+owner. After buffer initialization and startup tests, a single startup owner may
+call `wifi_service_start_mqtt(period_ms, status_period_ms, telemetry_max_age_ms,
+owner_max_age_ms)` in a `NET=lwip MQTT=1` build. The last argument bounds the
+age of network-owner link snapshots and must be at least the service period;
+allow for scheduling and the network poll interval. A missing, stale or
+inconsistent snapshot stops the service. Until the first owner poll, status is
+disconnected for at most that interval. Retry and error counts are not measured
+by this backend and are reported as zero. `wifi_telemetry_make()` builds a
+copied telemetry message containing the legacy five-byte packet. Its seven-bit
+wire sequence comes from the low bits of the message's 32-bit sequence; the
+producer must advance that sequence only after successful queueing and use the
+operating-clock timestamp of its oldest input. The opt-in single-owner
+`wifi_telemetry_producer_init()` and `wifi_telemetry_producer_send()` manage
+that sequence, check input age and return queue-full errors without advancing
+it. Start the service first, use a producer age limit no greater than the
+service's, and handle all send errors. A clock fault latches until restart.
+The producer does not acquire or verify sensor data. The legacy state map must be agreed
+with the controller. It has no unknown battery value, so do not fabricate one
+or publish until a verified battery measurement is available. The network owner
+publishes the payload on `robot/telemetry` at QoS 0. No source of verified
+telemetry data is connected, and neither bridge nor vehicle tasks start by default. Submissions
+report a full queue; acceptance is not broker delivery, and QoS 0 can lose data.
+The bridge retains a pending packet on temporary MQTT backpressure and stops
+until reboot on stale/invalid data, clock or publish errors, reporting a
+communication fault when possible. Stopping the service requests bridge shutdown;
+one publish already in progress may still complete, and queued packets are
+abandoned. Restart requires reboot, including if service task startup fails
+after bridge creation. A stalled network owner or full fault queue
+requires independent supervision. Queued packets are checked for age on dequeue;
+they can become stale while disconnected. MQTT in this template is unencrypted;
+use only on a trusted network. No incoming commands are connected.
+
+### Read-only dashboard
+
+`dashboard/` is a host-side Node.js application, separate from the Pico
+firmware. Run `npm ci` and `npm start` in that directory. It subscribes only to
+`robot/telemetry`, decodes the target's five-byte packet, ignores retained
+packets, and marks data stale after five seconds. Configure `MQTT_URL`,
+`MQTT_USER`, `MQTT_PASSWORD`, and optionally `PORT` through the process
+environment. The HTTP server binds to `127.0.0.1`; do not expose it directly to
+an untrusted network. The dashboard has no command-publish or barcode-mapping
+route and is not a safety monitor. Firmware telemetry remains opt-in and has no
+verified sensor-data producer connected by default.
+
+The encoder bring-up uses the shared GPIO dispatcher. All interrupt clients
+must be registered by one core-0 startup owner before the dispatcher starts;
+live registration is not supported. A robot test reported left -2500 and right
+2500 counts after one forward wheel revolution, and a 20 cm circumference.
+Baseline deltas, reverse direction, repeatability and IRQ timing remain to be
+verified. Pending edge bits do not record edge order or timestamps; fast or
+simultaneous transitions can be missed.
+The encoder source must be registered before dispatcher startup while the wheels
+are stationary. Snapshots require a task pinned to core 0. Ambiguous or
+inconsistent edge observations latch the snapshot invalid until restart; other
+missed edges may still go undetected. The bring-up diagnostic prints invalid
+counts for troubleshooting only.
+
+The odometry producer can build messages from caller-supplied encoder snapshots
+and send copies to separate line and IMU buffers. Motion publication is opt-in
+through `odometry_task_start_with_motion()` and uses its own buffer; start its
+consumer before opting in or the full buffer will stop odometry. An odometry task connects the
+source and producer but is not started by the default image. Before enabling it,
+verify both wheel polarities and calibrations, initialize the buffers and start
+the shared dispatcher with the wheels stationary. Its startup caller must be
+pinned to core 0 and handle any error. The task latches faults and stops
+publishing after invalid input, clock, scheduling or delivery failures; it
+reports the fault to the controller buffer, retrying if delivery fails. Fault
+timestamps use the last known operating time (zero if unavailable). Consumers
+must reject stale data and detect sequence gaps, including if fault delivery is
+blocked. Motion feedback derives wheel speeds from the copied counts; no
+wheel-speed messages are provided.
+The task and encoder hardware have not been tested on the robot.
 
 Pins: use **GP0–GP22 and GP26–GP28**. GP0/GP1 are free unless your team
 builds with `CRASH_REPORT=1` (section 3), which needs them. Never use
@@ -162,16 +481,18 @@ After editing, run `make -j8` again in `build_make` and copy the new `.uf2`.
 
 ---
 
-## 3. Build options: `SMP`, `CONSOLE`, `WIFI`, `TEST`, `CRASH_REPORT`
+## 3. Build options: `SMP`, `CONSOLE`, `WIFI`, `TEST`, `EXAMPLES`, `CRASH_REPORT`
 
 `make` on its own uses the defaults. To build differently, put options
 after `make`. They can be combined in any order:
 
 ```sh
-make -j8                          # defaults: SMP=1 CONSOLE=usb_cdc WIFI=cyw43 TEST=0 CRASH_REPORT=0
+make -j8                          # defaults: SMP=1 CONSOLE=usb_cdc WIFI=cyw43 TEST=0 EXAMPLES=0 CRASH_REPORT=0
 make SMP=0 -j8                    # single-core build
 make CONSOLE=uart WIFI=none -j8   # no USB console, radio off (no Pico SDK needed)
-make TEST=1 -j8                   # firmware with the subsystem self-tests
+make TEST=1 -j8                   # vehicle buffer test, no example tasks
+make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
+make TEST=1 EXAMPLES=1 -j8        # also run template examples and their tests; GP19 is driven
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
 
@@ -192,8 +513,17 @@ the next plain `make` goes back to the defaults.
 | `SMP` | `0`, **`1`** | `1` runs the kernel on both RP2040 cores; `0` uses core 0 only | `smp1` / `smp0` | `TK_SUPPORT_SMP` (1 or 0) |
 | `CONSOLE` | **`usb_cdc`**, `uart` | where `tm_printf` output goes. `usb_cdc` = USB cable; `uart` = UART0 only (GP0 TX / GP1 RX, needs a USB-serial adapter) | `_usb_cdc` / `_uart` | `TM_CONSOLE_USB_CDC` |
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
-| `TEST` | **`0`**, `1` | `1` compiles every `subsystemN_test.c` and runs the tests at power-up | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
+| `TEST` | **`0`**, `1` | `1` runs the vehicle buffer test; template tests also require `EXAMPLES=1` | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
+| `EXAMPLES` | **`0`**, `1` | `1` starts the template examples; subsystem 1 drives GP19 | `_examples` / *(nothing)* | `APP_EXAMPLES` (1 or 0) |
+| `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` and `EXAMPLES=0` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
+
+Encoder bring-up prints signed counts and individual wheel distances every
+second. GP16/17 are left A/B and GP18/19 are right A/B. It assumes 2500
+transitions per wheel revolution and a 200 mm circumference; verify the signs,
+calibration and circumference on each wheel. It does not initialize motors,
+send odometry messages or start the vehicle controller. Rotate wheels slowly
+by hand first: GPIO edge interrupts can miss transitions at high speeds.
 
 **Why `CRASH_REPORT` exists.** USB output is not sent the moment you call
 `tm_printf`: it waits in a buffer until the kernel's USB task sends it. If the
@@ -225,7 +555,7 @@ Using an option in C code:
 
 ### Where the options live in the makefile
 
-All five are handled in **`build_make/pico_rp2040.mk`**. To find each piece, search the file for the
+The options are handled in **`build_make/pico_rp2040.mk`**. To find each piece, search the file for the
 names in the left column (e.g. `grep -n "TEST" build_make/pico_rp2040.mk`).
 Each option goes through the same steps:
 

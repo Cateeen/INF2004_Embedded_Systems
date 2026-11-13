@@ -20,6 +20,8 @@
 #include "lwip/timeouts.h"
 #include "wifi_secrets.h"
 #include "mqtt_utk.h"
+#include "../../../../app_program/wifi/wifi_mqtt_bridge_owner.h"
+#include "../../../../app_program/wifi/wifi_telemetry.h"
 #include <tm/tmonitor.h>
 
 #define MQTT_UTK_HEARTBEAT_MS   5000
@@ -44,6 +46,31 @@ static u16_t		rx_len;
 static u8_t		rx_truncated;
 
 static void heartbeat_timeout(void *arg);
+
+static void telemetry_done_cb(void *arg, err_t result)
+{
+	(void)arg;
+	if(result != ERR_OK) {
+		tm_printf((UB*)"mqtt: telemetry publish failed, err=%d\n", (int)result);
+		wifi_mqtt_bridge_publish_failed();
+	}
+}
+
+static int telemetry_publish(const uint8_t *payload)
+{
+	err_t err = mqtt_publish(client, "robot/telemetry", payload, WIFI_TELEMETRY_PACKET_SIZE,
+				 0, 0, telemetry_done_cb, NULL);
+	if(err == ERR_OK) return WIFI_MQTT_PUBLISH_OK;
+	if(err == ERR_MEM) return WIFI_MQTT_PUBLISH_BUSY;
+	tm_printf((UB*)"mqtt: telemetry publish rejected, err=%d\n", (int)err);
+	return WIFI_MQTT_PUBLISH_ERROR;
+}
+
+void mqtt_utk_poll(int link_up)
+{
+	wifi_mqtt_bridge_poll(telemetry_publish, link_up,
+			      link_up && client != NULL && mqtt_client_is_connected(client));
+}
 
 /* mqtt.c NUL-terminates the topic before handing it over, but it is only
  * valid for the duration of this call -- copy it out. */

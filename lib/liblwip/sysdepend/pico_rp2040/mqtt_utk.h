@@ -15,4 +15,7 @@
  */
 void mqtt_utk_start(void);
 
+/* Called only by cyw43_utk_task, including while disconnected. */
+void mqtt_utk_poll(int link_up);
+
 #endif /* MQTT_UTK_H */

@@ -46,7 +46,7 @@
 #define CNF_MAX_FLGID		16	/* Event flag */
 #define CNF_MAX_MBXID		12	/* Mailbox*/
 #define CNF_MAX_MTXID		12	/* Mutex */
-#define CNF_MAX_MBFID		12	/* Message buffer */
+#define CNF_MAX_MBFID		27	/* Message buffer: 12 existing + 14 vehicle + MQTT bridge */
 #define CNF_MAX_MPLID		12	/* Memory pool */
 #define CNF_MAX_MPFID		12	/* Fixed size memory pool */
 #define CNF_MAX_CYCID		12	/* Cyclic handler */

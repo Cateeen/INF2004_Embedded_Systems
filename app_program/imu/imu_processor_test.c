@@ -33,23 +33,24 @@ static BOOL safety_test(void)
 	imu_state_t state;
 	const accel_data_t flat = {.az = GRAVITY_MS2};
 	const accel_data_t ramp = {.ax = -1.4f, .az = 9.70f};
-	const accel_data_t tilted = {.ay = 5.0f, .az = 8.4f};
-	const accel_data_t shock = {.az = 50.0f};
+	const accel_data_t lifted_roll = {.ay = 5.0f, .az = 8.4f};
+	const accel_data_t overturned = {.az = -5.0f};
 	const accel_data_t invalid = {.ax = __builtin_huge_valf(), .az = GRAVITY_MS2};
 
 	return imu_processor_init(&state) &&
 	       imu_processor_update(&state, &ramp, 0.0f, 5U) &&
 	       state.hump_active &&
-	       imu_processor_update(&state, &tilted, 0.0f, 10U) &&
+	       imu_processor_update(&state, &lifted_roll, 0.0f, 10U) &&
 	       state.tilt_detected && !state.hump_active &&
 	       state.fsm_state == IMU_STATE_TILT &&
 	       (state.packed_telemetry & 7U) == IMU_STATE_TILT &&
 	       imu_processor_update(&state, &flat, 0.0f, 20U) &&
-	       imu_processor_update(&state, &shock, 0.0f, 30U) &&
-	       state.shock_detected && state.fsm_state == IMU_STATE_SHOCK &&
-	       (state.packed_telemetry & 7U) == IMU_STATE_SHOCK &&
+	       state.fsm_state == IMU_STATE_MONITORING &&
+	       imu_processor_update(&state, &overturned, 0.0f, 30U) &&
+	       state.tilt_detected && state.fsm_state == IMU_STATE_TILT &&
+	       (state.packed_telemetry & 7U) == IMU_STATE_TILT &&
 	       !imu_processor_update(&state, &invalid, 0.0f, 40U) &&
-	       state.fsm_state == IMU_STATE_SHOCK &&
+	       state.fsm_state == IMU_STATE_TILT &&
 	       !imu_processor_update(&state, NULL, 0.0f, 40U) &&
 	       !imu_processor_init(NULL);
 }
@@ -192,12 +193,13 @@ static BOOL producer_test(void)
 	     message.header.sequence == 99U && !producer.have_sample && ok;
 	odometry.header.type = VEHICLE_MESSAGE_WHEEL_ODOMETRY;
 	odometry.header.version = VEHICLE_MESSAGE_VERSION;
-	odometry.header.sequence = UINT32_MAX;
-	odometry.header.timestamp_ms = 100U;
-	odometry.valid = 1U;
-	ok = !imu_producer_update(&producer, &accel, &odometry, 99U, &message) &&
-	     !producer.have_odometry && message.header.sequence == 99U && ok;
-	ok = imu_producer_update(&producer, &accel, &odometry, 100U, &message) &&
+	odometry.header.sequence = 0U;
+	odometry.header.timestamp_ms = 102U;
+	accel.ay = 0.0f;
+	accel.az = -5.0f; /* Overturned / inverted check */
+	ok = imu_producer_update(&producer, &accel, &odometry, 103U, &message) &&
+	     !message.shock_detected && message.tilt_detected &&
+	     (message.terrain_telemetry & 7U) == IMU_STATE_TILT && ok;
 	     message.header.type == VEHICLE_MESSAGE_IMU_ESTIMATE &&
 	     message.header.sequence == 1U && message.header.timestamp_ms == 100U &&
 	     message.validity == VEHICLE_IMU_VALID_ROLL_PITCH &&

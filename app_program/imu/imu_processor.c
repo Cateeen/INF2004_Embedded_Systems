@@ -15,13 +15,18 @@ static float get_roll_deg(const accel_data_t *a) {
     return atan2f(a->ay, a->az) * (180.0f / (float)M_PI);
 }
 
-static bool check_tilt(float pitch_deg, float roll_deg) {
-    return (fabsf(roll_deg) > TILT_THRESHOLD_DEG || fabsf(pitch_deg) > TILT_THRESHOLD_DEG);
-}
-
-static bool check_shock(const accel_data_t *a) {
-    float magnitude = sqrtf(a->ax * a->ax + a->ay * a->ay + a->az * a->az);
-    return (fabsf(magnitude - GRAVITY_MS2) > SHOCK_THRESHOLD * GRAVITY_MS2);
+/* Detects when the robot has been lifted by hand or overturned */
+static bool check_lifted_or_overturned(const accel_data_t *a, float pitch_deg, float roll_deg) {
+    if (a->az < OVERTURN_MIN_AZ) {
+        return true; /* Overturned on its side or upside-down */
+    }
+    if (fabsf(roll_deg) > LIFT_ROLL_DEG) {
+        return true; /* Lifted by hand or tipped sideways */
+    }
+    if (fabsf(pitch_deg) > LIFT_PITCH_DEG) {
+        return true; /* Lifted steeper than any ramp */
+    }
+    return false;
 }
 
 static uint8_t quantize_height_qcm(float height_m) {
@@ -47,8 +52,8 @@ bool imu_processor_init(imu_state_t *state) {
     state->hump_peak_m           = 0.0f;
     state->current_hump_m        = 0.0f;
     state->hump_active           = false;
-    state->shock_detected        = false;
-    state->tilt_detected         = false;
+    state->shock_detected        = false; /* Collision detection removed per Prof */
+    state->tilt_detected         = false; /* Latches true when lifted or overturned */
     state->last_distance_m       = 0.0f;
     state->hump_start_distance_m = 0.0f;
     state->current_pitch_deg     = 0.0f;
@@ -66,15 +71,8 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
     state->current_pitch_deg = get_pitch_deg(accel);
     state->current_roll_deg  = get_roll_deg(accel);
 
-    /* 1. Global Safety Watchdog (Active across all states) */
-    if (check_shock(accel)) {
-        state->shock_detected = true;
-        state->hump_active    = false;
-        state->motion_event   = IMU_EVENT_SHOCK;
-        state->fsm_state      = IMU_STATE_SHOCK;
-        goto pack_telemetry;
-    }
-    if (check_tilt(state->current_pitch_deg, state->current_roll_deg)) {
+    /* 1. Global Safety Watchdog: Lifted or Overturned (immediately disarms motors) */
+    if (check_lifted_or_overturned(accel, state->current_pitch_deg, state->current_roll_deg)) {
         state->tilt_detected = true;
         state->hump_active   = false;
         state->fsm_state     = IMU_STATE_TILT;
@@ -90,6 +88,7 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
             state->hump_start_distance_m = current_distance_m;
             state->last_distance_m       = current_distance_m;
             state->current_hump_m        = 0.0f;
+            state->hump_peak_m           = 0.0f; /* Reset so each hump records its own peak */
             state->hump_active           = true;
             state->hump_start_ms         = now_ms;
             state->motion_event          = IMU_EVENT_CLIMBING;
@@ -100,14 +99,12 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
     case IMU_STATE_HUMP_RISING:
         state->motion_event = IMU_EVENT_CLIMBING;
 
-        // Timeout after more than 5 seconds in the rising state.
         if ((uint32_t)(now_ms - state->hump_start_ms) > 5000U) {
             state->fsm_state   = IMU_STATE_MONITORING;
             state->hump_active = false;
             break;
         }
 
-        // Integrate height: dh = ds * sin(pitch)
         float delta_dist = current_distance_m - state->last_distance_m;
         if (delta_dist > 0.0f) {
             float pitch_rad = state->current_pitch_deg * ((float)M_PI / 180.0f);
@@ -115,7 +112,6 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
         }
         state->last_distance_m = current_distance_m;
 
-        // When pitch levels out below crest threshold or tilts downward
         if (state->current_pitch_deg <= PITCH_END_DEG) {
             if (state->current_hump_m > MIN_HUMP_HEIGHT_M) {
                 if (state->current_hump_m > state->hump_peak_m) {
@@ -130,7 +126,6 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
     case IMU_STATE_HUMP_FALLING:
         state->motion_event = IMU_EVENT_DESCENDING;
 
-        // Re-climb check: if pitch tilts nose-up again, transition back to RISING
         if (state->current_pitch_deg > PITCH_START_DEG) {
             state->last_distance_m = current_distance_m;
             state->hump_start_ms   = now_ms;
@@ -138,7 +133,6 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
             break;
         }
 
-        // Return to MONITORING once leveled flat OR after 4-second timeout
         if ((fabsf(state->current_pitch_deg) < PITCH_END_DEG) ||
             ((uint32_t)(now_ms - state->hump_start_ms) > 4000U)) {
             state->fsm_state   = IMU_STATE_MONITORING;
@@ -146,12 +140,8 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
         }
         break;
 
-    case IMU_STATE_SHOCK:
-        if (!check_shock(accel)) state->fsm_state = IMU_STATE_MONITORING;
-        break;
-
     case IMU_STATE_TILT:
-        if (!check_tilt(state->current_pitch_deg, state->current_roll_deg)) {
+        if (!check_lifted_or_overturned(accel, state->current_pitch_deg, state->current_roll_deg)) {
             state->fsm_state = IMU_STATE_MONITORING;
         }
         break;

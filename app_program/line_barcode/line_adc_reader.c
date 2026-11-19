@@ -125,7 +125,11 @@ static ER read_channel(line_adc_reader_t *reader, const line_adc_channel_t *chan
 		reader->pending_value = 0U;
 		er = tk_srea_dev(reader->device, channel->channel,
 				 &reader->pending_value, 1, &actual);
-		if (er != E_OK) return er < E_OK ? er : E_IO;
+		if (er != E_OK) {
+			tm_printf((UB*)"line ADC read failed: channel=%d error=%d\n",
+				  (int)channel->channel, (int)er);
+			return er < E_OK ? er : E_IO;
+		}
 		if (actual != 1 || reader->pending_value > LINE_ADC_MAX_VALUE) return E_IO;
 		sum += reader->pending_value;
 	}
@@ -160,8 +164,14 @@ ER line_adc_reader_read(void *context, ir_readings_t *readings,
 	start_ms = clock_ms(&start);
 	barcode_ms = clock_ms(&barcode_start);
 	end_ms = clock_ms(&end);
-	if (barcode_ms < start_ms || end_ms < barcode_ms ||
-	    end_ms - start_ms > reader->config.max_sample_span_ms) {
+	if (barcode_ms < start_ms || end_ms < barcode_ms) {
+		tm_printf((UB*)"line ADC sampling clock moved backward\n");
+		er = E_TMOUT;
+		goto fault;
+	}
+	if (end_ms - start_ms > reader->config.max_sample_span_ms) {
+		tm_printf((UB*)"line ADC sample span exceeded budget: limit=%u ms\n",
+			  (unsigned)reader->config.max_sample_span_ms);
 		er = E_TMOUT;
 		goto fault;
 	}

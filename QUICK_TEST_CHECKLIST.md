@@ -11,6 +11,37 @@ Expected: Build completes successfully, creates `mtk3pico_smp1_usb_cdc_wifi.uf2`
 
 ---
 
+## Test one physical sensor at a time
+
+Build and flash exactly one selected sensor test. These modes do not start the
+vehicle controller or motor tasks, and they print live readings to the USB
+serial console:
+
+```bash
+cd build_make
+make SENSOR_TEST=ir -j8
+# or
+make SENSOR_TEST=imu -j8
+```
+
+For the HC-SR04, first verify with a meter/level shifter that Echo on GP4 never
+exceeds 3.3 V, and verify the servo pulse endpoints do not drive into its
+mechanical stops. The ultrasonic diagnostic uses the existing obstacle driver,
+which moves the servo to its ahead angle:
+
+```bash
+make SENSOR_TEST=ultrasonic SENSOR_TEST_ECHO_3V3_SAFE=1 \
+  SENSOR_TEST_SERVO_LIMITS_VERIFIED=1 -j8
+```
+
+Flash the resulting `*_sensor_ir.uf2`, `*_sensor_imu.uf2`, or
+`*_sensor_ultrasonic.uf2` image and open the serial monitor. IR output shows
+the three ADC raw values and black/white classifications; IMU output shows
+raw XYZ and acceleration in milli-g; ultrasonic output shows distance in mm.
+Build another selection to test the next component.
+
+---
+
 ## Phase 2: Flash & Capture Output (5 mins)
 
 1. **Prepare Pico for flash:**

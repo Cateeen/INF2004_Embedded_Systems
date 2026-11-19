@@ -126,7 +126,7 @@ static BOOL hcsr04_distance_test(void)
 	BOOL ok;
 
 	ok = hcsr04_distance_mm(1000U, 343000U, &distance) &&
-	     distance == 172U && ok;
+	     distance == 172U;
 	ok = hcsr04_distance_mm(5000U, 343000U, &distance) &&
 	     distance == 858U && ok;
 	distance = 123U;

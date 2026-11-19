@@ -12,8 +12,8 @@
 #ifndef WIFI_SECRETS_H
 #define WIFI_SECRETS_H
 
-#define WIFI_SSID     "TZK"
-#define WIFI_PASSWORD "zhikaiii"
+#define WIFI_SSID     "your-network-ssid"
+#define WIFI_PASSWORD "your-network-password"
 
 /* Only used when built with MQTT=1 (also requires NET=lwip). */
 #define MQTT_BROKER_IP   "192.168.1.10"

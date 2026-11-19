@@ -27,8 +27,8 @@
 
 #define DEVCNF_USE_SER		1		// Serial communication device 
 #define DEVCNF_USE_ADC		1		// A/D conversion device
-#define DEVCNF_USE_IIC		0		// I2C communication device
-		/* Off by default. When enabled, startup initializes only I2C1
-		   on GP2/GP3 as "iicb". Confirm bus ownership before use. */
+#define DEVCNF_USE_IIC		1		// I2C communication device
+		/* Startup initializes only I2C1 on GP2/GP3 as "iicb"; the
+		   LSM303DLHC IMU task opens it exclusively (VEHICLE=1). */
 
 #endif	/* __DEV_CONFIG_H__ */

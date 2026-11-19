@@ -1,6 +1,7 @@
 #include "lsm303dlhc_i2c.h"
 
 #include "../../device/include/dev_i2c.h"
+#include <tm/tmonitor.h>
 
 #define LSM303DLHC_WHO_AM_I       0x0FU
 #define LSM303DLHC_CTRL_REG1_A    0x20U
@@ -39,7 +40,14 @@ static ER read_registers(lsm303dlhc_i2c_t *sensor, uint8_t reg,
 	exec.rcv_size = length;
 	exec.rcv_data = data;
 	er = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec, sizeof(exec), &actual);
-	if (er != E_OK) return er;
+	if (er != E_OK) {
+		tm_printf((UB*)"IMU I2C read failed: addr=0x%02x reg=0x%02x error=%d\n",
+			  (unsigned)sensor->address, (unsigned)reg, (int)er);
+		return er;
+	}
+	if (actual != (SZ)sizeof(exec))
+		tm_printf((UB*)"IMU I2C read incomplete: reg=0x%02x size=%d\n",
+			  (unsigned)reg, (int)actual);
 	return actual == (SZ)sizeof(exec) ? E_OK : E_IO;
 }
 
@@ -49,7 +57,14 @@ static ER write_register(lsm303dlhc_i2c_t *sensor, uint8_t reg, uint8_t value)
 	SZ actual = 0;
 	ER er = tk_swri_dev(sensor->device, (W)sensor->address, data, sizeof(data), &actual);
 
-	if (er != E_OK) return er;
+	if (er != E_OK) {
+		tm_printf((UB*)"IMU I2C write failed: addr=0x%02x reg=0x%02x error=%d\n",
+			  (unsigned)sensor->address, (unsigned)reg, (int)er);
+		return er;
+	}
+	if (actual != (SZ)sizeof(data))
+		tm_printf((UB*)"IMU I2C write incomplete: reg=0x%02x size=%d\n",
+			  (unsigned)reg, (int)actual);
 	return actual == (SZ)sizeof(data) ? E_OK : E_IO;
 }
 
@@ -117,7 +132,11 @@ ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 	sensor->data_ready_timeout_ms = config->data_ready_timeout_ms;
 	er = read_registers(sensor, LSM303DLHC_WHO_AM_I, &identity, 1U);
 	if (er != E_OK) return fail_init(sensor, er);
-	if (identity != LSM303DLHC_WHO_AM_I_VALUE) return fail_init(sensor, E_IO);
+	if (identity != LSM303DLHC_WHO_AM_I_VALUE) {
+		tm_printf((UB*)"IMU identity mismatch: got 0x%02x, expected 0x%02x\n",
+			  (unsigned)identity, (unsigned)LSM303DLHC_WHO_AM_I_VALUE);
+		return fail_init(sensor, E_IO);
+	}
 	er = write_register(sensor, LSM303DLHC_CTRL_REG1_A, 0U);
 	if (er != E_OK) return fail_init(sensor, er);
 	er = write_register(sensor, LSM303DLHC_CTRL_REG4_A, LSM303DLHC_CTRL4_NORMAL_2G);
@@ -133,8 +152,11 @@ ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 	er = read_registers(sensor, LSM303DLHC_CTRL_REG4_A, &control4, 1U);
 	if (er != E_OK) return fail_init(sensor, er);
 	if (control1 != LSM303DLHC_CTRL1_100HZ_XYZ ||
-	    control4 != LSM303DLHC_CTRL4_NORMAL_2G)
+	    control4 != LSM303DLHC_CTRL4_NORMAL_2G) {
+		tm_printf((UB*)"IMU control readback mismatch: CTRL1=0x%02x CTRL4=0x%02x\n",
+			  (unsigned)control1, (unsigned)control4);
 		return fail_init(sensor, E_IO);
+	}
 	er = lsm303dlhc_reader_init(&sensor->reader, &config->mapping,
 				    read_fresh, sensor);
 	if (er != E_OK) return fail_init(sensor, er);

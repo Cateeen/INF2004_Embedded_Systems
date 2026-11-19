@@ -551,6 +551,13 @@ BOOL vehicle_controller_task_test(void)
 	BOOL stale_status_ok;
 	TEST_INIT();
 
+	/* controller_cycle() reads the module config (s_config) for the motion
+	   status deadline.  The task is not started during the boot-time test
+	   run, so s_config would otherwise still be all zeros (max age 0 ms)
+	   and every advancing-clock cycle would fault.  Install the test
+	   config; vehicle_controller_task_start() overwrites it later. */
+	s_config = test_config;
+
 	arm_ok = controller_arm_test();
 	fault_ok = controller_fault_test();
 	emergency_ok = controller_local_emergency_test();

@@ -656,8 +656,10 @@ Before merging any PR:
 Run complete system test suite:
 ```bash
 # 1. Unit tests
-make TEST=1 EXAMPLES=1 -j8
+make TEST=1 -j8
 # Power cycle Pico, capture output
+# (make TEST=1 EXAMPLES=1 also runs the template demo tests, but drives GP19:
+#  disconnect the right encoder B wire first)
 
 # 2. Host-side integration tests
 cd testing/integration/i2c_host && gcc ... && ./test

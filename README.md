@@ -493,6 +493,7 @@ make CONSOLE=uart WIFI=none -j8   # no USB console, radio off (no Pico SDK neede
 make TEST=1 -j8                   # vehicle buffer test, no example tasks
 make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
 make TEST=1 EXAMPLES=1 -j8        # also run template examples and their tests; GP19 is driven
+make VEHICLE=1 -j8                # start the vehicle tasks at boot (needs verified hardware, see app_main.c)
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
 
@@ -516,6 +517,7 @@ the next plain `make` goes back to the defaults.
 | `TEST` | **`0`**, `1` | `1` runs the vehicle buffer test; template tests also require `EXAMPLES=1` | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `EXAMPLES` | **`0`**, `1` | `1` starts the template examples; subsystem 1 drives GP19 | `_examples` / *(nothing)* | `APP_EXAMPLES` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` and `EXAMPLES=0` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
+| `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0` and `EXAMPLES=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 
 Encoder bring-up prints signed counts and individual wheel distances every
@@ -524,6 +526,12 @@ transitions per wheel revolution and a 200 mm circumference; verify the signs,
 calibration and circumference on each wheel. It does not initialize motors,
 send odometry messages or start the vehicle controller. Rotate wheels slowly
 by hand first: GPIO edge interrupts can miss transitions at high speeds.
+
+For vehicle bring-up, check the first sensor error on the serial console.
+The IMU logs whether an I2C transfer failed or a register value did not match
+what the driver expected. The line ADC logs whether an individual channel
+read failed or the full sample exceeded its time budget. Later queue and
+controller errors can follow when a sensor task stops.
 
 **Why `CRASH_REPORT` exists.** USB output is not sent the moment you call
 `tm_printf`: it waits in a buffer until the kernel's USB task sends it. If the

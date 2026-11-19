@@ -115,6 +115,69 @@ endif
 ODOMETRY_SUFFIX := _odometry
 endif
 
+# VEHICLE=1 starts the vehicle application tasks at boot (APP_VEHICLE=1 in C).
+# Startup still refuses to run until the hardware verification facts in
+# app_program/app_main.c are confirmed on the robot.
+VEHICLE ?= 0
+ifneq ($(filter $(VEHICLE),0 1),$(VEHICLE))
+$(error Unknown VEHICLE '$(VEHICLE)'; use 0 or 1)
+endif
+ifeq ($(VEHICLE),1)
+ifneq ($(TEST),0)
+$(error VEHICLE=1 cannot run with TEST=1: boot-time tests exercise the same task state)
+endif
+ifneq ($(EXAMPLES),0)
+$(error VEHICLE=1 cannot run with EXAMPLES=1: the example LED drives encoder pin GP19)
+endif
+VEHICLE_SUFFIX := _vehicle
+endif
+
+# SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
+SENSOR_TEST ?= none
+ifneq ($(words $(SENSOR_TEST)),1)
+$(error SENSOR_TEST must be exactly one of none, ir, imu, or ultrasonic)
+endif
+ifneq ($(filter $(SENSOR_TEST),none ir imu ultrasonic),$(SENSOR_TEST))
+$(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use none, ir, imu, or ultrasonic)
+endif
+SENSOR_TEST_ECHO_3V3_SAFE ?= 0
+SENSOR_TEST_SERVO_LIMITS_VERIFIED ?= 0
+ifneq ($(words $(SENSOR_TEST_ECHO_3V3_SAFE)),1)
+$(error SENSOR_TEST_ECHO_3V3_SAFE must be exactly 0 or 1)
+endif
+ifneq ($(filter $(SENSOR_TEST_ECHO_3V3_SAFE),0 1),$(SENSOR_TEST_ECHO_3V3_SAFE))
+$(error SENSOR_TEST_ECHO_3V3_SAFE must be 0 or 1)
+endif
+ifneq ($(words $(SENSOR_TEST_SERVO_LIMITS_VERIFIED)),1)
+$(error SENSOR_TEST_SERVO_LIMITS_VERIFIED must be exactly 0 or 1)
+endif
+ifneq ($(filter $(SENSOR_TEST_SERVO_LIMITS_VERIFIED),0 1),$(SENSOR_TEST_SERVO_LIMITS_VERIFIED))
+$(error SENSOR_TEST_SERVO_LIMITS_VERIFIED must be 0 or 1)
+endif
+ifneq ($(SENSOR_TEST),none)
+ifneq ($(TEST)$(EXAMPLES)$(ODOMETRY_TEST)$(VEHICLE),0000)
+$(error SENSOR_TEST cannot be combined with TEST, EXAMPLES, ODOMETRY_TEST, or VEHICLE)
+endif
+SENSOR_TEST_SUFFIX := _sensor_$(SENSOR_TEST)
+endif
+ifeq ($(SENSOR_TEST),ir)
+SENSOR_TEST_VALUE := 1
+else ifeq ($(SENSOR_TEST),imu)
+SENSOR_TEST_VALUE := 2
+else ifeq ($(SENSOR_TEST),ultrasonic)
+SENSOR_TEST_VALUE := 3
+else
+SENSOR_TEST_VALUE := 0
+endif
+ifeq ($(SENSOR_TEST),ultrasonic)
+ifneq ($(SENSOR_TEST_ECHO_3V3_SAFE),1)
+$(error Ultrasonic test requires SENSOR_TEST_ECHO_3V3_SAFE=1 after verifying GP4 Echo <= 3.3V)
+endif
+ifneq ($(SENSOR_TEST_SERVO_LIMITS_VERIFIED),1)
+$(error Ultrasonic test requires SENSOR_TEST_SERVO_LIMITS_VERIFIED=1 after verifying servo endpoints)
+endif
+endif
+
 # CRASH_REPORT=1 also copies every console line to UART0 on GP0 (TX) /
 # GP1 (RX), 115200 8N1.  UART output is sent immediately, so it still shows
 # the last messages and the kernel's crash report after a crash, when the
@@ -140,7 +203,7 @@ endif
 # a live hazard: an SMP=1 build was once flashed in place of an SMP=0 one and
 # only the banner in the log revealed it.
 #
-EXE_FILE := mtk3pico_smp$(SMP)_$(CONSOLE)$(WIFI_SUFFIX)$(NET_SUFFIX)$(MQTT_SUFFIX)$(CRASH_SUFFIX)$(EXAMPLES_SUFFIX)$(ODOMETRY_SUFFIX)$(TEST_SUFFIX)
+EXE_FILE := mtk3pico_smp$(SMP)_$(CONSOLE)$(WIFI_SUFFIX)$(NET_SUFFIX)$(MQTT_SUFFIX)$(CRASH_SUFFIX)$(VEHICLE_SUFFIX)$(EXAMPLES_SUFFIX)$(ODOMETRY_SUFFIX)$(TEST_SUFFIX)$(SENSOR_TEST_SUFFIX)
 
 GCC := arm-none-eabi-gcc
 AS := arm-none-eabi-gcc
@@ -204,6 +267,10 @@ endif
 CFLAGS  += -DAPP_TEST=$(TEST)
 CFLAGS  += -DAPP_EXAMPLES=$(EXAMPLES)
 CFLAGS  += -DAPP_ODOMETRY_TEST=$(ODOMETRY_TEST)
+CFLAGS  += -DAPP_VEHICLE=$(VEHICLE)
+CFLAGS  += -DAPP_SENSOR_TEST=$(SENSOR_TEST_VALUE)
+CFLAGS  += -DSENSOR_TEST_ECHO_3V3_SAFE=$(SENSOR_TEST_ECHO_3V3_SAFE)
+CFLAGS  += -DSENSOR_TEST_SERVO_LIMITS_VERIFIED=$(SENSOR_TEST_SERVO_LIMITS_VERIFIED)
 CFLAGS  += -DTM_CONSOLE_UART=$(CRASH_REPORT)
 ifeq ($(CRASH_REPORT),0)
 CFLAGS  += -DBOARD_UART0_FREE=1
@@ -236,7 +303,7 @@ endif
 # before any recipe executes.
 ################################################################################
 
-PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-examples$(EXAMPLES)-odometry$(ODOMETRY_TEST)-test$(TEST)
+PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-examples$(EXAMPLES)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-echo-safe$(SENSOR_TEST_ECHO_3V3_SAFE)-servo-verified$(SENSOR_TEST_SERVO_LIMITS_VERIFIED)
 PROFILE_FILE := .build_profile
 
 ifneq ($(strip $(shell cat $(PROFILE_FILE) 2>/dev/null)),$(PROFILE_ID))

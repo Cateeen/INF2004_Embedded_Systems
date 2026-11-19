@@ -1,8 +1,22 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <tm/tmonitor.h>
+
 #include "lsm303dlhc_i2c.h"
 #include "dev_i2c.h"
+
+int tm_printf(const UB *format, ...)
+{
+	va_list args;
+	int result;
+
+	va_start(args, format);
+	result = vprintf((const char *)format, args);
+	va_end(args);
+	return result;
+}
 
 #define CHECK(condition) do { \
 	if (!(condition)) { \
@@ -151,7 +165,7 @@ static int test_identity_mismatch(void)
 	lsm303dlhc_i2c_config_t setup = config();
 
 	reset_fake();
-	registers[0x0F] = 0U;
+	registers[0x0F] = 0x32U;
 	CHECK(lsm303dlhc_i2c_init(&sensor, &setup) == E_IO);
 	CHECK(close_count == 1U && !sensor.opened && sensor.faulted);
 	CHECK(config_writes == 0U);

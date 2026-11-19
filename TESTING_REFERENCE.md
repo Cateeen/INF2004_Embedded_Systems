@@ -17,7 +17,7 @@ Use this document to track which tests have been run and which still need comple
 | S1-U05 | Zero count edge case handling | Auto | ⬜ | - | - |
 | S1-U06 | Count wrapping and rollover | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] ODO PASS`, `[TEST] ODO-PRODUCER PASS`, `[TEST] ODO-TASK PASS`  
 **Log location:** `testing/subsystem1/logs/`
 
@@ -35,7 +35,7 @@ Use this document to track which tests have been run and which still need comple
 | S2-U06 | Intersection detection | Auto | ⬜ | - | - |
 | S2-U07 | ADC reader producer task | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] LINE PASS`, `[TEST] BAR PASS`, `[TEST] LB-TASK PASS`, `[TEST] LINE-ADC PASS`  
 **Log location:** `testing/subsystem2/logs/`
 
@@ -54,7 +54,7 @@ Use this document to track which tests have been run and which still need comple
 | S3-U07 | Shock detection threshold | Auto | ⬜ | - | - |
 | S3-U08 | Tilt detection and terrain classification | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] IMU PASS`, `[TEST] IMU-TASK PASS`  
 **Host test:** `testing/integration/imu_i2c_host/test.c`  
 **Log location:** `testing/subsystem3/logs/`
@@ -72,7 +72,7 @@ Use this document to track which tests have been run and which still need comple
 | S4-U05 | Emergency stop trigger | Auto | ⬜ | - | - |
 | S4-U06 | Command processing (scan/reset/abort) | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] OBS PASS`, `[TEST] OBS-TASK PASS`  
 **Host test:** `testing/integration/hcsr04_host/test.c`  
 **Log location:** `testing/subsystem4/logs/`
@@ -91,7 +91,7 @@ Use this document to track which tests have been run and which still need comple
 | S5-U06 | Motion status reporting | Auto | ⬜ | - | - |
 | S5-U07 | Motor stall detection | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] MOT PASS`, `[TEST] MOT-TASK PASS`  
 **Log location:** `testing/subsystem5/logs/`
 
@@ -109,7 +109,7 @@ Use this document to track which tests have been run and which still need comple
 | S6-U06 | Safety gates (speed limits, emergency stop) | Auto | ⬜ | - | - |
 | S6-U07 | State machine transitions | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] VC PASS`, `[TEST] VC-MONITOR PASS`, `[TEST] VC-TASK PASS`  
 **Log location:** `testing/subsystem6/logs/`
 
@@ -125,7 +125,7 @@ Use this document to track which tests have been run and which still need comple
 | S7-U04 | Falling edge detection | Auto | ⬜ | - | - |
 | S7-U05 | Interrupt latency measurement | Manual | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] GPIO PASS`  
 **Log location:** `testing/subsystem7/logs/`
 
@@ -142,7 +142,7 @@ Use this document to track which tests have been run and which still need comple
 | S8-U05 | Network reconnection after loss | Manual | ⬜ | - | - |
 | S8-U06 | MQTT keep-alive / heartbeat | Auto | ⬜ | - | - |
 
-**Build:** `make TEST=1 EXAMPLES=1`  
+**Build:** `make TEST=1` *(do not add `EXAMPLES=1` on the robot: it drives GP19 against the right encoder)*  
 **Check for:** `[TEST] WIFI PASS`, `[TEST] WIFI-BRIDGE PASS`  
 **Log location:** `testing/subsystem8/logs/`
 

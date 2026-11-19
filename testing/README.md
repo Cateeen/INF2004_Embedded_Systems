@@ -42,6 +42,7 @@ robot. From `testing/integration/imu_i2c_host`:
 
 ```sh
 gcc -std=c11 -Wall -Wextra -Werror -Isys -I../../../app_program/imu \
+  -I../../../device/include \
   test.c ../../../app_program/imu/lsm303dlhc_i2c.c \
   ../../../app_program/imu/lsm303dlhc_reader.c \
   ../../../app_program/imu/lsm303dlhc_accel.c -o imu_i2c_host_test

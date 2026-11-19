@@ -1,0 +1,184 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║          DEVICE DRIVER PORTING TO MICRO T-KERNEL - QUICK REFERENCE            ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+┌─ HARDWARE DRIVERS (Mostly Unchanged) ─────────────────────────────────────────┐
+│                                                                               │
+│  ✅ motor_driver.h/c          → Copy as-is, add mutex for thread safety      │
+│  ✅ imu_driver.h/c            → Copy as-is (I2C timeouts already built in)   │
+│  ✅ line_following.c          → Copy as-is (ADC non-blocking)                │
+│  ✅ encoder.h/c               → Copy as-is (pure logic)                      │
+│  ✅ vehicle_gpio_dispatcher   → Copy as-is (ISR dispatcher)                  │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ CRITICAL CHANGES ────────────────────────────────────────────────────────────┐
+│                                                                               │
+│  BEFORE (Bare-Metal):                                                        │
+│  ═══════════════════════════════════════════════════════════════════         │
+│    int main(void) {                                                          │
+│        motor_driver_init();      ← Called in main()                          │
+│        imu_driver_init();                                                    │
+│        line_following_init();                                                │
+│        multicore_launch_core1(vc_core);  ← Explicit core launch             │
+│    }                                                                          │
+│                                                                               │
+│    void vc_core(void) {                                                      │
+│        for (;;) {                                                            │
+│            motor_set_speed(...);                                             │
+│            sleep_ms(10);        ← Bare-metal delay                           │
+│        }                                                                      │
+│    }                                                                          │
+│                                                                               │
+│  ───────────────────────────────────────────────────────────────────         │
+│                                                                               │
+│  AFTER (Micro T-Kernel):                                                     │
+│  ══════════════════════════════════════════════════════════════════          │
+│    void motion_control_task(INT stacd, void *exinf) {                       │
+│        motor_driver_init();      ← Call inside task at startup              │
+│        motion_init();                                                        │
+│                                                                               │
+│        for (;;) {                                                            │
+│            motor_set_speed(...);                                             │
+│            tk_dly_tsk(10);       ← RTOS-safe delay                          │
+│        }                                                                      │
+│    }                                                                          │
+│                                                                               │
+│    // Boot code (vehicle_system.c):                                         │
+│    vehicle_system_run() {                                                   │
+│        // NO motor_driver_init() here!                                       │
+│        create_all_message_buffers();                                         │
+│        create_all_tasks();                                                   │
+│        tk_sta_tsk(g_tsk_motion_control, 0);  ← Scheduler launches task     │
+│    }                                                                          │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ FILE CHANGES MATRIX ─────────────────────────────────────────────────────────┐
+│                                                                               │
+│  FILE                        │ CHANGE          │ REASON                      │
+│  ─────────────────────────────┼─────────────────┼──────────────────────      │
+│  motor_driver.c              │ ⚠️  ADD MUTEX   │ Thread-safe state access  │
+│  imu_driver.c                │ ✅ UNCHANGED    │ Boot-time init only       │
+│  line_following.c            │ ✅ UNCHANGED    │ ADC non-blocking           │
+│  encoder.c                   │ ✅ UNCHANGED    │ Pure logic                 │
+│  vehicle_gpio_dispatcher.c   │ ✅ UNCHANGED    │ ISR-based                 │
+│  ─────────────────────────────┼─────────────────┼──────────────────────      │
+│  motion_control_task.c       │ ⚠️  MODIFY      │ Init driver + delay call  │
+│  imu_task.c                  │ ⚠️  MODIFY      │ Replace sleep_ms()        │
+│  line_barcode_task.c         │ ⚠️  MODIFY      │ Init driver + delay call  │
+│  obstacle_detection_task.c   │ ⚠️  MODIFY      │ Init driver + delay call  │
+│  ─────────────────────────────┼─────────────────┼──────────────────────      │
+│  vehicle_system.c            │ ⚠️  MODIFY      │ Remove boot init calls    │
+│  car_main.c                  │ ✅ UNCHANGED    │ Calls vehicle_system_run()│
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ TOP 5 MISTAKES TO AVOID ─────────────────────────────────────────────────────┐
+│                                                                               │
+│  ❌ #1: Calling motor_driver_init() in vehicle_system_run()                 │
+│         → Causes "already initialized" conflicts when task starts            │
+│         → FIX: Call inside motion_control_task() at startup instead         │
+│                                                                               │
+│  ❌ #2: Using sleep_ms() in task loops                                      │
+│         → Blocks entire RTOS scheduler                                       │
+│         → FIX: Use tk_dly_tsk(milliseconds) instead                         │
+│                                                                               │
+│  ❌ #3: Not protecting motor state with mutex                               │
+│         → Race condition if multiple tasks call motor_set_speed()           │
+│         → FIX: Add tk_loc_mtx() / tk_unl_mtx() around shared state         │
+│                                                                               │
+│  ❌ #4: Keeping multicore_launch_core1() calls                              │
+│         → Conflicts with RTOS task scheduler                                │
+│         → FIX: Remove from boot code, use task priorities instead           │
+│                                                                               │
+│  ❌ #5: Assuming I2C is not thread-safe                                     │
+│         → Pico SDK I2C timeouts ARE safe; no mutex needed                   │
+│         → ✅ OK: Multiple tasks can query sensors (they block safely)       │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ SLEEP_MS() REPLACEMENT GUIDE ────────────────────────────────────────────────┐
+│                                                                               │
+│  Context                  │ Current                 │ Change To              │
+│  ────────────────────────┼─────────────────────────┼────────────────────   │
+│  During device init      │ sleep_ms(50);           │ sleep_ms(50); ✅       │
+│  (boot-time, once)       │                         │ (OK to keep)           │
+│  ────────────────────────┼─────────────────────────┼────────────────────   │
+│  In task main loop       │ sleep_ms(100);          │ tk_dly_tsk(100);       │
+│  (periodic reading)      │                         │ (MUST CHANGE)          │
+│  ────────────────────────┼─────────────────────────┼────────────────────   │
+│  In interrupt handler    │ ❌ NOT ALLOWED          │ ❌ NOT ALLOWED         │
+│  (ISR)                   │ sleep_ms(x);            │ Use hw timer instead   │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ MUTEX PATTERN FOR MOTOR DRIVER ──────────────────────────────────────────────┐
+│                                                                               │
+│  // In motor_driver.c - Add at top                                           │
+│  static ID s_motor_mutex = NULL;                                            │
+│                                                                               │
+│  // Call once during init                                                   │
+│  void motor_driver_mutex_init(void) {                                       │
+│      T_CMTX config = {0};                                                   │
+│      config.mtxatr = TA_TFIFO;                                              │
+│      s_motor_mutex = tk_cre_mtx(&config);                                   │
+│  }                                                                            │
+│                                                                               │
+│  // Wrap every public function                                              │
+│  void motor_set_speed(motor_id_t motor, int16_t speed_percent) {           │
+│      if (s_motor_mutex != NULL) {                                           │
+│          tk_loc_mtx(s_motor_mutex, TMO_FEVR);  // Lock                     │
+│      }                                                                       │
+│      // ... existing motor control code ...                                  │
+│      if (s_motor_mutex != NULL) {                                           │
+│          tk_unl_mtx(s_motor_mutex);  // Unlock                              │
+│      }                                                                       │
+│  }                                                                            │
+│                                                                               │
+│  // In motion_control_task.c at startup                                     │
+│  void motion_control_task(INT stacd, void *exinf) {                        │
+│      motor_driver_init();           // Basic init                            │
+│      motor_driver_mutex_init();     // Create mutex for RTOS               │
+│      // ...                                                                  │
+│  }                                                                            │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+┌─ TESTING CHECKLIST ───────────────────────────────────────────────────────────┐
+│                                                                               │
+│  Phase 1: Compilation                                                       │
+│  [ ] Drivers compile with no errors                                         │
+│  [ ] Task code compiles with RTOS includes                                  │
+│  [ ] No undefined references to sleep_ms() in task loops                   │
+│                                                                               │
+│  Phase 2: Initialization                                                    │
+│  [ ] Motors initialize when motion_control_task starts                      │
+│  [ ] IMU initializes when imu_task starts                                   │
+│  [ ] No double-init conflicts (init called twice)                          │
+│  [ ] All GPIO/PWM/I2C/ADC peripherals configured                            │
+│                                                                               │
+│  Phase 3: Functionality                                                     │
+│  [ ] Motors respond to speed commands                                       │
+│  [ ] IMU reads valid accelerometer data                                     │
+│  [ ] Line sensors detect black/white correctly                              │
+│  [ ] Ultrasonic distance readings work                                      │
+│                                                                               │
+│  Phase 4: Concurrency                                                       │
+│  [ ] Multiple tasks reading sensors simultaneously (no crashes)             │
+│  [ ] Motor commands and sensor reads don't interfere                        │
+│  [ ] I2C timeouts still respected under load                                │
+│  [ ] No priority inversion (high-priority task blocked by low-priority)    │
+│                                                                               │
+│  Phase 5: Timing                                                            │
+│  [ ] Tasks meet their deadlines (10ms motion, 50ms IMU, etc.)               │
+│  [ ] Task execution times stable (no jitter)                                │
+│  [ ] Message buffers don't overflow                                         │
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════════
+ KEY INSIGHT: The drivers don't need to know about the RTOS. They remain pure,
+ portable code. The RTOS integration happens at the TASK wrapper level, not the
+ driver level. This keeps drivers reusable and testable in bare-metal contexts too!
+═══════════════════════════════════════════════════════════════════════════════════

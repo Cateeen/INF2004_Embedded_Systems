@@ -2,14 +2,24 @@
 #include "hardware_sensor_test.h"
 
 #include "subsystem6/gpio/gpio_dispatcher.h"
+#include "subsystem6/odometry/encoder_source.h"
 #include "subsystem4/imu/lsm303dlhc_i2c.h"
 #include "subsystem3/line_barcode/line_adc_reader.h"
 #include "subsystem5/obstacle/obs_pico_port.h"
 #include "subsystem5/obstacle/obs_task.h"
 #include "vehicle_buffers.h"
+#include "vehicle_messages.h"
 
 #ifndef APP_SENSOR_TEST
 #define APP_SENSOR_TEST 0
+#endif
+
+#if APP_SENSOR_TEST == 7
+#include "subsystem6/odometry/odometry_task.h"
+#endif
+
+#if APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6
+#include "subsystem4/imu/imu_processor.h"
 #endif
 
 #if APP_SENSOR_TEST == 2
@@ -78,7 +88,171 @@ static void sensor_test_task(INT stacd, void *exinf)
 		if (error != E_OK) report_error_forever("IR", "delay", error);
 	}
 }
-#elif APP_SENSOR_TEST == 2
+#elif APP_SENSOR_TEST == 7
+#define LINE_BARCODE_TEST_ODOMETRY_PERIOD_MS 10U
+#define LINE_BARCODE_TEST_PERIOD_MS 20U
+#define LINE_BARCODE_TEST_MAX_SAMPLE_SPAN_MS 10U
+#define LINE_BARCODE_TEST_REPORT_INTERVAL_MS 250U
+#define LINE_BARCODE_TEST_COUNTS_PER_MODULE 250U
+
+static const odometry_producer_config_t s_line_barcode_odometry_config = {
+	{2500U, 20.4f}, {2500U, 20.4f}, 1, 1
+};
+
+static const line_barcode_task_config_t s_line_barcode_task_config = {
+	LINE_BARCODE_TEST_PERIOD_MS,
+	200U,
+	{LINE_BARCODE_TEST_COUNTS_PER_MODULE, 25U, 0U, 0U, 0U},
+	NULL, NULL, NULL
+};
+
+static const char *line_position_name(const line_observation_message_t *line)
+{
+	if (!line->line_detected) return "LOST";
+	if (line->intersection_detected) return "JUNCTION";
+	if (line->lateral_error < 0) return "LEFT";
+	if (line->lateral_error > 0) return "RIGHT";
+	return "CENTER";
+}
+
+static void drain_unused_imu_odometry(void)
+{
+	wheel_odometry_message_t message;
+	INT received;
+
+	do {
+		received = tk_rcv_mbf(g_mbf_imu_odometry, &message, TMO_POL);
+	} while (received == (INT)sizeof(message));
+	if (received != E_TMOUT)
+		report_error_forever("LINE-BARCODE", "unused IMU odometry receive",
+				     received < E_OK ? (ER)received : E_IO);
+}
+
+static void report_line_observations(bool *have_last, const char **last_position,
+				     uint32_t *last_report_ms)
+{
+	line_observation_message_t line;
+	INT received;
+
+	for (;;) {
+		const char *position;
+		received = tk_rcv_mbf(g_mbf_line_observations, &line, TMO_POL);
+		if (received == E_TMOUT) return;
+		if (received != (INT)sizeof(line))
+			report_error_forever("LINE-BARCODE", "line observation receive",
+					     received < E_OK ? (ER)received : E_IO);
+		if (line.header.type != VEHICLE_MESSAGE_LINE_OBSERVATION ||
+		    line.header.version != VEHICLE_MESSAGE_VERSION)
+			report_error_forever("LINE-BARCODE", "invalid line observation", E_SYS);
+
+		position = line_position_name(&line);
+		if (!*have_last || position != *last_position ||
+		    (uint32_t)(line.header.timestamp_ms - *last_report_ms) >=
+		    LINE_BARCODE_TEST_REPORT_INTERVAL_MS) {
+			tm_printf((UB*)"[HWTEST][LINE-H01] t=%u ms line=%s "
+				  "lateral=%d intersection=%u\n",
+				  (unsigned)line.header.timestamp_ms, position,
+				  (int)line.lateral_error,
+				  (unsigned)line.intersection_detected);
+			*last_position = position;
+			*last_report_ms = line.header.timestamp_ms;
+			*have_last = true;
+		}
+	}
+}
+
+static void report_barcode_events(void)
+{
+	barcode_event_message_t event;
+	INT received;
+
+	for (;;) {
+		char payload[VEHICLE_BARCODE_PAYLOAD_SIZE + 1U];
+		unsigned i;
+
+		received = tk_rcv_mbf(g_mbf_barcode_events, &event, TMO_POL);
+		if (received == E_TMOUT) return;
+		if (received != (INT)sizeof(event))
+			report_error_forever("LINE-BARCODE", "barcode event receive",
+					     received < E_OK ? (ER)received : E_IO);
+		if (event.header.type != VEHICLE_MESSAGE_BARCODE_EVENT ||
+		    event.header.version != VEHICLE_MESSAGE_VERSION ||
+		    event.valid != 1U || event.length > VEHICLE_BARCODE_PAYLOAD_SIZE)
+			report_error_forever("LINE-BARCODE", "invalid barcode event", E_SYS);
+
+		for (i = 0U; i < event.length; i++) payload[i] = event.payload[i];
+		payload[event.length] = '\0';
+		tm_printf((UB*)"[HWTEST][BAR-H01] t=%u ms decoded=%s length=%u\n",
+			  (unsigned)event.header.timestamp_ms, payload,
+			  (unsigned)event.length);
+	}
+}
+
+static void report_sensor_faults(void)
+{
+	fault_message_t fault;
+	INT received;
+
+	for (;;) {
+		received = tk_rcv_mbf(g_mbf_faults, &fault, TMO_POL);
+		if (received == E_TMOUT) return;
+		if (received != (INT)sizeof(fault))
+			report_error_forever("LINE-BARCODE", "fault receive",
+					     received < E_OK ? (ER)received : E_IO);
+		tm_printf((UB*)"[HWTEST][LINE-BARCODE] fault source=%u code=%u\n",
+			  (unsigned)fault.source, (unsigned)fault.code);
+	}
+}
+
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	bool have_last_line = false;
+	const char *last_position = NULL;
+	uint32_t last_report_ms = 0U;
+	ER error;
+
+	(void)stacd;
+	(void)exinf;
+	error = encoder_source_register();
+	if (error != E_OK)
+		report_error_forever("LINE-BARCODE", "encoder registration", error);
+	error = gpio_dispatcher_start();
+	if (error != E_OK)
+		report_error_forever("LINE-BARCODE", "GPIO dispatcher start", error);
+	error = odometry_task_start(&s_line_barcode_odometry_config,
+				    LINE_BARCODE_TEST_ODOMETRY_PERIOD_MS);
+	if (error != E_OK)
+		report_error_forever("LINE-BARCODE", "odometry task start", error);
+	error = line_adc_reader_start_default_task(LINE_BARCODE_TEST_MAX_SAMPLE_SPAN_MS,
+						   &s_line_barcode_task_config);
+	if (error != E_OK)
+		report_error_forever("LINE-BARCODE", "line/barcode task start", error);
+
+	tm_printf((UB*)"[HWTEST][LINE-BARCODE] monitor started; motors and servo "
+		  "are not started; keep wheels still until the first line sample\n");
+	tm_printf((UB*)"[HWTEST][LINE-BARCODE] wheel_counts_per_rev=2500 "
+		  "circumference_cm=20.4 counts_per_module=%u\n",
+		  (unsigned)LINE_BARCODE_TEST_COUNTS_PER_MODULE);
+	tm_printf((UB*)"[HWTEST][LINE-H01] move the sensors across line, junction, "
+		  "and blank track; observe LOST/LEFT/RIGHT/JUNCTION\n");
+	tm_printf((UB*)"[HWTEST][BAR-H01] roll over a known Code 39 label in both "
+		  "directions; expected payload is printed below\n");
+
+	for (;;) {
+		report_line_observations(&have_last_line, &last_position, &last_report_ms);
+		report_barcode_events();
+		report_sensor_faults();
+		drain_unused_imu_odometry();
+		error = tk_dly_tsk(10U);
+		if (error != E_OK)
+			report_error_forever("LINE-BARCODE", "diagnostic delay", error);
+	}
+}
+#elif APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6
+#define IMU_LIVE_SAMPLE_DELAY_MS 50U
+#define IMU_LIVE_REPORT_INTERVAL_MS 1000U
+#define IMU_LIVE_STARTUP_SAMPLES 5U
+#if APP_SENSOR_TEST == 2
 #define IMU_PROBE_INTERVAL_MS 20U
 #define IMU_PROBE_READY_WAIT_MS 100U
 #define IMU_PROBE_ZYXDA 0x08U
@@ -309,11 +483,23 @@ static ER imu_check_freshness(const lsm303dlhc_i2c_t *sensor, uint8_t before,
 	return E_OK;
 }
 
+#endif
+
 static void sensor_test_task(INT stacd, void *exinf)
 {
 	lsm303dlhc_i2c_t sensor = {0};
 	lsm303dlhc_i2c_config_t config;
+#if APP_SENSOR_TEST == 2
+	accel_data_t initial_sample;
+	uint32_t initial_timestamp;
 	unsigned probe_count;
+#else
+	accel_data_t warmup_sample;
+	uint32_t warmup_timestamp;
+#endif
+	imu_state_t imu;
+	uint32_t last_report_ms = 0U;
+	unsigned startup_samples = 0U;
 	ER error;
 
 	(void)stacd;
@@ -323,6 +509,12 @@ static void sensor_test_task(INT stacd, void *exinf)
 	config.profile = LSM303DLHC_I2C_PROFILE_32_FAMILY;
 	error = lsm303dlhc_i2c_init(&sensor, &config);
 	if (error != E_OK) report_error_forever("IMU", "sensor init", error);
+#if APP_SENSOR_TEST == 2
+	error = lsm303dlhc_i2c_read(&sensor, &initial_sample, &initial_timestamp);
+	if (error != E_OK) report_error_forever("IMU", "initial reader sample", error);
+	tm_printf((UB*)"[HWTEST][IMU] initial_open t_lower=%u ms raw_x=%d raw_y=%d raw_z=%d\n",
+		  (unsigned)initial_timestamp, (int)initial_sample.raw_x,
+		  (int)initial_sample.raw_y, (int)initial_sample.raw_z);
 	error = imu_check_trace_clock();
 	if (error != E_OK) report_error_forever("IMU", "trace clock comparison", error);
 	imu_report_identity(&sensor);
@@ -380,25 +572,58 @@ static void sensor_test_task(INT stacd, void *exinf)
 	sensor = (lsm303dlhc_i2c_t){0};
 	error = lsm303dlhc_i2c_init(&sensor, &config);
 	if (error != E_OK) report_error_forever("IMU", "vehicle reader init", error);
+#else
+	tm_printf((UB*)"[HWTEST][IMU] single-open tilt mode: no BDU probe or sensor reopen\n");
+	/* Bench-only: keep the startup outlier visible without latching the detector. */
+	error = lsm303dlhc_i2c_read(&sensor, &warmup_sample, &warmup_timestamp);
+	if (error != E_OK) report_error_forever("IMU", "warm-up reader sample", error);
+	tm_printf((UB*)"[HWTEST][IMU] warmup_sample t_lower=%u ms "
+		  "raw_x=%d raw_y=%d raw_z=%d (not evaluated for tilt)\n",
+		  (unsigned)warmup_timestamp, (int)warmup_sample.raw_x,
+		  (int)warmup_sample.raw_y, (int)warmup_sample.raw_z);
+	error = tk_dly_tsk(IMU_LIVE_SAMPLE_DELAY_MS);
+	if (error != E_OK) report_error_forever("IMU", "warm-up delay", error);
+#endif
+	if (!imu_processor_init(&imu))
+		report_error_forever("IMU", "tilt processor init", E_SYS);
 	tm_printf((UB*)"[HWTEST][IMU] vehicle reader: CTRL1=0x2f CTRL4=0x80; "
 		  "data-ready gating enabled; sample time is a lower bound\n");
+	tm_printf((UB*)"[HWTEST][IMU] tilt-only check: reset on level ground between trials\n");
 	for (;;) {
 		accel_data_t sample;
 		SYSTIM now;
 		uint32_t timestamp;
+		bool was_tilted = imu.tilt_detected;
+		bool tilt_latched;
+		bool report_startup = startup_samples < IMU_LIVE_STARTUP_SAMPLES;
 
 		error = lsm303dlhc_i2c_read(&sensor, &sample, &timestamp);
 		if (error != E_OK) report_error_forever("IMU", "vehicle reader", error);
 		error = tk_get_otm(&now);
 		if (error != E_OK) report_error_forever("IMU", "clock", error);
-		tm_printf((UB*)"[HWTEST][IMU] vehicle t_lower=%u ms age_bound=%u ms "
-			  "raw_x=%d raw_y=%d raw_z=%d ax_mg=%ld ay_mg=%ld az_mg=%ld\n",
-			  (unsigned)timestamp, (unsigned)(now.lo - timestamp),
-			  (int)sample.raw_x, (int)sample.raw_y, (int)sample.raw_z,
-			  (long)(sample.ax * 1000.0f / 9.80665f),
-			  (long)(sample.ay * 1000.0f / 9.80665f),
-			  (long)(sample.az * 1000.0f / 9.80665f));
-		error = tk_dly_tsk(50U);
+		/* No odometry in this diagnostic; tilt detection does not use distance. */
+		if (!imu_processor_update(&imu, &sample, 0.0f, now.lo))
+			report_error_forever("IMU", "tilt processor update", E_SYS);
+		tilt_latched = !was_tilted && imu.tilt_detected;
+		if (tilt_latched)
+			tm_printf((UB*)"[HWTEST][IMU] TILT DETECTED (latched until reset)\n");
+		if (report_startup || tilt_latched ||
+		    now.lo - last_report_ms >= IMU_LIVE_REPORT_INTERVAL_MS) {
+			if (report_startup) startup_samples++;
+			tm_printf((UB*)"[HWTEST][IMU] vehicle startup_sample=%u "
+				  "t_lower=%u ms age_bound=%u ms "
+				  "raw_x=%d raw_y=%d raw_z=%d ax_mg=%ld ay_mg=%ld az_mg=%ld "
+				  "tilt_detected=%u\n",
+				  report_startup ? startup_samples : 0U,
+				  (unsigned)timestamp, (unsigned)(now.lo - timestamp),
+				  (int)sample.raw_x, (int)sample.raw_y, (int)sample.raw_z,
+				  (long)(sample.ax * 1000.0f / 9.80665f),
+				  (long)(sample.ay * 1000.0f / 9.80665f),
+				  (long)(sample.az * 1000.0f / 9.80665f),
+				  imu.tilt_detected ? 1U : 0U);
+			last_report_ms = now.lo;
+		}
+		error = tk_dly_tsk(IMU_LIVE_SAMPLE_DELAY_MS);
 		if (error != E_OK) report_error_forever("IMU", "delay", error);
 	}
 }
@@ -499,7 +724,7 @@ static void sensor_test_task(INT stacd, void *exinf)
 	tk_slp_tsk(TMO_FEVR);
 }
 #else
-#error APP_SENSOR_TEST must be 0, 1 (IR), 2 (IMU), 3 (ultrasonic), or 4 (servo)
+#error Unsupported APP_SENSOR_TEST diagnostic
 #endif
 
 ER hardware_sensor_test_start(void)

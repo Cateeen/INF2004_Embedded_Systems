@@ -124,10 +124,10 @@ endif
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
 ifneq ($(words $(SENSOR_TEST)),1)
-$(error SENSOR_TEST must be exactly one of none, ir, imu, ultrasonic, servo, or encoder)
+$(error SENSOR_TEST must be exactly one of none, ir, imu, imu_tilt, ultrasonic, servo, encoder, or line_barcode)
 endif
-ifneq ($(filter $(SENSOR_TEST),none ir imu ultrasonic servo encoder),$(SENSOR_TEST))
-$(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use none, ir, imu, ultrasonic, servo, or encoder)
+ifneq ($(filter $(SENSOR_TEST),none ir imu imu_tilt ultrasonic servo encoder line_barcode),$(SENSOR_TEST))
+$(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use none, ir, imu, imu_tilt, ultrasonic, servo, encoder, or line_barcode)
 endif
 SERVO_TEST_US ?= 0
 ifneq ($(SENSOR_TEST),none)
@@ -146,6 +146,10 @@ else ifeq ($(SENSOR_TEST),servo)
 SENSOR_TEST_VALUE := 4
 else ifeq ($(SENSOR_TEST),encoder)
 SENSOR_TEST_VALUE := 5
+else ifeq ($(SENSOR_TEST),imu_tilt)
+SENSOR_TEST_VALUE := 6
+else ifeq ($(SENSOR_TEST),line_barcode)
+SENSOR_TEST_VALUE := 7
 else
 SENSOR_TEST_VALUE := 0
 endif

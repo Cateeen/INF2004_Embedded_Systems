@@ -202,8 +202,15 @@ timing and barcode behavior must be verified on hardware before use.
 `line_adc_reader_start_task()` optionally binds the actual ADC reader to the
 line/barcode task; ADC open and pin setup occur inside that task. It requires
 caller-supplied channel selection, thresholds, polarity and timing limits.
-No application startup calls it, and barcode acquisition on GP28 is not
-confirmed by the pin plan.
+The motor- and servo-free `make SENSOR_TEST=line_barcode` diagnostic starts
+this reader with the imported channel map, the encoder/odometry source, and
+the production line/barcode task. It prints live line observations and
+decoded Code 39 payloads. Its wheel calibration and
+`LINE_BARCODE_TEST_COUNTS_PER_MODULE` setting are in
+`app_program/hardware_sensor_test.c`; tune them to the measured robot and
+printed barcode before scanning. Keep motor power disconnected during this
+diagnostic. It tests sensor/odometry decoding and line observations, not
+powered motor steering.
 
 The IMU processor consumes simulated or caller-provided acceleration,
 distance and timestamps; it does not start a task or access the sensor.
@@ -430,15 +437,35 @@ affect the measurements.
 The shared I2C driver now signals completion after releasing its lock and
 rejects premature wake-ups; trace instrumentation remains IMU-test-only.
 Cross-core timeout behavior still needs hardware validation.
+The `initial_open` line shows the first data-ready-gated sample before the
+probes for comparison with `startup_sample=1` after the sensor is reopened.
 The diagnostic requests a 20 ms delay between its five direct reads;
 kernel timer granularity, freshness polling and I2C transactions add to the
 interval. It then reinitializes the sensor and continuously exercises the
 vehicle's data-ready-gated reader with a requested 50 ms delay. `t_lower` is
 the conservative timestamp lower bound, and `age_bound` is its age measured
 immediately before printing; neither is an exact acquisition time. The standalone test does not
-run the IMU task's 200 ms age check or test controller disarming. With motors
-disconnected, confirm timely readings and test sensor-disconnect fault
+run the IMU task's 200 ms age check or test controller disarming. The live
+reader feeds the production IMU processor with zero travel (no hump-height
+measurement). The live reader prints its first five samples after reopening
+the sensor (`startup_sample=1` through `5`), then reports about once per
+second (`startup_sample=0`) without slowing the sampling loop. When the flag
+first latches, `TILT DETECTED` and the triggering reading print immediately.
+With motor power
+disconnected, start flat, wait for the live readings, and try a slow level
+lift. Reset the Pico with the robot flat before trying a sideways lift. A
+latched flag does not clear when the robot is set down.
+With motors disconnected, confirm timely readings and test sensor-disconnect fault
 handling and controller disarm separately before vehicle operation.
+
+For a pickup-only check, build `make SENSOR_TEST=imu_tilt`. It opens the IMU
+once and runs the same detector without the BDU probe or close/reopen sequence.
+This bench diagnostic logs the first reading as `warmup_sample` without
+evaluating it for tilt because a startup outlier was observed on the robot.
+It then evaluates every reading, prints the first five evaluated samples, and
+continues logging about once per second. The vehicle IMU task is unchanged.
+With motor power disconnected, wait for `tilt_detected=0` on level ground
+before lifting. Reset on level ground between trials.
 
 For a manual GP15 servo check, build `make SENSOR_TEST=servo`: this default
 image emits no servo PWM. To command a single pulse width, build, for example,
@@ -573,6 +600,7 @@ make CONSOLE=uart WIFI=none -j8   # no USB console, radio off (no Pico SDK neede
 make TEST=1 -j8                   # vehicle buffer test, no example tasks
 make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
 make SMP=0 SENSOR_TEST=encoder -j8 # encoder-only diagnostic, skips startup tests
+make SENSOR_TEST=line_barcode -j8  # live line/barcode diagnostic, no motors
 make VEHICLE=1 -j8                # start the vehicle tasks at boot (needs verified hardware, see app_main.c)
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
@@ -596,7 +624,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `ultrasonic`, `servo`, `encoder` | Starts one hardware diagnostic without vehicle tasks or startup tests | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `ultrasonic`, `servo`, `encoder`, `line_barcode` | Starts one hardware diagnostic without vehicle tasks or startup tests; `line_barcode` runs the live ADC/encoder decoder without starting motors | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

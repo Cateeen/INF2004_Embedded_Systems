@@ -1,9 +1,7 @@
 # Team and subsystems
 
-The tables are pre-filled with the **example** in `app_program/` (marked
-*example*). Replace those rows with your own as you replace the example code.
-The examples are disabled by default. `EXAMPLES=1` enables them and drives
-GP19; disconnect the robot's GP19 encoder wire before using that build.
+The subsystem folders contain the vehicle modules. Fill in their owners and
+keep task and interface details current as integration progresses.
 
 Fill this in at the start of the project and keep it up to date. It is the
 single place that says **who owns what**, so that five people can work in
@@ -19,11 +17,12 @@ subsystem, ask its owner or open a pull request for them to review.
 
 | # | Subsystem (what it does) | Student ID | GitHub username | Code | Tests |
 |---|---|---|---|---|---|
-| 1 | *example:* LED heartbeat on GP19 | | | `app_program/subsystem1/` | `testing/subsystem1/` |
-| 2 | *example:* Producer: makes a sample every 300 ms | | | `app_program/subsystem2/` | `testing/subsystem2/` |
-| 3 | *example:* Consumer: collects samples into statistics | | | `app_program/subsystem3/` | `testing/subsystem3/` |
-| 4 | *example:* Monitor: prints reports, pauses the LED | | | `app_program/subsystem4/` | `testing/subsystem4/` |
-| 5 | | | | `app_program/subsystem5/` | `testing/subsystem5/` |
+| 1 | WiFi | | | `app_program/subsystem1/` | `testing/subsystem1/` |
+| 2 | Controller and motion | | | `app_program/subsystem2/` | `testing/subsystem2/` |
+| 3 | Line and barcode | | | `app_program/subsystem3/` | `testing/subsystem3/` |
+| 4 | IMU | | | `app_program/subsystem4/` | `testing/subsystem4/` |
+| 5 | Obstacle detection | | | `app_program/subsystem5/` | `testing/subsystem5/` |
+| 6 | Odometry and GPIO | | | `app_program/subsystem6/` | `testing/integration/` |
 
 Shared files (`app_program/app_main.c`, `app_program/app.h`, this file)
 are changed only by agreement of the team. The exception is claiming an empty
@@ -69,8 +68,8 @@ fixed.
 | GP16 | odometry bring-up | left encoder A |
 | GP17 | odometry bring-up | left encoder B |
 | GP18 | odometry bring-up | right encoder A |
-| GP19 | odometry bring-up / *example:* S1 | right encoder B / example LED; never enable both |
-| GP20 | | |
+| GP19 | odometry bring-up | right encoder B |
+| GP20 | vehicle controller | active-low GO toggle button to GND; internal pull-up |
 | GP21 | | |
 | GP22 | | |
 | GP26 | line/barcode | right IR sensor, ADC0 |
@@ -83,6 +82,14 @@ ADC2 labels were reversed relative to its GPIO numbers; the GPIO numbers were
 confirmed. Verify sensor output voltages and calibration before activation.
 The sensor used for barcode acquisition and the motor driver remain
 unverified. No independent motor-disable arrangement is available.
+
+For the GP15 servo, the operator reported safe positions of 1500 us right,
+1700 us ahead and 1900 us left, with clearance. The physical scan limits have
+been measured at 20 degrees to each side of center. The obstacle adapter uses
+these pulses as bounded calibration points and maps them to its 80–120 degree
+profile coordinates (100 degrees ahead). `VEHICLE_SERVO_LIMITS_VERIFIED` in
+`app_program/app_main.c` is set because these positions and angles were
+physically checked.
 
 ## 3. Peripherals
 
@@ -158,40 +165,35 @@ What students *can* do:
 
 ## 4. Task priorities
 
-1 is the highest. 1–4 are used by the kernel (USB console 3, WiFi 4). Each subsystem gets its own band by default;
-change it only by team agreement. Write down every task you create.
+1 is the highest. 1–4 are used by the kernel (USB console 3, WiFi 4).
+The vehicle tasks below currently use priority 10.
 
-| Subsystem | Priority band | Tasks (name – priority – core) |
+| Subsystem | Priority | Tasks |
 |---|---|---|
-| 1 | 12–13 | *example:* led_task – 12 – any |
-| 2 | 14–15 | *example:* producer_task – 14 – core 1 |
-| 3 | 16–17 | *example:* consumer_task – 16 – core 0 |
-| 4 | 18–19 | *example:* monitor_task – 18 – any |
-| 5 | 20–21 | |
-| Vehicle controller | 10 | `vehicle_controller_task` – 10 – any (opt-in) |
+| 1 | 10 | WiFi service |
+| 2 | 10 | motion, vehicle controller, controller monitor |
+| 3 | 10 | line/barcode |
+| 4 | 10 | IMU |
+| 5 | 10 | obstacle |
+| 6 | 10 | odometry, encoder bring-up |
 
 Core: `TP_PRC1` = core 0, `TP_PRC2` = core 1, or "any".
 
 ## 5. Interfaces between subsystems
 
 Every arrow between two subsystems is listed here. The **provider** creates
-the kernel object and publishes its ID in its own `subsystemN.h`; the **user** only
+the kernel object and publishes its ID in its public header; the **user** only
 sends to it or waits on it. Agree on the data format before coding.
 
 | ID | From → To | Mechanism | Object ID name | Data / meaning | Agreed by |
 |---|---|---|---|---|---|
-| IF-01 | S2 → S3 | mailbox (owned by S3) | `mbx_samples` | `SAMPLE_MSG` in `subsystem2.h` | *example* |
-| IF-02 | S3 → S2 | semaphore + fixed memory pool (owned by S2) | `sem_slots`, `mpf_samples` | receiver returns the block, then 1 slot | *example* |
-| IF-03 | S3 → S4 | message buffer + event flag (owned by S4) | `mbf_summary`, `flg_events` | text line ≤ `S4_SUMMARY_MAX` bytes, then `FLG_BATCH` | *example* |
-| IF-04 | S4 → S3 | shared data under a mutex (owned by S3) | `app_stats`, `mtx_stats` | `APP_STATS`, read only while locked | *example* |
-| IF-05 | S4 → S1 | task control | `tid_led` | `tk_sus_tsk` / `tk_rsm_tsk` / `tk_chg_pri` | *example* |
 | IF-06 | | | | | |
 | IF-07 | application WiFi service → built-in network owner | copied message buffer, nonblocking | bridge-owned, private | legacy five-byte telemetry on `robot/telemetry`, QoS 0; opt-in, no delivery guarantee | team and instructor agreement confirmed |
 | IF-08 | built-in network owner → application WiFi service | atomic link snapshot | bridge-owned, private | link and MQTT readiness with operating-clock timestamp; stale snapshots fault the service | team and instructor agreement confirmed |
 | IF-09 | telemetry producer → application WiFi service | copied message buffer, nonblocking | `g_mbf_telemetry` | ordered telemetry messages; producer handles full-buffer and other errors | pending |
 | IF-10 | motion task → controller | copied message buffer | `g_mbf_motion_status` | sequenced 100 ms commanded-PWM, active-command and latched-fault state; controller period ≤50 ms; no ARM acknowledgement or physical feedback | implementation draft; hardware validation pending |
 | IF-11 | vehicle controller → motion task | copied message buffer, nonblocking | `g_mbf_motion_commands` | ARM/STOP/emergency-stop; VELOCITY is not yet issued | implementation in progress |
-| IF-12 | trusted local input provider → vehicle controller | task-context callback | configured callback/context | GO and emergency-stop levels; callback is bounded and context remains alive for task lifetime | hardware binding pending |
+| IF-12 | local input provider → vehicle controller | task-context callback | configured callback/context | GP20 button toggles GO; emergency-stop input is not wired | hardware validation pending |
 
 Each interface is tested by at least one integration test
 (`testing/integration/TEST_LOG.md`).
@@ -199,19 +201,20 @@ Each interface is tested by at least one integration test
 ## 6. Kernel object budget
 
 Limits are set in `config/config.h`. If the team needs more, raise the
-limit there. The numbers below are the example's usage.
+limit there. The previous example's usage is no longer applicable; record
+vehicle usage as it is verified.
 
 | Object | Limit | S1 | S2 | S3 | S4 | S5 |
 |---|---|---|---|---|---|---|
-| Task | 32 | 1 | 1 | 1 | 1 | |
-| Semaphore | 16 | | 1 | | | |
-| Event flag | 16 | | | | 1 | |
-| Mailbox | 12 | | | 1 | | |
-| Mutex | 12 | | | 1 | | |
-| Message buffer | 12 | | | | 1 | |
-| Fixed memory pool | 12 | | 1 | | | |
+| Task | 32 | | | | | |
+| Semaphore | 16 | | | | | |
+| Event flag | 16 | | | | | |
+| Mailbox | 12 | | | | | |
+| Mutex | 12 | | | | | |
+| Message buffer | 12 | | | | | |
+| Fixed memory pool | 12 | | | | | |
 | Variable memory pool | 12 | | | | | |
-| Cyclic handler | 12 | 1 | | | | |
-| Alarm handler | 12 | | | | 1 | |
+| Cyclic handler | 12 | | | | | |
+| Alarm handler | 12 | | | | | |
 
 (The kernel's USB and WiFi service tasks also use a few of these.)

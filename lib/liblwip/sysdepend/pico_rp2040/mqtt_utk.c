@@ -20,8 +20,8 @@
 #include "lwip/timeouts.h"
 #include "wifi_secrets.h"
 #include "mqtt_utk.h"
-#include "../../../../app_program/wifi/wifi_mqtt_bridge_owner.h"
-#include "../../../../app_program/wifi/wifi_telemetry.h"
+#include "../../../../app_program/subsystem1/wifi/wifi_mqtt_bridge_owner.h"
+#include "../../../../app_program/subsystem1/wifi/wifi_telemetry.h"
 #include <tm/tmonitor.h>
 
 #define MQTT_UTK_HEARTBEAT_MS   5000

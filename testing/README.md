@@ -41,11 +41,11 @@ The LSM303DLHC transport tests also run against a host I2C/API mock, not the
 robot. From `testing/integration/imu_i2c_host`:
 
 ```sh
-gcc -std=c11 -Wall -Wextra -Werror -Isys -I../../../app_program/imu \
+gcc -std=c11 -Wall -Wextra -Werror -Isys -I../../../app_program/subsystem4/imu \
   -I../../../device/include \
-  test.c ../../../app_program/imu/lsm303dlhc_i2c.c \
-  ../../../app_program/imu/lsm303dlhc_reader.c \
-  ../../../app_program/imu/lsm303dlhc_accel.c -o imu_i2c_host_test
+  test.c ../../../app_program/subsystem4/imu/lsm303dlhc_i2c.c \
+  ../../../app_program/subsystem4/imu/lsm303dlhc_reader.c \
+  ../../../app_program/subsystem4/imu/lsm303dlhc_accel.c -o imu_i2c_host_test
 ./imu_i2c_host_test
 ```
 
@@ -57,29 +57,44 @@ The HSR04 distance conversion test is hardware-independent. From
 `testing/integration/hcsr04_host`:
 
 ```sh
-gcc -std=c11 -Wall -Wextra -Werror -I../../../app_program/obstacle \
-  test.c ../../../app_program/obstacle/hcsr04.c \
-  ../../../app_program/obstacle/hcsr04_capture.c -o hcsr04_host_test
+gcc -std=c11 -Wall -Wextra -Werror -I../../../app_program/subsystem5/obstacle \
+  test.c ../../../app_program/subsystem5/obstacle/hcsr04.c \
+  ../../../app_program/subsystem5/obstacle/hcsr04_capture.c -o hcsr04_host_test
 ./hcsr04_host_test
 ```
 
 It checks only Echo pulse-width conversion and input validation, not GPIO,
 level shifting, sensor acquisition, or servo operation.
 
+The servo diagnostic's PWM sequencing can be checked without hardware. From
+`testing/integration/servo_host`:
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -I../../../include -DSERVO_TEST_US=0 test.c -o servo_host_test
+./servo_host_test
+gcc -std=c11 -Wall -Wextra -Werror -I../../../include -DSERVO_TEST_US=1500 test.c -o servo_host_test
+./servo_host_test
+gcc -std=c11 -Wall -Wextra -Werror -I../../../include -I../../../kernel/knlinc pwm_startup_test.c -o pwm_startup_test
+./pwm_startup_test
+gcc -std=c11 -Wall -Wextra -Werror calibration_test.c ../../../app_program/subsystem5/obstacle/obs_servo_calibration.c -o calibration_test
+./calibration_test
+```
+
+These host tests do not verify electrical signals, servo movement, clearance,
+or physical scan angles.
+
 1. **Define it first.** Add a row to the *Test cases* table in the right
    `TEST_LOG.md`: ID, what it checks, how, and the expected result.
 2. **Automate it if you can.** Add a `TEST_CHECK` with the same ID to
-   `app_program/subsystemN/subsystemN_test.c` (see `app_program/test_report.h`).
+   the relevant module's test source (see `app_program/test_report.h`).
    A test that needs eyes or instruments (an LED blinks, a motor turns, a
    scope shows 1 kHz) is a *manual* test. Write its steps in the table instead.
 3. **Build the test image and flash it.**
    ```sh
    cd build_make
-   make TEST=1 -j8        # software startup tests; template examples disabled
-   make TEST=1 EXAMPLES=1 -j8  # also run template tests; drives GP19
+   make TEST=1 -j8        # vehicle software startup tests
    ```
-   With `EXAMPLES=1`, the test image runs every template subsystem's tests
-   at power-up and prints one
+   The test image runs vehicle tests at power-up and prints
    `[TEST] <ID> PASS|FAIL` line per check. (A normal `make` leaves the tests out.)
 4. **Save the console output** to `logs/`, named `YYYY-MM-DD_<what>.txt`:
    ```sh

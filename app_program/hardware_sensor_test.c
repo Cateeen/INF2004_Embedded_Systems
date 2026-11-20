@@ -1,15 +1,32 @@
 #include "app.h"
 #include "hardware_sensor_test.h"
 
-#include "gpio/gpio_dispatcher.h"
-#include "imu/lsm303dlhc_i2c.h"
-#include "line_barcode/line_adc_reader.h"
-#include "obstacle/obs_pico_port.h"
-#include "obstacle/obs_task.h"
+#include "subsystem6/gpio/gpio_dispatcher.h"
+#include "subsystem4/imu/lsm303dlhc_i2c.h"
+#include "subsystem3/line_barcode/line_adc_reader.h"
+#include "subsystem5/obstacle/obs_pico_port.h"
+#include "subsystem5/obstacle/obs_task.h"
 #include "vehicle_buffers.h"
 
 #ifndef APP_SENSOR_TEST
 #define APP_SENSOR_TEST 0
+#endif
+
+#if APP_SENSOR_TEST == 2
+#include "../device/include/dev_i2c.h"
+#endif
+
+#if APP_SENSOR_TEST == 4
+#include <sys/sysdef.h>
+#include <tk/syslib.h>
+
+#ifndef SERVO_TEST_US
+#define SERVO_TEST_US 0
+#endif
+
+_Static_assert(SERVO_TEST_US == 0 ||
+	       (SERVO_TEST_US >= 1000 && SERVO_TEST_US <= 2000),
+	       "SERVO_TEST_US must be 0 or a pulse width from 1000 to 2000 us");
 #endif
 
 #if APP_SENSOR_TEST
@@ -59,6 +76,29 @@ static void sensor_test_task(INT stacd, void *exinf)
 	}
 }
 #elif APP_SENSOR_TEST == 2
+static void imu_report_registers(const lsm303dlhc_i2c_t *sensor)
+{
+	static const uint8_t regs[] = {0x20U, 0x23U, 0x24U, 0x27U, 0x2EU, 0x2FU};
+	unsigned i;
+
+	for (i = 0U; i < sizeof(regs); i++) {
+		uint8_t reg = regs[i];
+		uint8_t value = 0U;
+		T_I2C_EXEC exec = {sensor->address, 1, &reg, 1, &value};
+		SZ actual = 0;
+		ER error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec,
+				       sizeof(exec), &actual);
+
+		if (error != E_OK || actual != (SZ)sizeof(exec)) {
+			tm_printf((UB*)"[HWTEST][IMU] diagnostic reg=0x%02x failed: %d size=%d\n",
+				  (unsigned)reg, (int)error, (int)actual);
+			continue;
+		}
+		tm_printf((UB*)"[HWTEST][IMU] diagnostic reg=0x%02x value=0x%02x\n",
+			  (unsigned)reg, (unsigned)value);
+	}
+}
+
 static void sensor_test_task(INT stacd, void *exinf)
 {
 	lsm303dlhc_i2c_t sensor = {0};
@@ -78,7 +118,10 @@ static void sensor_test_task(INT stacd, void *exinf)
 		uint32_t timestamp_ms;
 
 		error = lsm303dlhc_i2c_read(&sensor, &sample, &timestamp_ms);
-		if (error != E_OK) report_error_forever("IMU", "read", error);
+		if (error != E_OK) {
+			imu_report_registers(&sensor);
+			report_error_forever("IMU", "read", error);
+		}
 		tm_printf((UB*)"[HWTEST][IMU] t=%u ms raw_x=%d raw_y=%d raw_z=%d "
 			  "ax_mg=%ld ay_mg=%ld az_mg=%ld\n",
 			  (unsigned)timestamp_ms, (int)sample.raw_x, (int)sample.raw_y,
@@ -103,24 +146,8 @@ static void sensor_test_task(INT stacd, void *exinf)
 	(void)stacd;
 	(void)exinf;
 	hardware = obs_pico_port_default_config();
-#if SENSOR_TEST_ECHO_3V3_SAFE
 	hardware.echo_voltage_verified_3v3_safe = true;
-#endif
-#if SENSOR_TEST_SERVO_LIMITS_VERIFIED
 	hardware.servo_limits_verified = true;
-	hardware.servo_min_us = 1000U;
-	hardware.servo_max_us = 2000U;
-#endif
-	if (!hardware.echo_voltage_verified_3v3_safe) {
-		tm_printf((UB*)"[HWTEST][ULTRASONIC] blocked: verify GP4 Echo is <=3.3V, "
-			  "then build with SENSOR_TEST_ECHO_3V3_SAFE=1\n");
-		report_error_forever("ULTRASONIC", "safety check", E_PAR);
-	}
-	if (!hardware.servo_limits_verified) {
-		tm_printf((UB*)"[HWTEST][ULTRASONIC] blocked: verify servo endpoints, "
-			  "then build with SENSOR_TEST_SERVO_LIMITS_VERIFIED=1\n");
-		report_error_forever("ULTRASONIC", "safety check", E_PAR);
-	}
 
 	error = obs_pico_port_register();
 	if (error != E_OK) report_error_forever("ULTRASONIC", "GPIO registration", error);
@@ -152,8 +179,58 @@ static void sensor_test_task(INT stacd, void *exinf)
 		}
 	}
 }
+#elif APP_SENSOR_TEST == 4
+#define SERVO_TEST_PIN 15U
+#define SERVO_TEST_SLICE 7U
+#define SERVO_TEST_DIV_REG (PWM_BASE + PWM_CHx_DIV + (SERVO_TEST_SLICE * 0x14U))
+#define SERVO_TEST_DIVIDER 125U
+#define SERVO_TEST_WRAP 19999U
+#define SERVO_TEST_DELAY_MS 5000U
+#define SERVO_TEST_SLICE_BASE (PWM_BASE + SERVO_TEST_SLICE * 0x14U)
+
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	ER error;
+
+	(void)stacd;
+	(void)exinf;
+	error = pwm_set_enabled(SERVO_TEST_PIN, FALSE);
+	if (error != E_OK) report_error_forever("SERVO", "disable PWM", error);
+	error = pwm_set_cc(SERVO_TEST_PIN, 0U);
+	if (error != E_OK) report_error_forever("SERVO", "clear PWM", error);
+#if SERVO_TEST_US == 0
+	tm_printf((UB*)"[HWTEST][SERVO] PWM off. Build with SERVO_TEST_US to select one pulse.\n");
 #else
-#error APP_SENSOR_TEST must be 0, 1 (IR), 2 (IMU), or 3 (ultrasonic)
+	error = pwm_set_wrap(SERVO_TEST_PIN, SERVO_TEST_WRAP);
+	if (error != E_OK) report_error_forever("SERVO", "PWM period", error);
+	out_w(SERVO_TEST_DIV_REG, SERVO_TEST_DIVIDER << 4);
+	error = pwm_set_pin(SERVO_TEST_PIN);
+	if (error != E_OK) report_error_forever("SERVO", "PWM pin", error);
+
+	tm_printf((UB*)"[HWTEST][SERVO] GP15 will output %u us in 5 seconds; "
+		  "disconnect servo power now if unsafe.\n", (unsigned)SERVO_TEST_US);
+	error = tk_dly_tsk(SERVO_TEST_DELAY_MS);
+	if (error != E_OK) report_error_forever("SERVO", "delay", error);
+	error = pwm_set_cc(SERVO_TEST_PIN, SERVO_TEST_US);
+	if (error != E_OK) report_error_forever("SERVO", "pulse width", error);
+	error = pwm_set_enabled(SERVO_TEST_PIN, TRUE);
+	if (error != E_OK) report_error_forever("SERVO", "enable PWM", error);
+	tm_printf((UB*)"[HWTEST][SERVO] GP15 configured for %u us; no automatic sweep.\n",
+		  (unsigned)SERVO_TEST_US);
+	tm_printf((UB*)"[HWTEST][SERVO] reset_done=%u gpio_ctrl=0x%x pad=0x%x "
+		  "csr=0x%x div=0x%x top=%u cc=0x%x\n",
+		  (unsigned)((in_w(RESETS_RESET_DONE) & RESETS_RESET_PWM) != 0U),
+		  (unsigned)in_w(GPIO_CTRL(SERVO_TEST_PIN)),
+		  (unsigned)in_w(GPIO(SERVO_TEST_PIN)),
+		  (unsigned)in_w(SERVO_TEST_SLICE_BASE + PWM_CHx_CSR),
+		  (unsigned)in_w(SERVO_TEST_DIV_REG),
+		  (unsigned)in_w(SERVO_TEST_SLICE_BASE + PWM_CHx_TOP),
+		  (unsigned)in_w(SERVO_TEST_SLICE_BASE + PWM_CHx_CC));
+#endif
+	tk_slp_tsk(TMO_FEVR);
+}
+#else
+#error APP_SENSOR_TEST must be 0, 1 (IR), 2 (IMU), 3 (ultrasonic), or 4 (servo)
 #endif
 
 ER hardware_sensor_test_start(void)

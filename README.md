@@ -122,9 +122,7 @@ screen /dev/ttyACM0 115200            # Linux
 ```
 
 On Windows, use PuTTY or the VS Code *Serial Monitor* on the new COM port.
-Template example tasks are disabled by default while the robot is migrated.
-With `EXAMPLES=1`, the template reports appear and subsystem 1 drives GP19
-for an LED. Disconnect the robot's GP19 encoder wire before using that build.
+Vehicle tasks are opt-in and require verified hardware configuration.
 
 **2.5 Write your own code**
 
@@ -132,8 +130,7 @@ Your code lives in **`app_program/`**. Every `.c` file there, and in its
 subfolders, is compiled automatically.
 
 - **`app_main.c` → `usermain()` is where the program starts.** It creates
-  vehicle message buffers first. With `EXAMPLES=1`, it then calls every
-  example subsystem's `subsystemN_init()` and `subsystemN_start()`.
+  vehicle message buffers first, then starts the selected vehicle or diagnostic tasks.
 - Do not copy the source `integration/car_main.c` as another entry point.
   Its default path is a bare-metal `main()` that launches core-specific loops;
   µT-Kernel already owns startup and calls `usermain()`. The source file's
@@ -146,7 +143,7 @@ subfolders, is compiled automatically.
     scan operations.
   - `line_status_init()` / `car_measurements_init()` → line/barcode and
     odometry producers, which publish copied messages instead of shared state.
-  - Source `line_steering.c` is preserved under `app_program/controller/` as a
+  - Source `line_steering.c` is preserved under `app_program/subsystem2/controller/` as a
     hardware-independent decision module. It retains its PWM intent values
     but is not wired to the motion task or started by application startup.
   - `car_link_init()` → still needs a target-local input provider. Do not call
@@ -154,13 +151,9 @@ subfolders, is compiled automatically.
     return within its task period.
   Vehicle tasks remain opt-in until local-input binding, motion authorization,
   and hardware configurations are verified.
-- **One folder per student:** `app_program/subsystem1/` … `subsystem5/`.
-  Subsystems 1–4 hold a working example, one task each (LED, producer,
-  consumer, monitor). Together they use the main micro T-Kernel APIs and
-  pass data between subsystems. Subsystem 5 is an empty template.
-  Replace the examples with your own subsystems.
-- `subsystemN.h` is that subsystem's public interface: the object IDs and
-  data formats the other subsystems may use.
+- **Subsystem folders:** `app_program/subsystem1/` … `subsystem6/` contain
+  WiFi, control and motion, line/barcode, IMU, obstacle, and odometry/GPIO
+  modules respectively. Their task headers provide their public interfaces.
 - `app.h` holds the definitions shared by the whole team.
 - **Drivers go in your subsystem folder too**, as a `drv_<name>.c` /
   `drv_<name>.h` pair, e.g. `subsystem2/drv_ultrasonic.c`. They are compiled
@@ -173,8 +166,7 @@ between subsystems in **`TEAM.md`**, and record every test in **`testing/`**
 (see `testing/README.md`). `make TEST=1` tests the vehicle buffers, the
 hardware-independent encoder/odometry calculations, line classification, and
 Code 39 barcode decoding, IMU processing, obstacle profiling, wheel control
-controller safety predicates and GPIO interrupt routing;
-`make TEST=1 EXAMPLES=1` also runs the template subsystem tests. Short videos
+controller safety predicates and GPIO interrupt routing. Short videos
 of tests and demos are shared as unlisted YouTube links, listed in **`videos/`**.
 
 The line/barcode task consumes line odometry and publishes line observations
@@ -248,9 +240,10 @@ callback to the IMU task. The transport must configure the verified mode,
 establish that each sample is new, supply all six bytes and a valid acquisition
 timestamp, and own the bus; the adapter cannot independently verify those
 claims. An opt-in I2C1 transport is now available in
-`app_program/imu/lsm303dlhc_i2c.c`: it opens `iicb` exclusively, accepts the
+`app_program/subsystem4/imu/lsm303dlhc_i2c.c`: it opens `iicb` exclusively, accepts the
 sensor address as configuration (the imported default is 0x19), checks
-WHO_AM_I and control registers, configures 100 Hz normal-mode +/-2g acquisition,
+control-register readback but does not verify sensor identity, configures
+100 Hz normal-mode +/-2g acquisition,
 uses the original 1.05 mg/LSB scale and X/Y/Z signs (-,+,-), waits for
 ZYXDA, and reads all six output bytes. It supplies timestamps on the
 `tk_get_otm` clock that precede the corresponding acquisition. The ready wait
@@ -265,13 +258,18 @@ magnetometer, but the current vehicle message/processor path consumes only
 accelerometer data.
 
 The obstacle task has an opt-in Pico callback adapter in
-`app_program/obstacle/obs_pico_port.c`. It uses the shared GPIO dispatcher for
+`app_program/subsystem5/obstacle/obs_pico_port.c`. It uses the shared GPIO dispatcher for
 Echo edges and runs the task on core 0. It is not registered or started by
-application startup. Its default configuration deliberately leaves Echo
-voltage safety and servo endpoint confirmations false and servo pulse limits
-unset; do not enable it until the Echo signal is confirmed 3.3 V-safe and the
-servo endpoints are measured. The original source's Pico-car port itself says
-it was not compiled or hardware-tested, and its servo values are placeholders.
+application startup by default. Its generic default configuration remains
+unverified. The reported safe servo positions are 1500 us right, 1700 us ahead and 1900 us
+left; the physical scan limits were measured at 20 degrees to either side of
+center. The adapter interpolates within these positions and rejects commands
+outside the calibrated angle range. The vehicle and ultrasonic test profiles
+mark the owner's measured Echo voltage and servo limits as verified.
+The nine nominal scan pulses are 1500, 1550, 1600, 1650, 1700, 1750, 1800,
+1850 and 1900 us, in right-to-left order. The software profile coordinates are
+80–120 degrees with 100 degrees ahead; they represent the measured -20 to +20
+degree physical sweep, not absolute compass headings.
 
 The obstacle profile module processes simulated distance scans only. Its
 geometry and thresholds are placeholders; a clear scan or computed bypass is
@@ -289,11 +287,11 @@ The task cannot independently stop motors or verify that precondition. Its
 optional initialization callback, polling callback and stop callback share the
 obstacle task's owner context. The polling and stop callbacks must return
 promptly; a blocked callback or failed fault delivery requires independent
-freshness supervision. The reported ultrasonic sensor is an HSR04, but its
-Echo voltage/level shifting and the servo's safe pulse limits are unknown.
+freshness supervision. The reported ultrasonic sensor is an HSR04; its
+Echo voltage/level shifting must be verified for the actual wiring.
 Do not connect a 5 V Echo directly to the Pico W or activate the sensor/servo
-until those details are verified. The opt-in callback adapter described above
-is not started by application startup and has not been hardware-tested.
+until those details are verified. The full callback adapter and obstacle
+geometry have not been verified on hardware.
 The inactive `hcsr04_distance_mm()` helper converts a measured Echo high-pulse
 width to millimetres using an explicitly supplied sound speed; it does not
 measure the Echo pulse or initialize GPIO. The companion Echo capture state
@@ -302,7 +300,7 @@ also does not access GPIO; a hardware integration must capture both edges
 without missing the short pulse.
 
 Wheel-speed control calculates PWM magnitudes only. The opt-in hardware motion
-task can now apply them through `app_program/motion/motor_driver.c`; application
+task can now apply them through `app_program/subsystem2/motion/motor_driver.c`; application
 startup does not call it. The driver starts braked with emergency stop latched
 and only its initializing task may control it. Hardware mode requires an
 explicit, fresh ARM command while stopped, followed by a fresh VELOCITY command;
@@ -365,7 +363,7 @@ The standalone controller state machine is an advisory simulation of waiting,
 following, blocked, scanning and faulted states. Its single owner supplies
 sensor observations to its safety monitor and calls it every cycle with a
 current trusted local go input. A go signal already high at startup, or held
-high through a veto, cannot arm or rearm; release and press it again after
+high through a veto, cannot arm or rearm; turn GO off and on again after
 conditions clear. Faults and emergency stop remain latched until restart.
 The state machine does not start a task, steer, send motion commands, request
 scans or verify physical stopping. `FOLLOWING` is permission to follow, not
@@ -376,12 +374,45 @@ not connected. Independent motor-stop and watchdog mechanisms remain required.
 An opt-in `vehicle_controller_task` now connects this safety gate to the line,
 IMU, obstacle, fault and motion-status buffers and sends
 ARM/STOP/emergency-stop messages. Its required local-input callback supplies
-trusted GO and emergency-stop levels; dashboard commands alone cannot arm. It
+GO and emergency-stop levels; dashboard commands alone cannot arm. It
 sends no VELOCITY commands yet because the motion task still rejects steering
 commands. The motion status is commanded state, not physical feedback. The
 controller exclusively consumes those buffers, so do not start it alongside
-`controller_monitor_start()`. It is not started by application startup and has
-not been hardware-tested.
+`controller_monitor_start()`. It has not been hardware-tested.
+
+With `VEHICLE=1`, the local GO input is a momentary button between GP20 and
+GND, with the internal pull-up enabled. After an initial release, each
+debounced press toggles GO; releasing the button does not turn GO off. The
+controller samples it every 50 ms and requires two consecutive matching
+samples. If a safety veto occurs while GO is on, toggle it off and on after
+the veto clears to request rearming. The button and software STOP are not an
+emergency stop. The emergency input is still hardcoded inactive; an independent
+motor-power cutoff is required. Servo clearance and scan geometry have been
+verified; the flag in `app_main.c` enables the vehicle startup path. The GO
+button still controls whether the vehicle controller may run.
+
+For a manual GP15 servo check, build `make SENSOR_TEST=servo`: this default
+image emits no servo PWM. To command a single pulse width, build, for example,
+`make SENSOR_TEST=servo SERVO_TEST_US=1500`. The allowed values are 0 (off)
+or 1000–2000 microseconds. The value is not a guarantee of safe travel.
+After the serial monitor opens, the diagnostic warns for five seconds, then
+continuously outputs only that pulse; it never sweeps or stops automatically,
+even if the serial monitor disconnects. Disconnect servo power
+before flashing or changing the setup. Start with the linkage removed and
+verify that the commanded position is clear before reattaching it. Rebuild and
+reflash for each small change; keep clear and stop before the mechanism
+reaches the board. Disconnect servo power if anything is unsafe. This mode
+does not verify servo limits or the ultrasonic Echo voltage, and does not
+change the vehicle safety flags.
+The diagnostic also prints PWM and GPIO register values; these do not prove
+the signal or power reaches the servo.
+
+For the HC-SR04/servo hardware diagnostic, build
+`make SENSOR_TEST=ultrasonic`. It reports live distances on the USB serial
+console and moves the servo to its ahead position. GP4 Echo safety and the
+servo's 1500/1700/1900 us calibration are recorded as verified in this test
+configuration. If the sensor, wiring, voltage divider or servo setup changes,
+re-measure and update the configuration before running it.
 
 The opt-in application WiFi service supports simulated callbacks or an outbound
 MQTT bridge backend.
@@ -481,18 +512,17 @@ After editing, run `make -j8` again in `build_make` and copy the new `.uf2`.
 
 ---
 
-## 3. Build options: `SMP`, `CONSOLE`, `WIFI`, `TEST`, `EXAMPLES`, `CRASH_REPORT`
+## 3. Build options: `SMP`, `CONSOLE`, `WIFI`, `TEST`, `CRASH_REPORT`
 
 `make` on its own uses the defaults. To build differently, put options
 after `make`. They can be combined in any order:
 
 ```sh
-make -j8                          # defaults: SMP=1 CONSOLE=usb_cdc WIFI=cyw43 TEST=0 EXAMPLES=0 CRASH_REPORT=0
+make -j8                          # defaults: SMP=1 CONSOLE=usb_cdc WIFI=cyw43 TEST=0 CRASH_REPORT=0
 make SMP=0 -j8                    # single-core build
 make CONSOLE=uart WIFI=none -j8   # no USB console, radio off (no Pico SDK needed)
 make TEST=1 -j8                   # vehicle buffer test, no example tasks
 make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
-make TEST=1 EXAMPLES=1 -j8        # also run template examples and their tests; GP19 is driven
 make VEHICLE=1 -j8                # start the vehicle tasks at boot (needs verified hardware, see app_main.c)
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
@@ -514,10 +544,9 @@ the next plain `make` goes back to the defaults.
 | `SMP` | `0`, **`1`** | `1` runs the kernel on both RP2040 cores; `0` uses core 0 only | `smp1` / `smp0` | `TK_SUPPORT_SMP` (1 or 0) |
 | `CONSOLE` | **`usb_cdc`**, `uart` | where `tm_printf` output goes. `usb_cdc` = USB cable; `uart` = UART0 only (GP0 TX / GP1 RX, needs a USB-serial adapter) | `_usb_cdc` / `_uart` | `TM_CONSOLE_USB_CDC` |
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
-| `TEST` | **`0`**, `1` | `1` runs the vehicle buffer test; template tests also require `EXAMPLES=1` | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
-| `EXAMPLES` | **`0`**, `1` | `1` starts the template examples; subsystem 1 drives GP19 | `_examples` / *(nothing)* | `APP_EXAMPLES` (1 or 0) |
-| `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` and `EXAMPLES=0` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0` and `EXAMPLES=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
+| `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
+| `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
+| `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 
 Encoder bring-up prints signed counts and individual wheel distances every

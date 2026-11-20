@@ -4,6 +4,9 @@
 
 See `testing/README.md` for how to run tests and record results.
 
+The example template test below is historical and no longer runnable; current
+vehicle test cases are recorded in `testing/integration/TEST_LOG.md`.
+
 ## Test cases
 
 Define a test here before running it. Test IDs never change.

@@ -7,12 +7,18 @@
 #include "lsm303dlhc_i2c.h"
 #include "dev_i2c.h"
 
+static char last_log[256];
+
 int tm_printf(const UB *format, ...)
 {
 	va_list args;
+	va_list copy;
 	int result;
 
 	va_start(args, format);
+	va_copy(copy, args);
+	vsnprintf(last_log, sizeof(last_log), (const char *)format, copy);
+	va_end(copy);
 	result = vprintf((const char *)format, args);
 	va_end(args);
 	return result;
@@ -74,6 +80,7 @@ ER tk_swri_dev(ID dd, W start, const void *buf, SZ size, SZ *asize)
 		    exec->rcv_data == NULL)
 			return E_PAR;
 		reg = exec->snd_data[0];
+		if (reg == 0x0FU) return E_IO;
 		if ((reg & 0x7FU) == 0x28U && exec->rcv_size == 6) {
 			for (i = 0; i < 6; i++)
 				exec->rcv_data[i] = registers[(reg & 0x7FU) + i];
@@ -159,16 +166,21 @@ static int test_fresh_sample(void)
 	return 1;
 }
 
-static int test_identity_mismatch(void)
+static int test_without_identity_check(void)
 {
 	lsm303dlhc_i2c_t sensor = {0};
 	lsm303dlhc_i2c_config_t setup = config();
+	accel_data_t sample = {0};
+	uint32_t timestamp = 0U;
 
 	reset_fake();
 	registers[0x0F] = 0x32U;
-	CHECK(lsm303dlhc_i2c_init(&sensor, &setup) == E_IO);
-	CHECK(close_count == 1U && !sensor.opened && sensor.faulted);
-	CHECK(config_writes == 0U);
+	CHECK(lsm303dlhc_i2c_init(&sensor, &setup) == E_OK);
+	CHECK(sensor.opened && sensor.initialized && !sensor.faulted);
+	CHECK(lsm303dlhc_i2c_read(&sensor, &sample, &timestamp) == E_OK);
+	CHECK(sample.raw_x == -256 && sample.raw_z == -1000 && timestamp == 100U);
+	CHECK(lsm303dlhc_i2c_close(&sensor) == E_OK);
+	CHECK(close_count == 1U);
 	return 1;
 }
 
@@ -180,7 +192,8 @@ static int test_short_transfer(void)
 	reset_fake();
 	short_exec = true;
 	CHECK(lsm303dlhc_i2c_init(&sensor, &setup) == E_IO);
-	CHECK(close_count == 1U && !sensor.opened);
+	CHECK(close_count == 1U && !sensor.opened && sensor.faulted);
+	CHECK(registers[0x20] == 0U);
 	return 1;
 }
 
@@ -194,7 +207,9 @@ static int test_not_ready_latches_without_output_change(void)
 	reset_fake();
 	CHECK(lsm303dlhc_i2c_init(&sensor, &setup) == E_OK);
 	registers[0x27] = 0U;
+	last_log[0] = '\0';
 	CHECK(lsm303dlhc_i2c_read(&sensor, &sample, &timestamp) == E_TMOUT);
+	CHECK(strstr(last_log, "data-ready timeout: status=0x00 elapsed=2 ms limit=2 ms") != NULL);
 	CHECK(sample.raw_x == 12 && sample.raw_y == 34 && sample.raw_z == 56);
 	CHECK(timestamp == 77U && sensor.faulted);
 	CHECK(lsm303dlhc_i2c_read(&sensor, &sample, &timestamp) == E_OBJ);
@@ -238,7 +253,7 @@ int main(void)
 	CHECK(defaults.mapping.sign[0] == -1 && defaults.mapping.sign[1] == 1 &&
 	      defaults.mapping.sign[2] == -1);
 	CHECK(lsm303dlhc_i2c_default_config(&defaults, 0U) == E_PAR);
-	if (!test_fresh_sample() || !test_identity_mismatch() ||
+	if (!test_fresh_sample() || !test_without_identity_check() ||
 	    !test_short_transfer() || !test_not_ready_latches_without_output_change() ||
 	    !test_task_start_wires_transport())
 		return 1;

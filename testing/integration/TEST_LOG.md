@@ -8,6 +8,9 @@ See `testing/README.md` for how to run tests and record results.
 
 Define a test here before running it. Test IDs never change.
 
+INT-01 and INT-02 describe the removed example system and are retained for
+historical reference; they cannot be run against the current vehicle firmware.
+
 | ID | What is tested | Requirement / interface | Method | Steps / how | Expected result |
 |---|---|---|---|---|---|
 | INT-01 | samples flow from S2 to S3 (≥ 5 in 2 s) | IF-01, IF-02 | auto | `subsystem3_test.c` | `[TEST] INT-01 PASS` |
@@ -47,8 +50,8 @@ Define a test here before running it. Test IDs never change.
 | IMU-U08 | fresh transfer adapter, mapping, partial and invalid transfers, error latch | IMU reader adapter | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U08 PASS` |
 | I2C-U01 | RP2040 read/write command ordering, repeated start and STOP completion | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` | `[TEST] I2C-U01 PASS` |
 | I2C-U02 | RP2040 I2C timeout and abort propagation | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` | `[TEST] I2C-U02 PASS` |
-| IMU-I2C-U01 | LSM303DLHC identity, control-register setup/readback, fresh six-byte sample and timestamp | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U01 PASS` |
-| IMU-I2C-U02 | wrong identity, short transfer, data-ready timeout, output preservation and fault latch | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U02 PASS` |
+| IMU-I2C-U01 | LSM303DLHC control-register setup/readback, fresh six-byte sample and timestamp | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U01 PASS` |
+| IMU-I2C-U02 | no identity read, short transfer, data-ready timeout, output preservation and fault latch | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U02 PASS` |
 | IMU-I2C-U03 | IMU task startup preserves timing configuration and receives the transport callback and context | IMU task integration | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U03 PASS` |
 | IMU-I2C-U04 | imported address, original register mode, vehicle axis signs and accelerometer scale | IMU hardware configuration migration | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U04 PASS` |
 | OBS-U01 | clear scan and centred obstacle | obstacle profiling | auto | `obs_profile_test()` before tasks start | `[TEST] OBS-U01 PASS` |
@@ -59,6 +62,9 @@ Define a test here before running it. Test IDs never change.
 | OBS-U06 | stale or invalid sensor, premature or stale commands, sequence gaps, scan timeout and full event buffer | obstacle task | auto | `obs_task_test()` before tasks start | `[TEST] OBS-U06 PASS` |
 | OBS-U07 | HSR04 Echo pulse width to millimetres, invalid sound speed and reserved sentinel range | ultrasonic distance conversion | host test | compile and run `testing/integration/hcsr04_host/test.c` | `[TEST] OBS-U07 PASS` |
 | OBS-U08 | HSR04 rising/falling Echo capture, wraparound, timeout, reset and restart | ultrasonic Echo capture | host test | compile and run `testing/integration/hcsr04_host/test.c` | `[TEST] OBS-U08 PASS` |
+| SERVO-U01 | default servo diagnostic disables PWM; a selected pulse is enabled only after the warning delay | servo diagnostic | host test | run both configurations described in `testing/README.md` | both mock runs pass |
+| SERVO-U02 | RP2040 startup releases PWM reset when the physical timer is disabled | PWM startup | host test | `pwm_startup_test` as described in `testing/README.md` | PWM reset released |
+| SERVO-U03 | bounded scan mapping, direction and invalid calibration | servo calibration | host test | `calibration_test` as described in `testing/README.md` | bounded mapping passes |
 | MOT-U01 | independent wheel correction and limits | wheel speed control | auto | `wheel_speed_test()` before tasks start | `[TEST] MOT-U01 PASS` |
 | MOT-U02 | integral anti-windup, derivative and reset | wheel speed control | auto | `wheel_speed_test()` before tasks start | `[TEST] MOT-U02 PASS` |
 | MOT-U03 | invalid inputs and numeric overflow rejected | wheel speed control | auto | `wheel_speed_test()` before tasks start | `[TEST] MOT-U03 PASS` |
@@ -92,6 +98,9 @@ Define a test here before running it. Test IDs never change.
 | VC-U19 | lost-line hold expires at 300 ms with a zero-output latch | line steering migration | auto | `line_steering_test()` before tasks start | `[TEST] VC-U19 PASS` |
 | VC-U20 | stop latch persists until explicit reset | line steering migration | auto | `line_steering_test()` before tasks start | `[TEST] VC-U20 PASS` |
 | VC-U21 | invalid line positions fail closed until reset | line steering migration | auto | `line_steering_test()` before tasks start | `[TEST] VC-U21 PASS` |
+| GO-U01 | a button held at startup cannot enable GO | local GO button | auto | `go_button_test()` before tasks start | `[TEST] GO-U01 PASS` |
+| GO-U02 | a single noisy sample does not toggle GO | local GO button | auto | `go_button_test()` before tasks start | `[TEST] GO-U02 PASS` |
+| GO-U03 | distinct stable presses toggle GO once each | local GO button | auto | `go_button_test()` before tasks start | `[TEST] GO-U03 PASS` |
 | WIFI-U01 | disconnected queue retention, status delivery, transient publish retry and sequence wrap | WiFi service | auto | `wifi_service_test()` before tasks start | `[TEST] WIFI-U01 PASS` |
 | WIFI-U02 | invalid or stale telemetry, invalid link, full status buffer and backend errors | WiFi service | auto | `wifi_service_test()` before tasks start | `[TEST] WIFI-U02 PASS` |
 | WIFI-U03 | legacy dashboard command decode, malformed lengths and reserved command types | WiFi command protocol | auto | `wifi_service_test()` before tasks start | `[TEST] WIFI-U03 PASS` |

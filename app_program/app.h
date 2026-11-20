@@ -3,7 +3,7 @@
  *	Definitions shared by the whole team.  Changed only by team agreement.
  *
  *	Anything that belongs to ONE subsystem goes in that subsystem's own
- *	header instead (app_program/subsystemN/subsystemN.h).
+ *	module's own header instead.
  */
 
 #ifndef APP_H
@@ -31,34 +31,6 @@
 /* Create and start a task.  prc = TP_PRC1 (core 0), TP_PRC2 (core 1), or
    0 for "any core".  Defined in app_main.c. */
 IMPORT ID app_start_task(FP entry, PRI pri, UW prc, const char *name);
-
-/* ---------------------------------------------------------------------
- *  Every subsystem provides these.  usermain() calls ALL the _init()
- *  functions first and only then ALL the _start() functions, so every
- *  kernel object exists before any task can use it.
- *    subsystemN_init()   create this subsystem's kernel objects
- *    subsystemN_start()  create and start this subsystem's tasks
- *    subsystemN_test()   on-target tests, only in test builds (make TEST=1)
- * --------------------------------------------------------------------- */
-IMPORT ER subsystem1_init(void);
-IMPORT ER subsystem2_init(void);
-IMPORT ER subsystem3_init(void);
-IMPORT ER subsystem4_init(void);
-IMPORT ER subsystem5_init(void);
-
-IMPORT ER subsystem1_start(void);
-IMPORT ER subsystem2_start(void);
-IMPORT ER subsystem3_start(void);
-IMPORT ER subsystem4_start(void);
-IMPORT ER subsystem5_start(void);
-
-#if APP_TEST
-IMPORT void subsystem1_test(void);
-IMPORT void subsystem2_test(void);
-IMPORT void subsystem3_test(void);
-IMPORT void subsystem4_test(void);
-IMPORT void subsystem5_test(void);
-#endif
 
 /* Print a readable message if a kernel call failed (negative error code) */
 #define CHECK(er, what)							\

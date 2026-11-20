@@ -48,6 +48,7 @@ LOCAL const UW module_tbl[] = {
 	RESETS_RESET_IO_BANK0,		/* IO_BANK0 */
 	RESETS_RESET_PADS_BANK0,	/* PADS_BANK0 */
 	RESETS_RESET_UART0,		/* UART0 */
+	RESETS_RESET_PWM,		/* PWM for application outputs and physical timer */
 
 #if TM_WIFI_CYW43
 	/* The Pico W radio transport runs a PIO state machine with two DMA
@@ -58,10 +59,6 @@ LOCAL const UW module_tbl[] = {
 	RESETS_RESET_PIO1,		/* PIO allocator may select either instance */
 	RESETS_RESET_DMA,		/* CYW43439 PIO-SPI transfers */
 #endif
-
-#if USE_PTMR
-	RESETS_RESET_PWM,		/* PWM */
-#endif	/* USE_PTMR */
 
 #if USE_SDEV_DRV	// Do not use sample device driver
 	RESETS_RESET_ADC,		/* A/DC */

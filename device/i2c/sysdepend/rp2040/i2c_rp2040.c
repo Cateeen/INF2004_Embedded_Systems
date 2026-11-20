@@ -20,6 +20,11 @@
 #endif
 #include "../../i2c.h"
 #include "../../../include/dev_def.h"
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+#include "../../../include/i2c_probe_trace.h"
+#include <sys/sysdef.h>
+#include <tk/syslib.h>
+#endif
 #if DEV_IIC_ENABLE
 /*
  *	i2c_rp2040.c
@@ -66,6 +71,10 @@ typedef struct {
 	UW	rdat_num;	// Number of receive data
 	UB	*sbuf;		// Send buffer
 	UB	*rbuf;		// Receive buffer
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+	T_I2C_PROBE_TRACE probe_trace;
+	BOOL	probe_active;
+#endif
 } T_I2C_LLDCB;
 LOCAL T_I2C_LLDCB	ll_devcb[DEV_I2C_UNITNM];
 
@@ -105,7 +114,28 @@ LOCAL void i2c_inthdr( UINT intno )
 	}
 	I2C_LOCK(unit, intsts);
 
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+	if (p_cb->probe_active) {
+		UW timestamp = in_w(TIMER_TIMERAWL);
+		if (p_cb->probe_trace.irq_count == 0U)
+			p_cb->probe_trace.first_irq_us = timestamp;
+		if (p_cb->state == I2C_STS_RECV) {
+			if (p_cb->probe_trace.receive_irq_count == 0U)
+				p_cb->probe_trace.first_receive_irq_us = timestamp;
+			if (p_cb->rdat_num == 1U)
+				p_cb->probe_trace.last_receive_irq_us = timestamp;
+			p_cb->probe_trace.receive_irq_count++;
+		}
+		p_cb->probe_trace.last_irq_us = timestamp;
+		p_cb->probe_trace.irq_count++;
+	}
+#endif
 	i2c_sts = in_w(I2C_INTR_STAT(unit));
+	if (i2c_sts == 0U) {
+		ClearInt(intno);
+		I2C_UNLOCK(unit, intsts);
+		return;
+	}
 	if(i2c_sts & I2C_INT_ERROR) abort = TRUE;
 
 	if(!abort) {
@@ -176,9 +206,9 @@ LOCAL void i2c_inthdr( UINT intno )
 
 	if(wup) {
 		out_w(I2C_INTR_MASK(unit), 0);
-		(void)tk_set_flg(p_cb->done_flgid, 1);
 	}
 	I2C_UNLOCK(unit, intsts);
+	if (wup) (void)tk_set_flg(p_cb->done_flgid, 1);
 }
 /*----------------------------------------------------------------------
  * Execution of communication
@@ -186,12 +216,20 @@ LOCAL void i2c_inthdr( UINT intno )
 LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 {
 	UW	cmd;
+	UW	wait_state;
 	UINT	imask;
 	UINT	flgptn;
 	ER	err;
 	BOOL	restart_pending = p_cb->sdat_num > 0 && p_cb->rdat_num > 0;
 
-	p_cb->ioerr = err = E_OK;
+	err = E_OK;
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+	I2C_LOCK(unit, imask);
+	p_cb->probe_trace = (T_I2C_PROBE_TRACE){0};
+	p_cb->probe_trace.start_us = in_w(TIMER_TIMERAWL);
+	p_cb->probe_active = TRUE;
+	I2C_UNLOCK(unit, imask);
+#endif
 
 	out_w(I2C_TAR(unit), p_cb->sadr & I2C_TAR_7BIT_ADR);	// Set slave address
 	out_w(I2C_INTR_MASK(unit), 0);				// Mask all innterrupts
@@ -216,15 +254,14 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 				restart_pending = FALSE;
 			}
 			set_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL|I2C_INT_ERROR);
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+			p_cb->probe_trace.receive_command_us = in_w(TIMER_TIMERAWL);
+#endif
 			out_w(I2C_DATA_CMD(unit), cmd);				
 			p_cb->state = I2C_STS_RECV;
 		}
+		wait_state = p_cb->state;
 		I2C_UNLOCK(unit, imask);
-
-		if(p_cb->ioerr != E_OK) {
-			err = p_cb->ioerr;
-			break;
-		}
 
 		err = tk_wai_flg(p_cb->done_flgid, 1,
 				 TWF_ORW | TWF_BITCLR, &flgptn,
@@ -236,38 +273,80 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 			I2C_UNLOCK(unit, imask);
 			break;
 		}
-		else err = p_cb->ioerr;
+		else {
+			I2C_LOCK(unit, imask);
+			err = p_cb->ioerr;
+			/* A late signal from a timed-out transfer must not advance this phase. */
+			if (err == E_OK && p_cb->state == wait_state) err = E_IO;
+			I2C_UNLOCK(unit, imask);
+			if (err != E_OK) break;
+		}
 	}
-	if(err == E_OK && p_cb->ioerr == E_OK) {
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+	if (p_cb->probe_trace.receive_irq_count != 0U)
+		p_cb->probe_trace.receive_resume_us = in_w(TIMER_TIMERAWL);
+#endif
+	if(err == E_OK) {
 		I2C_LOCK(unit, imask);
 		(void)tk_clr_flg(p_cb->done_flgid, 0);
 		p_cb->state = I2C_STS_WAIT_STOP;
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+		p_cb->probe_trace.stop_pending =
+			(in_w(I2C_RAW_INTR_STAT(unit)) & I2C_INT_STOP_DET) != 0U;
+		p_cb->probe_trace.stop_arm_us = in_w(TIMER_TIMERAWL);
+#endif
 		set_w(I2C_INTR_MASK(unit), I2C_INT_STOP_DET | I2C_INT_ERROR);
 		I2C_UNLOCK(unit, imask);
 		err = tk_wai_flg(p_cb->done_flgid, 1, TWF_ORW | TWF_BITCLR,
 				 &flgptn, ll_devdat[unit].timout);
-		if(err == E_OK) err = p_cb->ioerr;
+		if(err == E_OK) {
+			I2C_LOCK(unit, imask);
+			err = p_cb->ioerr;
+			if (err == E_OK && p_cb->state != I2C_STS_STOP) err = E_IO;
+			I2C_UNLOCK(unit, imask);
+		}
 	}
 	I2C_LOCK(unit, imask);
 	out_w(I2C_INTR_MASK(unit), 0);
 	p_cb->state = I2C_STS_STOP;
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+	p_cb->probe_trace.end_us = in_w(TIMER_TIMERAWL);
+	p_cb->probe_active = FALSE;
+#endif
 	I2C_UNLOCK(unit, imask);
 	out_w(I2C_ENABLE(unit), 0);				// Disable I2C
 
 	return err;
 }
 
+#if defined(APP_SENSOR_TEST) && APP_SENSOR_TEST == 2
+EXPORT ER dev_i2c_probe_trace(UW unit, T_I2C_PROBE_TRACE *trace)
+{
+	UINT imask;
+
+	if (unit >= DEV_I2C_UNITNM || trace == NULL) return E_PAR;
+	I2C_LOCK(unit, imask);
+	*trace = ll_devcb[unit].probe_trace;
+	I2C_UNLOCK(unit, imask);
+	return E_OK;
+}
+#endif
+
 /*----------------------------------------------------------------------
  * Set communication parameters
  */
 Inline void set_com_start(UW unit, UW sadr, UW sdat_num, UW rdat_num, UB *sbuf, UB *rbuf)
 {
+	UINT imask;
+	I2C_LOCK(unit, imask);
 	ll_devcb[unit].state	= I2C_STS_START;
+	ll_devcb[unit].ioerr	= E_OK;
 	ll_devcb[unit].sadr	= sadr;		/* Slave address */
 	ll_devcb[unit].sdat_num	= sdat_num;	/* Number of send data */
 	ll_devcb[unit].rdat_num	= rdat_num;	/* Number of receive data */
 	ll_devcb[unit].sbuf	= sbuf;		/* Send buffer */
 	ll_devcb[unit].rbuf	= rbuf;		/* Receive buffer */
+	I2C_UNLOCK(unit, imask);
 }
 
 

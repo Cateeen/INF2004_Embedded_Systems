@@ -247,6 +247,7 @@ static void vehicle_start(void)
 	      "line_adc_reader_start_default_task");
 	CHECK(lsm303dlhc_i2c_default_config(&imu_sensor_config, 20U),
 	      "lsm303dlhc_i2c_default_config");
+	imu_sensor_config.profile = LSM303DLHC_I2C_PROFILE_32_FAMILY;
 	CHECK(lsm303dlhc_i2c_start_imu_task(&imu_sensor_config, &imu_config),
 	      "lsm303dlhc_i2c_start_imu_task");
 
@@ -361,6 +362,7 @@ EXPORT INT usermain(void)
 #endif
 
 	/* Phase 1: every subsystem creates its kernel objects */
+#if APP_SENSOR_TEST != 5
 	er = vehicle_buffers_init();
 	if (er < E_OK) {
 		tm_printf((UB*)"vehicle buffer initialization failed; tasks not started\n");
@@ -368,15 +370,25 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+#endif
 #if APP_SENSOR_TEST
 #if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
 	wait_for_serial_monitor();
 #endif
+#if APP_SENSOR_TEST == 5
+	tm_printf((UB*)"starting encoder-only diagnostic\n");
+	er = encoder_bringup_start();
+#else
 	er = hardware_sensor_test_start();
+#endif
 	if (er < E_OK) {
 		for (;;) {
+#if APP_SENSOR_TEST == 5
+			tm_printf((UB*)"encoder task failed to start: %d\n", (int)er);
+#else
 			tm_printf((UB*)"hardware sensor test task failed to start: %d\n",
 				  (int)er);
+#endif
 			tk_dly_tsk(5000);
 		}
 	}

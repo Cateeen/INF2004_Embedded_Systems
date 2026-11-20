@@ -212,8 +212,9 @@ verification before use in the vehicle. The single-owner IMU producer converts
 successful accelerometer samples and fresh, ordered odometry into copied
 estimate messages. Only accelerometer-derived roll and pitch are marked
 valid; dynamic acceleration can make them inaccurate. Yaw and gyro fields are
-not measured. The message includes packed terrain telemetry and latched shock and
-tilt indicators. The caller must report rejected samples, check sample age,
+not measured. The message includes packed terrain telemetry and a latched tilt
+indicator. The shock field is retained but collision detection is disabled, so
+it does not report impacts. The caller must report rejected samples, check sample age,
 retain future odometry until its timestamp, and deliver messages; no IMU task
 or hardware reader is started by default. The inactive IMU task owns its
 reader callback, consumes the dedicated odometry buffer, and publishes
@@ -223,8 +224,9 @@ and age limits. Consumers must also fail safe on stale estimates if fault
 delivery fails or the reader blocks; real timing and sensor behavior are
 unverified.
 
-The reported IMU is an LSM303DLHC on I2C1 GP2/GP3. The portable accelerometer
-decoder expects a verified fresh six-byte read configured for little-endian,
+The accelerometer responds at 0x19 on I2C1 GP2/GP3, but its exact identity is
+unconfirmed: the observed WHO_AM_I is 0x32, not the LSM303DLHC's 0x33. The
+portable accelerometer decoder expects a verified fresh six-byte read configured for little-endian,
 normal-mode +/-2g operation, and an explicit vehicle-axis mapping. It does not
 configure the sensor or access I2C. Bus ownership and any other devices are
 not yet confirmed. The kernel I2C driver is disabled; if explicitly enabled,
@@ -232,26 +234,29 @@ startup initializes only I2C1 on GP2/GP3 as `iicb`. Confirm ownership before
 enabling it. I2C0 is still configured on motor pins GP8/GP9 and must not be
 initialized until its pins are reassigned.
 The RP2040 I2C driver's transaction sequencing has host-level register-mock
-tests, but it has not been validated on the physical bus. Timeouts and bus
-faults must be handled independently; do not treat a software build as sensor
-verification.
+tests. The post-unlock wake-up ordering reduced latency in a hardware diagnostic,
+but the shared-driver fix and its timeout behavior still need hardware testing.
+Timeouts and bus faults must be handled independently; do not treat a software
+build as sensor verification.
 The inactive LSM303DLHC reader adapter connects a supplied fresh-transfer
 callback to the IMU task. The transport must configure the verified mode,
 establish that each sample is new, supply all six bytes and a valid acquisition
 timestamp, and own the bus; the adapter cannot independently verify those
 claims. An opt-in I2C1 transport is now available in
 `app_program/subsystem4/imu/lsm303dlhc_i2c.c`: it opens `iicb` exclusively, accepts the
-sensor address as configuration (the imported default is 0x19), checks
-control-register readback but does not verify sensor identity, configures
-100 Hz normal-mode +/-2g acquisition,
-uses the original 1.05 mg/LSB scale and X/Y/Z signs (-,+,-), waits for
-ZYXDA, and reads all six output bytes. It supplies timestamps on the
+sensor address and register profile as configuration (the imported default is
+0x19 and the original DLHC profile), checks control-register readback but does
+not verify sensor identity. The optional 0x32-family profile uses CTRL1 `0x2f`
+and CTRL4 `0x80`: 100 Hz and BDU on the candidate family, whose exact identity
+and data coherence remain unconfirmed. Both profiles assume normal-mode +/-2g.
+The transport uses the original 1.05 mg/LSB scale and X/Y/Z signs (-,+,-),
+waits for ZYXDA, and reads all six output bytes. It supplies timestamps on the
 `tk_get_otm` clock that precede the corresponding acquisition. The ready wait
 is capped at 100 ms; kernel I2C transaction timeouts can add up to the driver's
 configured timeout for each bus operation. Any transport error latches a
 fault. `lsm303dlhc_i2c_start_imu_task()` wires this reader into the IMU task
 with static context lifetime; sensor initialization and reads execute in the
-IMU task context. No application startup calls it.
+IMU task context. Opt-in vehicle startup selects the 0x32-family profile.
 I2C remains disabled by default; bus sharing and timestamps have not been
 verified on physical hardware. The original source also initialized the
 magnetometer, but the current vehicle message/processor path consumes only
@@ -391,6 +396,50 @@ motor-power cutoff is required. Servo clearance and scan geometry have been
 verified; the flag in `app_main.c` enables the vehicle startup path. The GO
 button still controls whether the vehicle controller may run.
 
+For a standalone IMU hardware check, build `make SENSOR_TEST=imu`. This test
+and the opt-in vehicle startup select the experimental 0x32-family profile:
+CTRL1 `0x2f` and CTRL4 `0x80`, which select 100 Hz and BDU on the candidate
+family. The exact device is unconfirmed, so its actual rate may differ.
+It first compares the raw trace timer with kernel time over a requested 250 ms;
+the expected ratio is approximately 1000 timer ticks per kernel millisecond.
+Do not interpret the trace's microsecond values if this comparison disagrees.
+Readback does not prove that BDU works or that all three axes
+belong to one conversion. At the BDU
+prompt, move the board continuously for five seconds. The diagnostic reads each
+low byte twice without reading its high byte, then reads the high byte and
+checks the low byte again. `consistent-not-proof` is compatible with BDU;
+`inconclusive` may mean there was insufficient movement or the low bytes
+coincidentally matched. `changed-while-held` does not match the candidate
+family's documented BDU behavior. This is not a full coherence test.
+It reports the identity register without rejecting any value, then reads the
+status and accelerometer together, then checks whether data-ready clears after
+the read and reasserts within 100 ms. If data-ready is already set when checked
+after the read, the result is inconclusive: a new sample may have arrived in between.
+A detected transition does not establish exact sampling rate or sample age.
+Readings remain freshness-unverified and `t_read` is the completion time of the
+reads, not an acquisition timestamp. `burst_us` and `status_us` measure each
+I2C API call using the RP2040 microsecond timer; they include scheduling and
+driver overhead, not just wire time. These measurements do not prove that the
+XYZ bytes are from one measurement.
+The IMU-only build also records the burst's time inside the I2C driver and the
+first and last I2C interrupt offsets, plus the first receive command and first
+and last receive interrupts. It also reports when the task resumed, when STOP
+completion was armed and whether STOP was already pending. Comparing these
+with `burst_us` helps locate the delay; interrupts and scheduling can still
+affect the measurements.
+The shared I2C driver now signals completion after releasing its lock and
+rejects premature wake-ups; trace instrumentation remains IMU-test-only.
+Cross-core timeout behavior still needs hardware validation.
+The diagnostic requests a 20 ms delay between its five direct reads;
+kernel timer granularity, freshness polling and I2C transactions add to the
+interval. It then reinitializes the sensor and continuously exercises the
+vehicle's data-ready-gated reader with a requested 50 ms delay. `t_lower` is
+the conservative timestamp lower bound, and `age_bound` is its age measured
+immediately before printing; neither is an exact acquisition time. The standalone test does not
+run the IMU task's 200 ms age check or test controller disarming. With motors
+disconnected, confirm timely readings and test sensor-disconnect fault
+handling and controller disarm separately before vehicle operation.
+
 For a manual GP15 servo check, build `make SENSOR_TEST=servo`: this default
 image emits no servo PWM. To command a single pulse width, build, for example,
 `make SENSOR_TEST=servo SERVO_TEST_US=1500`. The allowed values are 0 (off)
@@ -523,6 +572,7 @@ make SMP=0 -j8                    # single-core build
 make CONSOLE=uart WIFI=none -j8   # no USB console, radio off (no Pico SDK needed)
 make TEST=1 -j8                   # vehicle buffer test, no example tasks
 make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
+make SMP=0 SENSOR_TEST=encoder -j8 # encoder-only diagnostic, skips startup tests
 make VEHICLE=1 -j8                # start the vehicle tasks at boot (needs verified hardware, see app_main.c)
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
@@ -546,6 +596,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `ultrasonic`, `servo`, `encoder` | Starts one hardware diagnostic without vehicle tasks or startup tests | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 
@@ -555,6 +606,9 @@ transitions per wheel revolution and a 200 mm circumference; verify the signs,
 calibration and circumference on each wheel. It does not initialize motors,
 send odometry messages or start the vehicle controller. Rotate wheels slowly
 by hand first: GPIO edge interrupts can miss transitions at high speeds.
+The `SENSOR_TEST=encoder` image skips the startup tests and vehicle buffers;
+it can help isolate encoder bring-up from a startup-test failure. It does not
+fix a kernel fault or prove the encoder readings are reliable.
 
 For vehicle bring-up, check the first sensor error on the serial console.
 The IMU logs whether an I2C transfer failed or a register value did not match

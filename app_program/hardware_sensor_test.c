@@ -14,6 +14,9 @@
 
 #if APP_SENSOR_TEST == 2
 #include "../device/include/dev_i2c.h"
+#include "../device/include/i2c_probe_trace.h"
+#include <sys/sysdef.h>
+#include <tk/syslib.h>
 #endif
 
 #if APP_SENSOR_TEST == 4
@@ -29,7 +32,7 @@ _Static_assert(SERVO_TEST_US == 0 ||
 	       "SERVO_TEST_US must be 0 or a pulse width from 1000 to 2000 us");
 #endif
 
-#if APP_SENSOR_TEST
+#if APP_SENSOR_TEST && APP_SENSOR_TEST != 5
 
 #define SENSOR_TEST_PRIORITY 10
 #define SENSOR_TEST_INTERVAL_MS 500U
@@ -76,60 +79,326 @@ static void sensor_test_task(INT stacd, void *exinf)
 	}
 }
 #elif APP_SENSOR_TEST == 2
-static void imu_report_registers(const lsm303dlhc_i2c_t *sensor)
+#define IMU_PROBE_INTERVAL_MS 20U
+#define IMU_PROBE_READY_WAIT_MS 100U
+#define IMU_PROBE_ZYXDA 0x08U
+#define IMU_PROBE_CTRL1 0x2FU
+#define IMU_PROBE_CTRL4 0x80U
+
+static ER imu_check_trace_clock(void)
 {
-	static const uint8_t regs[] = {0x20U, 0x23U, 0x24U, 0x27U, 0x2EU, 0x2FU};
-	unsigned i;
+	SYSTIM before, after;
+	uint32_t ticks_before, ticks_after, elapsed_ms, elapsed_ticks;
+	ER error;
 
-	for (i = 0U; i < sizeof(regs); i++) {
-		uint8_t reg = regs[i];
-		uint8_t value = 0U;
-		T_I2C_EXEC exec = {sensor->address, 1, &reg, 1, &value};
-		SZ actual = 0;
-		ER error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec,
-				       sizeof(exec), &actual);
+	error = tk_get_otm(&before);
+	if (error != E_OK) return error;
+	ticks_before = in_w(TIMER_TIMERAWL);
+	error = tk_dly_tsk(250U);
+	if (error != E_OK) return error;
+	ticks_after = in_w(TIMER_TIMERAWL);
+	error = tk_get_otm(&after);
+	if (error != E_OK) return error;
+	elapsed_ms = after.lo - before.lo;
+	elapsed_ticks = ticks_after - ticks_before;
+	tm_printf((UB*)"[HWTEST][IMU] trace clock comparison: kernel_ms=%u timer_ticks=%u "
+		  "(expected about 1000 ticks/ms)\n",
+		  (unsigned)elapsed_ms, (unsigned)elapsed_ticks);
+	return E_OK;
+}
 
-		if (error != E_OK || actual != (SZ)sizeof(exec)) {
-			tm_printf((UB*)"[HWTEST][IMU] diagnostic reg=0x%02x failed: %d size=%d\n",
-				  (unsigned)reg, (int)error, (int)actual);
-			continue;
-		}
-		tm_printf((UB*)"[HWTEST][IMU] diagnostic reg=0x%02x value=0x%02x\n",
-			  (unsigned)reg, (unsigned)value);
+static void imu_report_identity(const lsm303dlhc_i2c_t *sensor)
+{
+	uint8_t reg = 0x0FU, identity = 0U;
+	T_I2C_EXEC exec = {sensor->address, 1, &reg, 1, &identity};
+	SZ actual = 0;
+	ER error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec,
+			       sizeof(exec), &actual);
+
+	if (error != E_OK || actual != (SZ)sizeof(exec))
+		tm_printf((UB*)"[HWTEST][IMU] WHO_AM_I read failed: %d size=%d\n",
+			  (int)error, (int)actual);
+	else
+		tm_printf((UB*)"[HWTEST][IMU] WHO_AM_I: 0x%02x\n", (unsigned)identity);
+}
+
+static ER imu_write_probe_register(const lsm303dlhc_i2c_t *sensor,
+				   uint8_t reg, uint8_t value)
+{
+	uint8_t data[2] = {reg, value};
+	uint8_t readback = 0U;
+	T_I2C_EXEC exec = {sensor->address, 1, &reg, 1, &readback};
+	SZ actual = 0;
+	ER error = tk_swri_dev(sensor->device, (W)sensor->address, data,
+			       sizeof(data), &actual);
+
+	if (error != E_OK || actual != (SZ)sizeof(data)) {
+		tm_printf((UB*)"[HWTEST][IMU] probe register 0x%02x write failed: %d size=%d\n",
+			  (unsigned)reg, (int)error, (int)actual);
+		return error != E_OK ? error : E_IO;
 	}
+	actual = 0;
+	error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec, sizeof(exec), &actual);
+	if (error != E_OK || actual != (SZ)sizeof(exec)) {
+		tm_printf((UB*)"[HWTEST][IMU] probe register 0x%02x readback failed: %d size=%d\n",
+			  (unsigned)reg, (int)error, (int)actual);
+		return error != E_OK ? error : E_IO;
+	}
+	if (readback != value) {
+		tm_printf((UB*)"[HWTEST][IMU] probe register 0x%02x readback mismatch: "
+			  "expected=0x%02x actual=0x%02x\n",
+			  (unsigned)reg, (unsigned)value, (unsigned)readback);
+		return E_IO;
+	}
+	return E_OK;
+}
+
+static ER imu_set_probe_mode(const lsm303dlhc_i2c_t *sensor)
+{
+	ER error = imu_write_probe_register(sensor, 0x23U, IMU_PROBE_CTRL4);
+
+	if (error != E_OK) return error;
+	return imu_write_probe_register(sensor, 0x20U, IMU_PROBE_CTRL1);
+}
+
+static ER imu_read_probe_register(const lsm303dlhc_i2c_t *sensor, uint8_t reg,
+				  uint8_t *value)
+{
+	T_I2C_EXEC exec = {sensor->address, 1, &reg, 1, value};
+	SZ actual = 0;
+	ER error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec,
+			       sizeof(exec), &actual);
+
+	if (error != E_OK || actual != (SZ)sizeof(exec)) {
+		tm_printf((UB*)"[HWTEST][IMU] register 0x%02x read failed: %d size=%d\n",
+			  (unsigned)reg, (int)error, (int)actual);
+		return error != E_OK ? error : E_IO;
+	}
+	return E_OK;
+}
+
+static ER imu_read_status(const lsm303dlhc_i2c_t *sensor, uint8_t *status)
+{
+	return imu_read_probe_register(sensor, 0x27U, status);
+}
+
+static ER imu_probe_bdu(const lsm303dlhc_i2c_t *sensor)
+{
+	const uint8_t low_regs[3] = {0x28U, 0x2AU, 0x2CU};
+	uint8_t first[3], held[3], released[3], high;
+	bool changed_while_held = false, changed_after_release = false;
+	unsigned i;
+	ER error;
+
+	tm_printf((UB*)"[HWTEST][IMU] BDU probe: move the board continuously for 5 seconds\n");
+	error = tk_dly_tsk(2000U);
+	if (error != E_OK) return error;
+	for (i = 0; i < 3U; i++) {
+		error = imu_read_probe_register(sensor, low_regs[i], &first[i]);
+		if (error != E_OK) return error;
+	}
+	error = tk_dly_tsk(1000U);
+	if (error != E_OK) return error;
+	for (i = 0; i < 3U; i++) {
+		error = imu_read_probe_register(sensor, low_regs[i], &held[i]);
+		if (error != E_OK) return error;
+		if (held[i] != first[i]) changed_while_held = true;
+	}
+	for (i = 0; i < 3U; i++) {
+		error = imu_read_probe_register(sensor, low_regs[i] + 1U, &high);
+		if (error != E_OK) return error;
+	}
+	error = tk_dly_tsk(200U);
+	if (error != E_OK) return error;
+	for (i = 0; i < 3U; i++) {
+		error = imu_read_probe_register(sensor, low_regs[i], &released[i]);
+		if (error != E_OK) return error;
+		if (released[i] != held[i]) changed_after_release = true;
+		error = imu_read_probe_register(sensor, low_regs[i] + 1U, &high);
+		if (error != E_OK) return error;
+	}
+	tm_printf((UB*)"[HWTEST][IMU] BDU low bytes: first=%02x,%02x,%02x held=%02x,%02x,%02x "
+		  "released=%02x,%02x,%02x result=%s\n",
+		  (unsigned)first[0], (unsigned)first[1], (unsigned)first[2],
+		  (unsigned)held[0], (unsigned)held[1], (unsigned)held[2],
+		  (unsigned)released[0], (unsigned)released[1], (unsigned)released[2],
+		  changed_while_held ? "changed-while-held" :
+		  changed_after_release ? "consistent-not-proof" : "inconclusive");
+	return E_OK;
+}
+
+static ER imu_read_unverified(const lsm303dlhc_i2c_t *sensor,
+			      const lsm303dlhc_axis_map_t *mapping,
+			      accel_data_t *sample, uint8_t *status, uint8_t *after,
+			      uint32_t *burst_us, uint32_t *status_us,
+			      T_I2C_PROBE_TRACE *trace)
+{
+	uint8_t reg = 0xA7U;
+	uint8_t bytes[7];
+	T_I2C_EXEC exec = {sensor->address, 1, &reg, sizeof(bytes), bytes};
+	SZ actual = 0;
+	uint32_t start = in_w(TIMER_TIMERAWL);
+	uint32_t burst_end, status_start, status_end;
+	ER error = tk_swri_dev(sensor->device, TDN_I2C_EXEC, &exec, sizeof(exec), &actual);
+
+	burst_end = in_w(TIMER_TIMERAWL);
+	if (error != E_OK || actual != (SZ)sizeof(exec)) {
+		tm_printf((UB*)"[HWTEST][IMU] direct read failed: %d size=%d\n",
+			  (int)error, (int)actual);
+		return error != E_OK ? error : E_IO;
+	}
+	error = dev_i2c_probe_trace(1U, trace);
+	if (error != E_OK) {
+		tm_printf((UB*)"[HWTEST][IMU] I2C trace read failed: %d\n", (int)error);
+		return error;
+	}
+	if (trace->irq_count == 0U || trace->receive_irq_count == 0U) {
+		tm_printf((UB*)"[HWTEST][IMU] I2C trace missing receive interrupt\n");
+		return E_IO;
+	}
+	status_start = in_w(TIMER_TIMERAWL);
+	error = imu_read_status(sensor, after);
+	status_end = in_w(TIMER_TIMERAWL);
+	if (error != E_OK) return error;
+	if (!lsm303dlhc_accel_decode(&bytes[1], mapping, sample)) {
+		tm_printf((UB*)"[HWTEST][IMU] direct read returned invalid accelerometer data\n");
+		return E_IO;
+	}
+	*status = bytes[0];
+	*burst_us = burst_end - start;
+	*status_us = status_end - status_start;
+	return E_OK;
+}
+
+static ER imu_check_freshness(const lsm303dlhc_i2c_t *sensor, uint8_t before,
+			      uint8_t after)
+{
+	uint8_t ready;
+	SYSTIM start, now;
+	ER error;
+
+	if (!(before & IMU_PROBE_ZYXDA) || (after & IMU_PROBE_ZYXDA)) {
+		tm_printf((UB*)"[HWTEST][IMU] freshness inconclusive: before=0x%02x after=0x%02x\n",
+			  (unsigned)before, (unsigned)after);
+		return E_OK;
+	}
+	error = tk_get_otm(&start);
+	if (error != E_OK) return error;
+	for (;;) {
+		error = tk_dly_tsk(1U);
+		if (error != E_OK) return error;
+		error = imu_read_status(sensor, &ready);
+		if (error != E_OK) return error;
+		error = tk_get_otm(&now);
+		if (error != E_OK) return error;
+		if (now.lo - start.lo > IMU_PROBE_READY_WAIT_MS ||
+		    (!(ready & IMU_PROBE_ZYXDA) &&
+		     now.lo - start.lo >= IMU_PROBE_READY_WAIT_MS)) {
+			tm_printf((UB*)"[HWTEST][IMU] freshness timeout: before=0x%02x after=0x%02x "
+				  "status=0x%02x elapsed=%u ms limit=%u ms\n",
+				  (unsigned)before, (unsigned)after, (unsigned)ready,
+				  (unsigned)(now.lo - start.lo), IMU_PROBE_READY_WAIT_MS);
+			return E_TMOUT;
+		}
+		if (ready & IMU_PROBE_ZYXDA) break;
+	}
+	tm_printf((UB*)"[HWTEST][IMU] data-ready transition observed: before=0x%02x "
+		  "after=0x%02x ready=0x%02x wait=%u ms\n",
+		  (unsigned)before, (unsigned)after, (unsigned)ready,
+		  (unsigned)(now.lo - start.lo));
+	return E_OK;
 }
 
 static void sensor_test_task(INT stacd, void *exinf)
 {
 	lsm303dlhc_i2c_t sensor = {0};
 	lsm303dlhc_i2c_config_t config;
+	unsigned probe_count;
 	ER error;
 
 	(void)stacd;
 	(void)exinf;
 	error = lsm303dlhc_i2c_default_config(&config, 20U);
 	if (error != E_OK) report_error_forever("IMU", "default config", error);
+	config.profile = LSM303DLHC_I2C_PROFILE_32_FAMILY;
 	error = lsm303dlhc_i2c_init(&sensor, &config);
 	if (error != E_OK) report_error_forever("IMU", "sensor init", error);
+	error = imu_check_trace_clock();
+	if (error != E_OK) report_error_forever("IMU", "trace clock comparison", error);
+	imu_report_identity(&sensor);
+	error = imu_set_probe_mode(&sensor);
+	if (error != E_OK) report_error_forever("IMU", "probe mode", error);
 
-	tm_printf((UB*)"[HWTEST][IMU] live accelerometer XYZ readings\n");
-	for (;;) {
+	tm_printf((UB*)"[HWTEST][IMU] fast BDU probe CTRL1=0x2f CTRL4=0x80; "
+		  "direct readings, freshness unverified\n");
+	tm_printf((UB*)"[HWTEST][IMU] shared I2C wake-up fix enabled\n");
+	error = imu_probe_bdu(&sensor);
+	if (error != E_OK) report_error_forever("IMU", "BDU probe", error);
+	for (probe_count = 0U; probe_count < 5U; probe_count++) {
 		accel_data_t sample;
-		uint32_t timestamp_ms;
+		SYSTIM now;
+		uint32_t burst_us, status_us;
+		uint8_t status, after;
+		T_I2C_PROBE_TRACE trace;
 
-		error = lsm303dlhc_i2c_read(&sensor, &sample, &timestamp_ms);
-		if (error != E_OK) {
-			imu_report_registers(&sensor);
-			report_error_forever("IMU", "read", error);
-		}
-		tm_printf((UB*)"[HWTEST][IMU] t=%u ms raw_x=%d raw_y=%d raw_z=%d "
+		error = imu_read_unverified(&sensor, &config.mapping, &sample, &status, &after,
+					    &burst_us, &status_us, &trace);
+		if (error != E_OK) report_error_forever("IMU", "read", error);
+		error = tk_get_otm(&now);
+		if (error != E_OK) report_error_forever("IMU", "clock", error);
+		error = imu_check_freshness(&sensor, status, after);
+		if (error != E_OK) report_error_forever("IMU", "freshness check", error);
+		tm_printf((UB*)"[HWTEST][IMU] unverified t_read=%u ms burst_us=%u status_us=%u "
+			  "status=0x%02x raw_x=%d raw_y=%d raw_z=%d "
 			  "ax_mg=%ld ay_mg=%ld az_mg=%ld\n",
-			  (unsigned)timestamp_ms, (int)sample.raw_x, (int)sample.raw_y,
+			  (unsigned)now.lo, (unsigned)burst_us, (unsigned)status_us,
+			  (unsigned)status, (int)sample.raw_x, (int)sample.raw_y,
 			  (int)sample.raw_z,
 			  (long)(sample.ax * 1000.0f / 9.80665f),
 			  (long)(sample.ay * 1000.0f / 9.80665f),
 			  (long)(sample.az * 1000.0f / 9.80665f));
-		error = tk_dly_tsk(SENSOR_TEST_INTERVAL_MS);
+		tm_printf((UB*)"[HWTEST][IMU] I2C trace driver_us=%u first_irq_us=%u "
+			  "last_irq_us=%u irq_count=%u\n",
+			  (unsigned)(trace.end_us - trace.start_us),
+			  (unsigned)(trace.first_irq_us - trace.start_us),
+			  (unsigned)(trace.last_irq_us - trace.start_us),
+			  (unsigned)trace.irq_count);
+		tm_printf((UB*)"[HWTEST][IMU] I2C phases recv_command_us=%u "
+			  "first_rx_us=%u last_rx_us=%u rx_resume_us=%u "
+			  "stop_arm_us=%u stop_pending=%u\n",
+			  (unsigned)(trace.receive_command_us - trace.start_us),
+			  (unsigned)(trace.first_receive_irq_us - trace.start_us),
+			  (unsigned)(trace.last_receive_irq_us - trace.start_us),
+			  (unsigned)(trace.receive_resume_us - trace.start_us),
+			  (unsigned)(trace.stop_arm_us - trace.start_us),
+			  (unsigned)trace.stop_pending);
+		error = tk_dly_tsk(IMU_PROBE_INTERVAL_MS);
+		if (error != E_OK) report_error_forever("IMU", "delay", error);
+	}
+	error = lsm303dlhc_i2c_close(&sensor);
+	if (error != E_OK) report_error_forever("IMU", "probe close", error);
+	sensor = (lsm303dlhc_i2c_t){0};
+	error = lsm303dlhc_i2c_init(&sensor, &config);
+	if (error != E_OK) report_error_forever("IMU", "vehicle reader init", error);
+	tm_printf((UB*)"[HWTEST][IMU] vehicle reader: CTRL1=0x2f CTRL4=0x80; "
+		  "data-ready gating enabled; sample time is a lower bound\n");
+	for (;;) {
+		accel_data_t sample;
+		SYSTIM now;
+		uint32_t timestamp;
+
+		error = lsm303dlhc_i2c_read(&sensor, &sample, &timestamp);
+		if (error != E_OK) report_error_forever("IMU", "vehicle reader", error);
+		error = tk_get_otm(&now);
+		if (error != E_OK) report_error_forever("IMU", "clock", error);
+		tm_printf((UB*)"[HWTEST][IMU] vehicle t_lower=%u ms age_bound=%u ms "
+			  "raw_x=%d raw_y=%d raw_z=%d ax_mg=%ld ay_mg=%ld az_mg=%ld\n",
+			  (unsigned)timestamp, (unsigned)(now.lo - timestamp),
+			  (int)sample.raw_x, (int)sample.raw_y, (int)sample.raw_z,
+			  (long)(sample.ax * 1000.0f / 9.80665f),
+			  (long)(sample.ay * 1000.0f / 9.80665f),
+			  (long)(sample.az * 1000.0f / 9.80665f));
+		error = tk_dly_tsk(50U);
 		if (error != E_OK) report_error_forever("IMU", "delay", error);
 	}
 }

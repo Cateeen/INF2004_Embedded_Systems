@@ -1,0 +1,6 @@
+#ifndef I2C_HOST_SYSDEF_H
+#define I2C_HOST_SYSDEF_H
+
+#define TIMER_TIMERAWL 0x40054028U
+
+#endif

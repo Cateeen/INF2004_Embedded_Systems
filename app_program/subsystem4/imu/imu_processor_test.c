@@ -195,29 +195,31 @@ static BOOL producer_test(void)
 	odometry.header.version = VEHICLE_MESSAGE_VERSION;
 	odometry.header.sequence = 0U;
 	odometry.header.timestamp_ms = 102U;
-	accel.ay = 0.0f;
-	accel.az = -5.0f; /* Overturned / inverted check */
-	ok = imu_producer_update(&producer, &accel, &odometry, 103U, &message) &&
-	     !message.shock_detected && message.tilt_detected &&
-	     (message.terrain_telemetry & 7U) == IMU_STATE_TILT && ok;
+	ok = !imu_producer_update(&producer, &accel, &odometry, 103U, &message) &&
+	     !producer.have_odometry && message.header.sequence == 99U && ok;
+	odometry.valid = 1U;
+	ok = !imu_producer_update(&producer, &accel, &odometry, 100U, &message) &&
+	     !producer.have_odometry && message.header.sequence == 99U && ok;
+	odometry.header.timestamp_ms = 100U;
+	ok = imu_producer_update(&producer, &accel, &odometry, 100U, &message) &&
+	     !message.shock_detected && !message.tilt_detected &&
 	     message.header.type == VEHICLE_MESSAGE_IMU_ESTIMATE &&
 	     message.header.sequence == 1U && message.header.timestamp_ms == 100U &&
 	     message.validity == VEHICLE_IMU_VALID_ROLL_PITCH &&
 	     message.roll_mdeg == 0 && message.pitch_mdeg == 0 &&
 	     message.yaw_mdeg == 0 && message.gyro_x == 0 && ok;
-	accel.ay = 5.0f;
-	accel.az = 8.4f;
+	accel.az = -5.0f;
 	ok = imu_producer_update(&producer, &accel, NULL, 101U, &message) &&
 	     message.tilt_detected && !message.shock_detected &&
-	     (message.terrain_telemetry & 7U) == IMU_STATE_TILT && ok;
-	odometry.header.sequence = 0U;
+	     (message.terrain_telemetry & 7U) == IMU_STATE_TILT &&
+	     message.roll_mdeg >= 179000 && message.roll_mdeg <= 180001 && ok;
+	odometry.header.sequence = 1U;
 	odometry.header.timestamp_ms = 102U;
-	accel.ay = 0.0f;
 	accel.az = 50.0f;
 	ok = imu_producer_update(&producer, &accel, &odometry, 103U, &message) &&
-	     message.shock_detected && message.tilt_detected &&
-	     (message.terrain_telemetry & 7U) == IMU_STATE_SHOCK && ok;
-	odometry.header.sequence = 2U;
+	     !message.shock_detected && message.tilt_detected &&
+	     (message.terrain_telemetry & 7U) == IMU_STATE_MONITORING && ok;
+	odometry.header.sequence = 3U;
 	odometry.header.timestamp_ms = 104U;
 	ok = !imu_producer_update(&producer, &accel, &odometry, 104U, &message) &&
 	     !imu_producer_update(&producer, &accel, NULL, 113U, &message) &&
@@ -262,7 +264,7 @@ BOOL imu_processor_test(void)
 	accel_ok = accel_decode_test();
 	reader_ok = accel_reader_test();
 	TEST_CHECK("IMU-U01", terrain_ok, "flat, ramp and hump transitions");
-	TEST_CHECK("IMU-U02", safety_ok, "tilt, shock and invalid samples");
+	TEST_CHECK("IMU-U02", safety_ok, "tilt and invalid samples");
 	TEST_CHECK("IMU-U03", clock_ok, "independent timeouts and clock wrap");
 	TEST_CHECK("IMU-U04", producer_ok, "typed estimates and odometry validation");
 	TEST_CHECK("IMU-U07", accel_ok, "LSM303DLHC acceleration decoding");

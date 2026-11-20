@@ -35,7 +35,12 @@ gcc -std=c11 -Wall -Wextra -Werror -Wno-old-style-declaration -I. test.c -o /tmp
 /tmp/i2c_host_test
 ```
 
-They do not verify electrical timing or actual I2C hardware.
+For the IMU-only driver timing instrumentation, compile the same test with
+`-DAPP_SENSOR_TEST=2` and run the resulting executable.
+
+The tests cover premature completion signals as well as normal transfers and
+timeouts. They do not prove cross-core scheduling, electrical timing or actual
+I2C hardware behavior.
 
 The LSM303DLHC transport tests also run against a host I2C/API mock, not the
 robot. From `testing/integration/imu_i2c_host`:
@@ -51,7 +56,8 @@ gcc -std=c11 -Wall -Wextra -Werror -Isys -I../../../app_program/subsystem4/imu \
 
 These tests verify software configuration and mocked transfer handling only;
 they do not verify the sensor, address selection, bus timing, or timestamp
-accuracy on the robot.
+accuracy on the robot. The 0x32-family profile is experimental; test the
+production reader and sensor-disconnect behavior with motors disconnected.
 
 The HSR04 distance conversion test is hardware-independent. From
 `testing/integration/hcsr04_host`:

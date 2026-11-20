@@ -28,7 +28,7 @@ historical reference; they cannot be run against the current vehicle firmware.
 | ODO-U10 | a full opted-in motion odometry queue causes a delivery fault | odometry task | auto | `odometry_task_test()` before tasks start | `[TEST] ODO-U10 PASS` |
 | INT-04 | independent odometry message delivery and full-buffer reporting | odometry buffers | auto | `odometry_producer_test()` before tasks start | `[TEST] INT-04 PASS` |
 | INT-05 | optional copied motion odometry and independent full-buffer handling | odometry buffers | auto | `odometry_producer_test()` before tasks start | `[TEST] INT-05 PASS` |
-| ODO-H01 | live encoder counts and signs for each wheel | GPIO encoder bring-up | manual | Build `TEST=1 ODOMETRY_TEST=1`; with motor power off, rotate each wheel slowly by hand and compare count deltas over several marked revolutions in both directions. | Each wheel changes independently and reproducibly; about 2500 absolute counts per revolution, opposite sign when reversed. |
+| ODO-H01 | live encoder counts and signs for each wheel | GPIO encoder bring-up | manual | Build `TEST=1 ODOMETRY_TEST=1` or `SENSOR_TEST=encoder`; with motor power off, rotate each wheel slowly by hand and compare count deltas over several marked revolutions in both directions. | Each wheel changes independently and reproducibly; about 2500 absolute counts per revolution, opposite sign when reversed. |
 | LINE-U01 | line classification from the center and right sensors | line observation | auto | `line_observation_test()` before tasks start | `[TEST] LINE-U01 PASS` |
 | LINE-U02 | barcode input and missing readings do not change line classification | line observation | auto | `line_observation_test()` before tasks start | `[TEST] LINE-U02 PASS` |
 | BAR-U01 | forward Code 39 frame and undersized result buffer | barcode decoder | auto | `barcode_scanner_test()` before tasks start | `[TEST] BAR-U01 PASS` |
@@ -41,19 +41,26 @@ historical reference; they cannot be run against the current vehicle firmware.
 | ADC-U02 | independent thresholds and black polarity | line ADC reader | auto | `line_adc_reader_test()` before tasks start | `[TEST] ADC-U02 PASS` |
 | ADC-U03 | original ADC channel mapping, threshold and black polarity imported into the task reader | line ADC reader migration | auto | `line_adc_reader_test()` before tasks start | `[TEST] ADC-U03 PASS` |
 | IMU-U01 | flat, ramp and hump state transitions | IMU processing | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U01 PASS` |
-| IMU-U02 | tilt, shock telemetry and invalid input handling | IMU processing | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U02 PASS` |
+| IMU-U02 | tilt and invalid input handling | IMU processing | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U02 PASS` |
 | IMU-U03 | independent timeout state and millisecond wrap | IMU processing | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U03 PASS` |
 | IMU-U04 | typed estimates, latched safety flags, invalid and stale inputs, sequence and clock wrap | IMU producer | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U04 PASS` |
 | IMU-U05 | queued and future odometry, sequence and clock wrap, copied estimates | IMU task | auto | `imu_task_test()` before tasks start | `[TEST] IMU-U05 PASS` |
 | IMU-U06 | missing, stale or invalid odometry, sensor and timestamp errors, and full output buffer | IMU task | auto | `imu_task_test()` before tasks start | `[TEST] IMU-U06 PASS` |
 | IMU-U07 | original LSM303DLHC normal-mode signed data, axis mapping, sensitivity and invalid input | IMU decoding | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U07 PASS` |
 | IMU-U08 | fresh transfer adapter, mapping, partial and invalid transfers, error latch | IMU reader adapter | auto | `imu_processor_test()` before tasks start | `[TEST] IMU-U08 PASS` |
-| I2C-U01 | RP2040 read/write command ordering, repeated start and STOP completion | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` | `[TEST] I2C-U01 PASS` |
+| I2C-U01 | RP2040 command ordering, repeated start, STOP completion and wake-up lock ordering | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` | `[TEST] I2C-U01 PASS` |
 | I2C-U02 | RP2040 I2C timeout and abort propagation | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` | `[TEST] I2C-U02 PASS` |
+| I2C-U03 | IMU-only I2C driver interrupt timing and trace argument validation | kernel I2C diagnostic | host mock | compile `testing/integration/i2c_host/test.c` with `-DAPP_SENSOR_TEST=2` and run | `[TEST] I2C-U03 PASS` |
+| I2C-U04 | premature completion signals during send, receive and STOP; stale masked interrupt | kernel I2C driver | host mock | compile and run `testing/integration/i2c_host/test.c` in both modes | `[TEST] I2C-U04 PASS` |
 | IMU-I2C-U01 | LSM303DLHC control-register setup/readback, fresh six-byte sample and timestamp | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U01 PASS` |
 | IMU-I2C-U02 | no identity read, short transfer, data-ready timeout, output preservation and fault latch | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U02 PASS` |
 | IMU-I2C-U03 | IMU task startup preserves timing configuration and receives the transport callback and context | IMU task integration | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U03 PASS` |
 | IMU-I2C-U04 | imported address, original register mode, vehicle axis signs and accelerometer scale | IMU hardware configuration migration | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U04 PASS` |
+| IMU-I2C-U05 | standalone diagnostic control readback, direct reads, errors and microsecond timing | IMU hardware diagnostic | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U05 PASS` |
+| IMU-I2C-U06 | standalone data-ready transition, inconclusive status, timeout and transfer error | IMU hardware diagnostic | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U06 PASS` |
+| IMU-I2C-U07 | standalone BDU experiment: held, changed and inconclusive byte patterns; transfer failure | IMU hardware diagnostic | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U07 PASS` |
+| IMU-I2C-U08 | experimental 0x32-family profile, readback failures, data-ready timeout and fault latch | IMU I2C transport | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U08 PASS` |
+| IMU-I2C-U09 | standalone trace-clock comparison reports kernel and raw timer deltas | IMU hardware diagnostic | host mock | compile and run `testing/integration/imu_i2c_host/test.c` | `[TEST] IMU-I2C-U09 PASS` |
 | OBS-U01 | clear scan and centred obstacle | obstacle profiling | auto | `obs_profile_test()` before tasks start | `[TEST] OBS-U01 PASS` |
 | OBS-U02 | scan edge clearances and cluster selection | obstacle profiling | auto | `obs_profile_test()` before tasks start | `[TEST] OBS-U02 PASS` |
 | OBS-U03 | invalid scan input rejected | obstacle profiling | auto | `obs_profile_test()` before tasks start | `[TEST] OBS-U03 PASS` |

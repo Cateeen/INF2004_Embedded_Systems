@@ -1,7 +1,7 @@
 #include "../../app.h"
 #include "encoder_bringup.h"
 
-#if APP_ODOMETRY_TEST
+#if APP_ODOMETRY_TEST || APP_SENSOR_TEST == 5
 #include "encoder_source.h"
 #include "../gpio/gpio_dispatcher.h"
 

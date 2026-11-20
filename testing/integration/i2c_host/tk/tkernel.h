@@ -6,6 +6,7 @@ typedef uint32_t UW;
 typedef unsigned int UINT;
 typedef int INT;
 typedef int W;
+typedef int SZ;
 typedef int ID;
 typedef int ER;
 typedef int PRI;
@@ -15,6 +16,7 @@ typedef uint8_t UB;
 typedef struct { UINT flgatr; } T_CFLG;
 typedef struct { UINT intatr; void (*inthdr)(UINT); } T_DINT;
 #define LOCAL static
+#define IMPORT extern
 #define EXPORT
 #define Inline static inline
 #define TRUE 1
@@ -28,8 +30,9 @@ typedef struct { UINT intatr; void (*inthdr)(UINT); } T_DINT;
 #define TWF_ORW 1
 #define TWF_BITCLR 2
 #define TK_SUPPORT_SMP 0
-#define DI(sts) ((sts) = 0)
-#define EI(sts) ((void)(sts))
+extern UINT i2c_host_irq_masked;
+#define DI(sts) do { (sts) = i2c_host_irq_masked; i2c_host_irq_masked = 1U; } while (0)
+#define EI(sts) do { i2c_host_irq_masked = (sts); } while (0)
 UW in_w(UW address);
 void out_w(UW address, UW value);
 void set_w(UW address, UW value);

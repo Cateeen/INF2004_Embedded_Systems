@@ -37,7 +37,7 @@ typedef struct {
     float           hump_peak_m;
     float           current_hump_m;
     bool            hump_active;
-    bool            shock_detected; /* latched until imu_processor_init() */
+    bool            shock_detected; /* collision detection is disabled */
     bool            tilt_detected;  /* latched until imu_processor_init() */
     imu_fsm_state_t fsm_state;
     imu_event_type_t motion_event;

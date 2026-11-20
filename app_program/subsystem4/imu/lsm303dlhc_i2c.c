@@ -10,6 +10,8 @@
 #define LSM303DLHC_AUTO_INCREMENT 0x80U
 #define LSM303DLHC_CTRL1_100HZ_XYZ 0x57U
 #define LSM303DLHC_CTRL4_NORMAL_2G 0x00U
+#define IMU_32_CTRL1_100HZ_XYZ    0x2FU
+#define IMU_32_CTRL4_NORMAL_2G_BDU 0x80U
 #define LSM303DLHC_ZYXDA          0x08U
 #define LSM303DLHC_MAX_READY_WAIT_MS 100U
 
@@ -72,7 +74,8 @@ ER lsm303dlhc_i2c_default_config(lsm303dlhc_i2c_config_t *config,
 	lsm303dlhc_i2c_config_t imported = {
 		.address = 0x19U,
 		.data_ready_timeout_ms = data_ready_timeout_ms,
-		.mapping = {{0U, 1U, 2U}, {-1, 1, -1}}
+		.mapping = {{0U, 1U, 2U}, {-1, 1, -1}},
+		.profile = LSM303DLHC_I2C_PROFILE_DLHC
 	};
 
 	const uint8_t zeroes[6] = {0};
@@ -108,7 +111,7 @@ static ER fail_init(lsm303dlhc_i2c_t *sensor, ER cause)
 ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 		       const lsm303dlhc_i2c_config_t *config)
 {
-	uint8_t control1, control4;
+	uint8_t control1, control4, expected_control1, expected_control4;
 	const uint8_t zeroes[6] = {0};
 	accel_data_t decoded;
 	SYSTIM now;
@@ -116,6 +119,8 @@ ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 
 	if (sensor == NULL || config == NULL ||
 	    (config->address != 0x18U && config->address != 0x19U) ||
+	    (config->profile != LSM303DLHC_I2C_PROFILE_DLHC &&
+	     config->profile != LSM303DLHC_I2C_PROFILE_32_FAMILY) ||
 	    config->data_ready_timeout_ms == 0U ||
 	    config->data_ready_timeout_ms > LSM303DLHC_MAX_READY_WAIT_MS ||
 	    !lsm303dlhc_accel_decode(zeroes, &config->mapping, &decoded))
@@ -123,6 +128,10 @@ ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 	if (sensor->opened || sensor->initialized || sensor->faulted ||
 	    sensor->reader.initialized)
 		return E_OBJ;
+	expected_control1 = config->profile == LSM303DLHC_I2C_PROFILE_32_FAMILY ?
+		IMU_32_CTRL1_100HZ_XYZ : LSM303DLHC_CTRL1_100HZ_XYZ;
+	expected_control4 = config->profile == LSM303DLHC_I2C_PROFILE_32_FAMILY ?
+		IMU_32_CTRL4_NORMAL_2G_BDU : LSM303DLHC_CTRL4_NORMAL_2G;
 	sensor->device = tk_opn_dev((const UB *)"iicb", TD_UPDATE | TD_EXCL);
 	if (sensor->device < E_OK) return sensor->device;
 	sensor->opened = true;
@@ -130,20 +139,19 @@ ER lsm303dlhc_i2c_init(lsm303dlhc_i2c_t *sensor,
 	sensor->data_ready_timeout_ms = config->data_ready_timeout_ms;
 	er = write_register(sensor, LSM303DLHC_CTRL_REG1_A, 0U);
 	if (er != E_OK) return fail_init(sensor, er);
-	er = write_register(sensor, LSM303DLHC_CTRL_REG4_A, LSM303DLHC_CTRL4_NORMAL_2G);
+	er = write_register(sensor, LSM303DLHC_CTRL_REG4_A, expected_control4);
 	if (er != E_OK) return fail_init(sensor, er);
 	er = tk_get_otm(&now);
 	if (er != E_OK) return fail_init(sensor, er);
 	sensor->next_sample_not_before_ms = now.lo;
 	sensor->measurement_may_be_active = true;
-	er = write_register(sensor, LSM303DLHC_CTRL_REG1_A, LSM303DLHC_CTRL1_100HZ_XYZ);
+	er = write_register(sensor, LSM303DLHC_CTRL_REG1_A, expected_control1);
 	if (er != E_OK) return fail_init(sensor, er);
 	er = read_registers(sensor, LSM303DLHC_CTRL_REG1_A, &control1, 1U);
 	if (er != E_OK) return fail_init(sensor, er);
 	er = read_registers(sensor, LSM303DLHC_CTRL_REG4_A, &control4, 1U);
 	if (er != E_OK) return fail_init(sensor, er);
-	if (control1 != LSM303DLHC_CTRL1_100HZ_XYZ ||
-	    control4 != LSM303DLHC_CTRL4_NORMAL_2G) {
+	if (control1 != expected_control1 || control4 != expected_control4) {
 		tm_printf((UB*)"IMU control readback mismatch: CTRL1=0x%02x CTRL4=0x%02x\n",
 			  (unsigned)control1, (unsigned)control4);
 		return fail_init(sensor, E_IO);

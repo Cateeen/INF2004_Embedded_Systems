@@ -88,7 +88,6 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
             state->hump_start_distance_m = current_distance_m;
             state->last_distance_m       = current_distance_m;
             state->current_hump_m        = 0.0f;
-            state->hump_peak_m           = 0.0f; /* Reset so each hump records its own peak */
             state->hump_active           = true;
             state->hump_start_ms         = now_ms;
             state->motion_event          = IMU_EVENT_CLIMBING;
@@ -98,6 +97,19 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
 
     case IMU_STATE_HUMP_RISING:
         state->motion_event = IMU_EVENT_CLIMBING;
+        {
+            float delta_dist = current_distance_m - state->last_distance_m;
+            if (delta_dist > 0.0f) {
+                float pitch_rad = state->current_pitch_deg * ((float)M_PI / 180.0f);
+                state->current_hump_m += delta_dist * sinf(pitch_rad);
+                /* Update max ramp height live while climbing */
+                if (state->current_hump_m > MIN_HUMP_HEIGHT_M &&
+                    state->current_hump_m > state->hump_peak_m) {
+                    state->hump_peak_m = state->current_hump_m;
+                }
+            }
+            state->last_distance_m = current_distance_m;
+        }
 
         if ((uint32_t)(now_ms - state->hump_start_ms) > 5000U) {
             state->fsm_state   = IMU_STATE_MONITORING;
@@ -105,21 +117,9 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
             break;
         }
 
-        float delta_dist = current_distance_m - state->last_distance_m;
-        if (delta_dist > 0.0f) {
-            float pitch_rad = state->current_pitch_deg * ((float)M_PI / 180.0f);
-            state->current_hump_m += delta_dist * sinf(pitch_rad);
-        }
-        state->last_distance_m = current_distance_m;
-
         if (state->current_pitch_deg <= PITCH_END_DEG) {
-            if (state->current_hump_m > MIN_HUMP_HEIGHT_M) {
-                if (state->current_hump_m > state->hump_peak_m) {
-                    state->hump_peak_m = state->current_hump_m;
-                }
-            }
             state->hump_start_ms = now_ms;
-            state->fsm_state = IMU_STATE_HUMP_FALLING;
+            state->fsm_state     = IMU_STATE_HUMP_FALLING;
         }
         break;
 

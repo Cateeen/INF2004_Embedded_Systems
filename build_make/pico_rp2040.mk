@@ -123,13 +123,15 @@ endif
 
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
+SENSOR_TEST_MODES := none ir imu imu_tilt ultrasonic servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
-$(error SENSOR_TEST must be exactly one of none, ir, imu, imu_tilt, ultrasonic, servo, encoder, or line_barcode)
+$(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
-ifneq ($(filter $(SENSOR_TEST),none ir imu imu_tilt ultrasonic servo encoder line_barcode),$(SENSOR_TEST))
-$(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use none, ir, imu, imu_tilt, ultrasonic, servo, encoder, or line_barcode)
+ifeq ($(filter $(SENSOR_TEST_MODES),$(SENSOR_TEST)),)
+$(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use one of: $(SENSOR_TEST_MODES))
 endif
 SERVO_TEST_US ?= 0
+BARCODE_TEST_MODULE_COUNTS ?= 0
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -150,6 +152,10 @@ else ifeq ($(SENSOR_TEST),imu_tilt)
 SENSOR_TEST_VALUE := 6
 else ifeq ($(SENSOR_TEST),line_barcode)
 SENSOR_TEST_VALUE := 7
+else ifeq ($(SENSOR_TEST),line)
+SENSOR_TEST_VALUE := 8
+else ifeq ($(SENSOR_TEST),barcode)
+SENSOR_TEST_VALUE := 9
 else
 SENSOR_TEST_VALUE := 0
 endif
@@ -243,6 +249,9 @@ CFLAGS  += -DAPP_TEST=$(TEST)
 CFLAGS  += -DAPP_ODOMETRY_TEST=$(ODOMETRY_TEST)
 CFLAGS  += -DAPP_VEHICLE=$(VEHICLE)
 CFLAGS  += -DAPP_SENSOR_TEST=$(SENSOR_TEST_VALUE)
+ifeq ($(SENSOR_TEST),barcode)
+CFLAGS  += -DBARCODE_TEST_MODULE_COUNTS=$(BARCODE_TEST_MODULE_COUNTS)
+endif
 ifeq ($(SENSOR_TEST),servo)
 CFLAGS  += -DSERVO_TEST_US=$(SERVO_TEST_US)
 endif
@@ -279,6 +288,9 @@ endif
 ################################################################################
 
 PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
+ifeq ($(SENSOR_TEST),barcode)
+PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)
+endif
 PROFILE_FILE := .build_profile
 
 ifneq ($(strip $(shell cat $(PROFILE_FILE) 2>/dev/null)),$(PROFILE_ID))

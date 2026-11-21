@@ -212,6 +212,36 @@ printed barcode before scanning. Keep motor power disconnected during this
 diagnostic. It tests sensor/odometry decoding and line observations, not
 powered motor steering.
 
+For independent bench tests, build from `build_make`:
+
+```sh
+make SENSOR_TEST=line -j8       # flash *_sensor_line.uf2
+make SENSOR_TEST=barcode -j8    # flash *_sensor_barcode.uf2
+```
+
+Keep motor power disconnected. The line-only image samples GP27 and GP26
+and prints `LOST`, `LEFT`, `RIGHT`, or `JUNCTION`; the wheels can stay still.
+The barcode-only image samples GP28 and reads the encoders directly. It
+doesn't start line tracking. Start on white space and slowly roll both
+wheels over one known Code 39 label (for example, data `AB`, with no optional
+check digit). The console reports the decode or character rejection reason
+and measured widths in encoder counts. `narrow_max` should be clearly below
+`wide_min`; if they overlap, try a slower, steadier pass or a larger print.
+
+The barcode image defaults to calibration mode: it accepts nonzero run
+widths, retains the wide/narrow separation check, and allows gaps up to
+1000 counts. After a full decode it prints a measured
+`BARCODE_TEST_MODULE_COUNTS` value. If the decoded text matches the label,
+repeat in both directions and use a representative value to verify the scan
+with normal width and gap limits, for example:
+
+```sh
+make SENSOR_TEST=barcode BARCODE_TEST_MODULE_COUNTS=24 -j8
+```
+
+Replace `24` with your measured count. This setting only affects the
+barcode-only diagnostic, not the combined diagnostic or vehicle firmware.
+
 The IMU processor consumes simulated or caller-provided acceleration,
 distance and timestamps; it does not start a task or access the sensor.
 Its thresholds, mounting orientation and odometry inputs need hardware
@@ -624,7 +654,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `ultrasonic`, `servo`, `encoder`, `line_barcode` | Starts one hardware diagnostic without vehicle tasks or startup tests; `line_barcode` runs the live ADC/encoder decoder without starting motors | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `ultrasonic`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line` and `barcode` are independent, motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

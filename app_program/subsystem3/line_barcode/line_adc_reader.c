@@ -138,11 +138,10 @@ static ER read_channel(line_adc_reader_t *reader, const line_adc_channel_t *chan
 	return E_OK;
 }
 
-ER line_adc_reader_read(void *context, ir_readings_t *readings,
-			uint32_t *timestamp_ms)
+static ER read_sample(line_adc_reader_t *reader, ir_readings_t *readings,
+		      uint32_t *timestamp_ms, bool line, bool barcode)
 {
-	line_adc_reader_t *reader = context;
-	ir_readings_t result;
+	ir_readings_t result = {0};
 	SYSTIM start, barcode_start, end;
 	uint64_t start_ms, barcode_ms, end_ms;
 	ER er;
@@ -151,14 +150,21 @@ ER line_adc_reader_read(void *context, ir_readings_t *readings,
 	if (!reader->initialized || reader->faulted) return E_OBJ;
 	er = tk_get_otm(&start);
 	if (er != E_OK) goto fault;
-	er = read_channel(reader, &reader->config.center, &result.center);
-	if (er != E_OK) goto fault;
-	er = read_channel(reader, &reader->config.right, &result.right);
-	if (er != E_OK) goto fault;
-	er = tk_get_otm(&barcode_start);
-	if (er != E_OK) goto fault;
-	er = read_channel(reader, &reader->config.barcode, &result.barcode);
-	if (er != E_OK) goto fault;
+	barcode_start = start;
+	if (line) {
+		er = read_channel(reader, &reader->config.center, &result.center);
+		if (er != E_OK) goto fault;
+		er = read_channel(reader, &reader->config.right, &result.right);
+		if (er != E_OK) goto fault;
+	}
+	if (barcode) {
+		if (line) {
+			er = tk_get_otm(&barcode_start);
+			if (er != E_OK) goto fault;
+		}
+		er = read_channel(reader, &reader->config.barcode, &result.barcode);
+		if (er != E_OK) goto fault;
+	}
 	er = tk_get_otm(&end);
 	if (er != E_OK) goto fault;
 	start_ms = clock_ms(&start);
@@ -182,6 +188,24 @@ ER line_adc_reader_read(void *context, ir_readings_t *readings,
 fault:
 	reader->faulted = true;
 	return er < E_OK ? er : E_IO;
+}
+
+ER line_adc_reader_read(void *context, ir_readings_t *readings,
+			uint32_t *timestamp_ms)
+{
+	return read_sample(context, readings, timestamp_ms, true, true);
+}
+
+ER line_adc_reader_read_line(line_adc_reader_t *reader, ir_readings_t *readings,
+			     uint32_t *timestamp_ms)
+{
+	return read_sample(reader, readings, timestamp_ms, true, false);
+}
+
+ER line_adc_reader_read_barcode(line_adc_reader_t *reader, ir_readings_t *readings,
+				uint32_t *timestamp_ms)
+{
+	return read_sample(reader, readings, timestamp_ms, false, true);
 }
 
 ER line_adc_reader_close(line_adc_reader_t *reader)

@@ -52,6 +52,12 @@ ER line_adc_reader_start_default_task(uint32_t max_sample_span_ms,
 ER line_adc_reader_read(void *context, ir_readings_t *readings,
 			uint32_t *timestamp_ms);
 
+/* Bench reads: only sample the selected inputs; other fields are zeroed. */
+ER line_adc_reader_read_line(line_adc_reader_t *reader, ir_readings_t *readings,
+			     uint32_t *timestamp_ms);
+ER line_adc_reader_read_barcode(line_adc_reader_t *reader, ir_readings_t *readings,
+				uint32_t *timestamp_ms);
+
 /* Close only an unfaulted reader that no task is using. Pins remain analog. */
 ER line_adc_reader_close(line_adc_reader_t *reader);
 

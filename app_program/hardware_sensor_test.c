@@ -57,6 +57,17 @@ static void report_error_forever(const char *sensor, const char *operation, ER e
 	}
 }
 
+#if APP_SENSOR_TEST == 8 || APP_SENSOR_TEST == 9
+static void init_bench_reader(line_adc_reader_t *reader, const char *name)
+{
+	line_adc_config_t config;
+	ER error = line_adc_reader_default_config(&config, 100U);
+
+	if (error == E_OK) error = line_adc_reader_init(reader, &config);
+	if (error != E_OK) report_error_forever(name, "ADC init", error);
+}
+#endif
+
 #if APP_SENSOR_TEST == 1
 static void sensor_test_task(INT stacd, void *exinf)
 {
@@ -246,6 +257,120 @@ static void sensor_test_task(INT stacd, void *exinf)
 		error = tk_dly_tsk(10U);
 		if (error != E_OK)
 			report_error_forever("LINE-BARCODE", "diagnostic delay", error);
+	}
+}
+#elif APP_SENSOR_TEST == 8
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	static const char *const names[] = {
+		[POS_LOST] = "LOST", [POS_LEFT] = "LEFT",
+		[POS_RIGHT] = "RIGHT", [POS_JUNCTION] = "JUNCTION"
+	};
+	line_adc_reader_t reader = {0};
+	ER error;
+
+	(void)stacd;
+	(void)exinf;
+	init_bench_reader(&reader, "LINE-H02");
+	tm_printf((UB*)"[HWTEST][LINE-H02] GP27 center, GP26 right; no encoders or motors\n");
+	for (;;) {
+		ir_readings_t readings;
+		uint32_t timestamp;
+
+		error = line_adc_reader_read_line(&reader, &readings, &timestamp);
+		if (error != E_OK) report_error_forever("LINE-H02", "ADC read", error);
+		tm_printf((UB*)"[HWTEST][LINE-H02] t=%u line=%s center=%u right=%u\n",
+			  (unsigned)timestamp, names[line_following_position(&readings)],
+			  (unsigned)readings.center.raw, (unsigned)readings.right.raw);
+		error = tk_dly_tsk(250U);
+		if (error != E_OK) report_error_forever("LINE-H02", "delay", error);
+	}
+}
+#elif APP_SENSOR_TEST == 9
+_Static_assert(BARCODE_TEST_MODULE_COUNTS >= 0 &&
+	       BARCODE_TEST_MODULE_COUNTS <= UINT32_MAX,
+	       "BARCODE_TEST_MODULE_COUNTS must be 0 or a positive 32-bit count");
+
+/* Calibration mode allows short runs before the module size is known. */
+static const barcode_scanner_config_t s_bench_barcode_config = {
+	BARCODE_TEST_MODULE_COUNTS ? BARCODE_TEST_MODULE_COUNTS : 1U,
+	25U, 0U, BARCODE_TEST_MODULE_COUNTS ? 0U : 1000U, 0U
+};
+static barcode_scanner_t s_bench_scanner;
+
+static void report_bench_barcode(void)
+{
+	barcode_char_info_t info;
+	uint8_t payload[BARCODE_MAX_PAYLOAD + 1U];
+	uint8_t length;
+
+	if (barcode_scanner_take_event(&s_bench_scanner, &info)) {
+		if (info.reject == BARCODE_REJECT_NONE && info.symbol == '*' && info.in_frame)
+			barcode_scanner_reset_stats(&s_bench_scanner);
+		tm_printf((UB*)"[HWTEST][BAR-H02] char=%c %s dir=%d narrow_max=%u "
+			  "wide_min=%u gap=%u offending=%u\n",
+			  info.symbol ? info.symbol : '?', barcode_reject_name(info.reject),
+			  (int)info.direction, (unsigned)info.narrow_max, (unsigned)info.wide_min,
+			  (unsigned)info.gap_counts, (unsigned)info.offending_counts);
+	}
+	if (barcode_scanner_take_result(&s_bench_scanner, payload, BARCODE_MAX_PAYLOAD, &length)) {
+		barcode_scanner_config_t suggested;
+
+		payload[length] = '\0';
+		tm_printf((UB*)"[HWTEST][BAR-H02] decoded=%s length=%u\n", payload, (unsigned)length);
+		if (barcode_scanner_suggest_config(&s_bench_scanner, &suggested))
+			tm_printf((UB*)"[HWTEST][BAR-H02] if payload matches, try "
+				  "BARCODE_TEST_MODULE_COUNTS=%u\n",
+				  (unsigned)suggested.counts_per_module);
+	}
+}
+
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	line_adc_reader_t reader = {0};
+	bool initialized = false;
+	uint32_t last_report = 0U;
+	ER error;
+
+	(void)stacd;
+	(void)exinf;
+	init_bench_reader(&reader, "BAR-H02");
+	error = encoder_source_register();
+	if (error == E_OK) error = gpio_dispatcher_start();
+	if (error != E_OK) report_error_forever("BAR-H02", "encoder startup", error);
+	tm_printf((UB*)"[HWTEST][BAR-H02] GP28 barcode; keep motor power off; "
+		  "module_counts=%u (0 = learn from a scan)\n",
+		  (unsigned)BARCODE_TEST_MODULE_COUNTS);
+	for (;;) {
+		ir_readings_t readings;
+		encoder_snapshot_t snapshot;
+		uint32_t timestamp;
+		int32_t count;
+
+		error = line_adc_reader_read_barcode(&reader, &readings, &timestamp);
+		if (error != E_OK) report_error_forever("BAR-H02", "ADC read", error);
+		error = encoder_source_snapshot(&snapshot);
+		if (error != E_OK || !snapshot.valid)
+			report_error_forever("BAR-H02", "encoder snapshot", error != E_OK ? error : E_IO);
+		/* Same wheel polarities as the vehicle calibration (+1, +1). */
+		count = (int32_t)(((int64_t)snapshot.left_count + snapshot.right_count) / 2);
+		if (!initialized) {
+			initialized = barcode_scanner_init(&s_bench_scanner, &s_bench_barcode_config,
+							   readings.barcode.black, count);
+			if (!initialized) report_error_forever("BAR-H02", "scanner init", E_SYS);
+		} else if (!barcode_scanner_update(&s_bench_scanner, readings.barcode.black, count)) {
+			report_error_forever("BAR-H02", "scanner update", E_SYS);
+		}
+		report_bench_barcode();
+		if (!s_bench_scanner.collecting && !s_bench_scanner.in_frame &&
+		    timestamp - last_report >= SENSOR_TEST_INTERVAL_MS) {
+			last_report = timestamp;
+			tm_printf((UB*)"[HWTEST][BAR-H02] adc=%u black=%u left=%d right=%d\n",
+				  (unsigned)readings.barcode.raw, readings.barcode.black ? 1U : 0U,
+				  (int)snapshot.left_count, (int)snapshot.right_count);
+		}
+		error = tk_dly_tsk(10U);
+		if (error != E_OK) report_error_forever("BAR-H02", "delay", error);
 	}
 }
 #elif APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6

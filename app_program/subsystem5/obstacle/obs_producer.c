@@ -94,6 +94,16 @@ bool obs_producer_scan(obs_producer_t *producer, const uint16_t *distances,
 		case OBS_ACT_REVERSE: next.advisory_action = VEHICLE_OBSTACLE_ADVICE_REVERSE; break;
 		default: return false;
 		}
+		switch (profile.object_side) {
+		case OBS_SIDE_CENTRE: next.object_side = VEHICLE_OBSTACLE_SIDE_CENTRE; break;
+		case OBS_SIDE_LEFT: next.object_side = VEHICLE_OBSTACLE_SIDE_LEFT; break;
+		case OBS_SIDE_RIGHT: next.object_side = VEHICLE_OBSTACLE_SIDE_RIGHT; break;
+		default: next.object_side = VEHICLE_OBSTACLE_SIDE_UNKNOWN; break;
+		}
+		next.edges_seen = (uint8_t)((profile.left_edge_seen ?
+					     VEHICLE_OBSTACLE_EDGE_LEFT_SEEN : 0U) |
+					    (profile.right_edge_seen ?
+					     VEHICLE_OBSTACLE_EDGE_RIGHT_SEEN : 0U));
 	}
 	producer->sequence = next.header.sequence;
 	producer->last_scan_ms = timestamp_ms;

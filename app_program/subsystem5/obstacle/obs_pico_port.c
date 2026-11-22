@@ -60,6 +60,9 @@ typedef struct {
 } obs_pico_port_state_t;
 
 static obs_pico_port_state_t s_port;
+/* Diagnostic copy of the last complete scan; guarded by DI/EI. */
+static obs_task_sample_t s_last_scan;
+static uint32_t s_last_scan_sequence;
 static bool s_registered;
 static bool s_task_started;
 
@@ -466,8 +469,29 @@ static ER publish_measurement(uint16_t distance_mm, uint32_t trigger_ms,
 		sample->step_deg = s_port.hardware.scan_step_deg;
 		for (i = 0U; i < s_port.scan_index; i++)
 			sample->distances[i] = s_port.scan_distances[i];
+		{
+			UINT saved;
+			DI(saved);
+			s_last_scan = *sample;
+			s_last_scan_sequence++;
+			EI(saved);
+		}
 	}
 	return E_OK;
+}
+
+bool obs_pico_port_last_scan(obs_task_sample_t *scan, uint32_t *sequence)
+{
+	UINT saved;
+	uint32_t seq;
+
+	if (scan == NULL || sequence == NULL) return false;
+	DI(saved);
+	seq = s_last_scan_sequence;
+	if (seq != 0U) *scan = s_last_scan;
+	EI(saved);
+	*sequence = seq;
+	return seq != 0U;
 }
 
 static ER poll(void *context, obs_task_mode_t mode, obs_task_sample_t *sample)

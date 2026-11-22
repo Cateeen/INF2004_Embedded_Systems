@@ -528,17 +528,60 @@ evaluating it for tilt because a startup outlier was observed on the robot.
 It then evaluates every reading, prints the first five evaluated samples, and
 continues logging about once per second. The vehicle IMU task is unchanged.
 With motor power disconnected, wait for `tilt_detected=0` on level ground
-before lifting. Reset on level ground between trials.
+before lifting. Unlike the vehicle, this diagnostic re-arms itself: once the
+robot has been back on level ground for 500 ms it prints `TILT CLEARED` and
+`tilt_detected` returns to 0, so trials can be repeated without a reset.
 
 For a physical hump-height check, build `make SENSOR_TEST=imu_hump`. With motor
 power disconnected, it reads the IMU and wheel encoders but does not start a
-motor task. The serial output reports travel, pitch, roll, current rise and
-peak rise in millimeters. The diagnostic currently assumes 2500 encoder counts
-per revolution, 20.4 cm wheel circumference, and left/right signs -1/+1; verify
-these against the robot before trusting the height. Reset on level ground for
-each trial, then push straight and steadily over a known gentle ramp. Keep the
-robot below 35 degrees pitch and 15 degrees roll, and compare `peak_mm` with
-the ramp's ruler-measured vertical rise.
+motor task. Reset on level ground for each trial, then push straight and
+steadily over a known gentle ramp, and compare `peak` with the ramp's
+ruler-measured vertical rise.
+
+Hump height comes from the robot's geometry, not from travel: two rear drive
+wheels `IMU_TRACK_WIDTH_M` (W = 115 mm) apart and a front-centre ball
+`IMU_WHEELBASE_M` (L = 80 mm) ahead of the rear axle, both in
+`imu_processor_config.h`. The smoothed pitch and roll give the height of each
+ground contact above the lowest one: `left`, `right` and `ball`, printed in
+0.1 mm (100 = 1 cm). The hump height is the highest of the three, so a ramp
+under either wheel, both wheels or the ball is measured. A ramp under only the
+right wheel tilts the robot right-side-up by about asin(h/W) and nose-down by
+about asin(h/2L). Odometry (`travel_mm`, assuming 2500 counts per revolution,
+20.4 cm circumference and signs -1/+1) is logged but not used for the height.
+The IMU board is also rotated about 4 degrees on the chassis
+(`IMU_MOUNT_YAW_DEG`, -4.1); the diagnostic undoes this after the level
+offsets. It was measured with the robot still and its right wheel resting on
+the 10 mm ramp, where it brings `left` and `ball` to 0 and `right` to 10.1 mm
+(10.6 mm without it). `peak` only accepts a height held for three samples in
+a row (150 ms), so one noisy sample cannot set it.
+A hump starts above 5 mm (`IMU_HUMP_START_M`) and ends below 3 mm, so floor
+unevenness of about 1-1.5 degrees (2-3 mm across the robot) is ignored; `peak`
+records humps above 5 mm. A hump still rising is only reset after 30 s
+(`IMU_HUMP_TIMEOUT_MS`), so a slow push is not cut short. A hump only ends
+once every contact has stayed below 3 mm for 300 ms (`IMU_HUMP_END_HOLD_MS`),
+so a brief dip on one ramp does not split it into several humps; a reading
+stuck between 3 and 5 mm ends it after 4 s (`IMU_HUMP_SETTLE_MS`).
+
+At startup it averages about 1 s of readings as the level reference, so keep
+the robot still on flat ground until `level offsets` prints; the offsets show
+how far the IMU board is tilted on the chassis (about 9 degrees nose-up was
+measured on the robot). The pitch and roll used for the height are smoothed
+(alpha 0.2 per 50 ms sample) so a hand push is not read as a slope; tilt
+detection still uses the unfiltered angles. Because the lift check trips at
+15 degrees of roll, a ramp under one wheel taller than about W*sin(15 deg) =
+30 mm would be reported as a lift.
+
+The vehicle IMU task (`VEHICLE=1`) uses the same processor setup
+(`imu_processor_init_vehicle()`: filter alpha 0.2 and mount yaw -4.1 deg) and
+the same startup level calibration (`imu_level_calibrator_*`, 20 samples).
+Keep the robot still on level ground for about 1 s after power-up, until
+`IMU level calibrated` prints. Until then the IMU task still publishes
+estimates, so the controller's 200 ms IMU deadline holds, but marks them
+`tilt_detected`, so GO cannot arm the car. If the robot moved (any axis
+varying more than 0.8 m/s^2) or is more than 20 degrees from level, it prints
+a retry message and calibrates again; GO stays blocked meanwhile. The
+processor is restarted with the offsets once calibration succeeds, so nothing
+seen before it (such as the mounting tilt reading as a hump) carries over.
 
 For a manual GP15 servo check, build `make SENSOR_TEST=servo`: this default
 image emits no servo PWM. To command a single pulse width, build, for example,
@@ -562,6 +605,35 @@ console and moves the servo to its ahead position. GP4 Echo safety and the
 servo's 1500/1700/1900 us calibration are recorded as verified in this test
 configuration. If the sensor, wiring, voltage divider or servo setup changes,
 re-measure and update the configuration before running it.
+
+For obstacle width, build `make SENSOR_TEST=obstacle_width` (motor-free; the
+robot must stand still). The sensor watches ahead; an object that stays at or
+below `OBSTACLE_DETECT_MM` (default 400), within 60 mm of its first reading,
+for 1 s (at least 5 readings) confirms an obstacle, so a passing hand is
+ignored. Readings at or below 40 mm are untrusted and never confirm or clear:
+on the bench the HC-SR04 returned a constant 24 mm at every angle with nothing
+in front (a no-echo artefact, not a distance). The test then sends a normal `SCAN_REQUEST`, sweeps the
+servo R20..L20 degrees and prints the raw sweep, the full width, how far the
+obstacle extends left and right of the robot centreline (`left + right =
+width`), whether each edge was seen or lies beyond the sweep (then the width is
+only a lower bound), the free space beyond each edge and the advisory bypass,
+plus a `CSV,` line for logging. Remove the obstacle to re-arm. With a known test
+object, `make SENSOR_TEST=obstacle_width OBSTACLE_TRUE_WIDTH_MM=150` also
+prints the error and an approximate `OBS_BEAM_TRIM_DEG` to calibrate the
+HC-SR04 beam spread, which otherwise makes objects look wider than they are.
+
+Bench finding: the HC-SR04 still hears a 7 cm bottle 35 degrees off its
+axis at 30 cm (effective beam at least +/-28 degrees, about +/-20 at 60 cm),
+which is wider than the +/-20 degree servo sweep. Such a scan hears the object
+at every angle (`smeared` in the profile); the report then prints `FULL WIDTH:
+NOT MEASURABLE` instead of a meaningless number, and the width cannot be
+calibrated. The profile and the `SCAN_FOUND` event carry an object side
+(`object_side`: CENTRE, LEFT or RIGHT) and the `edges_seen` bits; `width_mm`
+is a measurement only when both edge bits are set. With both edges seen the
+side comes from geometry; otherwise from the range trend across the sweep,
+because off-axis echoes read 10-20 mm longer. On the bench that weak cue was
+right in 5 of 6 off-centre scans and fell back to CENTRE in the sixth, never
+the wrong side.
 
 The opt-in application WiFi service supports simulated callbacks or an outbound
 MQTT bridge backend.
@@ -697,7 +769,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, and `imu_hump` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

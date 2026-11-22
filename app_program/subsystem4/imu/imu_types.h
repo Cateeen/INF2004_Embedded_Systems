@@ -44,9 +44,24 @@ typedef struct {
 
     float           last_distance_m;
     float           hump_start_distance_m;
-    float           current_pitch_deg;
-    float           current_roll_deg;
+    float           current_pitch_deg; /* level-corrected, unfiltered */
+    float           current_roll_deg;  /* level-corrected, unfiltered */
+    float           terrain_pitch_deg; /* filtered pitch used for hump detection */
+    float           terrain_roll_deg;  /* filtered roll used for hump detection */
+    float           pitch_offset_deg;  /* resting pitch removed by set_level */
+    float           roll_offset_deg;   /* resting roll removed by set_level */
+    float           mount_yaw_cos;     /* board rotation about vertical, */
+    float           mount_yaw_sin;     /* undone after the level offsets */
+    float           terrain_filter_alpha; /* 1 = unfiltered */
+    bool            terrain_valid;
+    /* Height of each ground contact above the lowest one, from the filtered
+     * pitch/roll and the robot geometry (rear wheels + front ball). */
+    float           wheel_left_m;
+    float           wheel_right_m;
+    float           ball_m;
+    float           hump_history_m[2]; /* previous two hump heights, newest first */
     uint32_t        hump_start_ms;
+    uint32_t        hump_below_since_ms; /* falling: when heights last went below end */
     uint16_t        packed_telemetry; /* 16-bit Minimum-Bit packed word */
 } imu_state_t;
 

@@ -16,6 +16,18 @@ static uint16_t sat16(float v, uint16_t max)
     return (uint16_t)(v + 0.5f);
 }
 
+/* sats16 - round a float and clamp it to -max..max. */
+static int16_t sats16(float v, int16_t max)
+{
+    if (v <= -(float)max) {
+        return (int16_t)-max;
+    }
+    if (v >= (float)max) {
+        return max;
+    }
+    return (int16_t)((v < 0.0f) ? (v - 0.5f) : (v + 0.5f));
+}
+
 /**
  * obs_profile_compute - turn a fine-scan into an obstacle description.
  * Params : distances = n millimetre readings (OBS_DIST_NONE = nothing seen),
@@ -159,6 +171,54 @@ obs_profile_status_t obs_profile_compute(const uint16_t *dist, uint8_t n, uint8_
 
     out->closest_mm = closest;
     out->width_mm = sat16(xr - xl, OBS_OFFSET_MAX_MM);
+    out->left_edge_mm = sats16(-xl, (int16_t)OBS_OFFSET_MAX_MM);
+    out->right_edge_mm = sats16(xr, (int16_t)OBS_OFFSET_MAX_MM);
+    out->left_edge_seen = !blocked_last;
+    out->right_edge_seen = !blocked_first;
+    out->smeared = blocked_first && blocked_last;
+
+    /* Which side the obstacle is on. Fit range against sample index over the
+     * obstacle's points (least squares); higher index = further left. */
+    {
+        float si = 0.0f, sd = 0.0f, sii = 0.0f, sid = 0.0f, cnt = 0.0f;
+        uint8_t i_first = 0xFFU, i_last = 0U;
+
+        for (i = 0U; i < n; i++) {
+            if (cid[i] == best) {
+                float fi = (float)i, fd = (float)dist[i];
+                if (i_first == 0xFFU) { i_first = i; }
+                i_last = i;
+                si += fi; sd += fd; sii += fi * fi; sid += fi * fd; cnt += 1.0f;
+            }
+        }
+        if (cnt >= 3.0f) {
+            float den = cnt * sii - si * si;
+            float slope = (den > 0.0f) ? (cnt * sid - si * sd) / den : 0.0f;
+            out->range_trend_mm = sats16(slope * (float)(i_last - i_first),
+                                         (int16_t)OBS_OFFSET_MAX_MM);
+        }
+        /* Geometry only when both edges are real: one extrapolated edge drags
+         * the centre towards the unseen side (a centred bottle at 61 cm with
+         * one edge beyond the sweep came out RIGHT). */
+        if (blocked_first || blocked_last) {
+            if (out->range_trend_mm >= (int16_t)OBS_SIDE_TREND_MM) {
+                out->object_side = OBS_SIDE_RIGHT;   /* farther on the left */
+            } else if (out->range_trend_mm <= -(int16_t)OBS_SIDE_TREND_MM) {
+                out->object_side = OBS_SIDE_LEFT;
+            } else {
+                out->object_side = OBS_SIDE_CENTRE;
+            }
+        } else {
+            float centre = 0.5f * (xl + xr);         /* x > 0 is right */
+            if (centre > (float)OBS_SIDE_CENTRE_MM) {
+                out->object_side = OBS_SIDE_RIGHT;
+            } else if (centre < -(float)OBS_SIDE_CENTRE_MM) {
+                out->object_side = OBS_SIDE_LEFT;
+            } else {
+                out->object_side = OBS_SIDE_CENTRE;
+            }
+        }
+    }
 
     /* Choose a side: it must fit the robot plus margin on both sides. */
     {

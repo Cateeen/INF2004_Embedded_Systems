@@ -35,4 +35,10 @@ ER obs_pico_port_register(void);
 ER obs_pico_port_task_start(const obs_pico_port_config_t *hardware,
 			    const obs_task_config_t *task);
 
+/* Diagnostic read-only copy of the most recent complete raw scan, in the same
+ * right-to-left order the profile receives. *sequence counts completed scans
+ * (0 = none yet), so a caller can tell a new scan from a stale one. Returns
+ * false when no scan has completed. Safe to call from any core-0 task. */
+bool obs_pico_port_last_scan(obs_task_sample_t *scan, uint32_t *sequence);
+
 #endif

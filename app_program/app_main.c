@@ -209,7 +209,7 @@ static void vehicle_start(void)
 	static const obs_task_config_t obstacle_config = {
 		50U,	/* period_ms */
 		500U,	/* ahead_max_age_ms */
-		1000U,	/* scan_max_age_ms */
+		2500U,	/* scan_max_age_ms: 9 points x 3 polls x 50 ms ~ 1.3 s */
 		5000U,	/* scan_timeout_ms */
 		500U,	/* command_max_age_ms */
 		300U,	/* emergency_distance_mm */

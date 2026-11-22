@@ -16,5 +16,11 @@
 #define OBS_DEPTH_MIN_MM     100U
 #define OBS_BEAM_TRIM_DEG    0.0f
 #define OBS_OFFSET_MAX_MM    1023U
+/* Object side. Bench (7 cm bottle 8 cm off-centre at 30 cm, 6 scans): fitted
+ * range trend 11-23 mm towards the object in 5 scans, +3 in one; centred
+ * bottles +/-4 mm; a centred flat file -9 mm. A weak signal: CENTRE is the
+ * safe answer below the threshold. */
+#define OBS_SIDE_TREND_MM    10U   /* |trend| needed to call a side when an edge is unseen */
+#define OBS_SIDE_CENTRE_MM   20U   /* |centre x| within this = centre (edges seen) */
 
 #endif

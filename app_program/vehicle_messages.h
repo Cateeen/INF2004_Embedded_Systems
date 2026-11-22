@@ -94,6 +94,19 @@ typedef enum {
     VEHICLE_OBSTACLE_ADVICE_REVERSE
 } vehicle_obstacle_advice_t;
 
+/* Side of the robot centreline the scanned obstacle mainly lies on. */
+typedef enum {
+    VEHICLE_OBSTACLE_SIDE_UNKNOWN = 0,
+    VEHICLE_OBSTACLE_SIDE_CENTRE,
+    VEHICLE_OBSTACLE_SIDE_LEFT,
+    VEHICLE_OBSTACLE_SIDE_RIGHT
+} vehicle_obstacle_side_t;
+
+/* obstacle_event_message_t.edges_seen bits. width_mm is a measurement only
+ * when both bits are set; otherwise it is a lower bound or meaningless. */
+#define VEHICLE_OBSTACLE_EDGE_LEFT_SEEN    0x01U
+#define VEHICLE_OBSTACLE_EDGE_RIGHT_SEEN   0x02U
+
 #define VEHICLE_FAULT_CODE_IMU_I2C 1U
 #define VEHICLE_FAULT_CODE_ODOMETRY_SOURCE 2U
 #define VEHICLE_FAULT_CODE_ODOMETRY_CALCULATION 3U
@@ -181,6 +194,9 @@ typedef struct {
     uint16_t lateral_mm;
     uint16_t advance_mm;
     uint8_t advisory_action;
+    /* SCAN_FOUND only (0 otherwise). Appended: earlier fields are unchanged. */
+    uint8_t object_side;      /* vehicle_obstacle_side_t */
+    uint8_t edges_seen;       /* VEHICLE_OBSTACLE_EDGE_* bits */
 } obstacle_event_message_t;
 
 typedef struct {

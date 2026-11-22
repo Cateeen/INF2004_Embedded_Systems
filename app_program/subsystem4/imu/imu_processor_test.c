@@ -21,10 +21,15 @@ static BOOL terrain_test(void)
 	       imu_processor_update(&state, &ramp, 0.0f, 20U) &&
 	       state.fsm_state == IMU_STATE_HUMP_RISING &&
 	       imu_processor_update(&state, &ramp, 0.30f, 50U) &&
+	       imu_processor_update(&state, &ramp, 0.30f, 65U) &&
 	       imu_processor_update(&state, &flat, 0.30f, 80U) &&
 	       state.fsm_state == IMU_STATE_HUMP_FALLING &&
-	       state.hump_peak_m > 0.015f &&
-	       imu_processor_update(&state, &flat, 0.30f, 100U) &&
+	       /* 8.2 deg nose-up: the ball sits L*sin(8.2 deg) = 11.4 mm above the wheels. */
+	       state.hump_peak_m > 0.011f && state.hump_peak_m < 0.012f &&
+	       /* Still counted as the same hump until flat for IMU_HUMP_END_HOLD_MS. */
+	       imu_processor_update(&state, &flat, 0.30f, 80U + IMU_HUMP_END_HOLD_MS - 1U) &&
+	       state.fsm_state == IMU_STATE_HUMP_FALLING && state.hump_active &&
+	       imu_processor_update(&state, &flat, 0.30f, 80U + IMU_HUMP_END_HOLD_MS) &&
 	       state.fsm_state == IMU_STATE_MONITORING && !state.hump_active;
 }
 
@@ -78,31 +83,241 @@ static BOOL pickup_tilt_test(void)
 	       state.fsm_state == IMU_STATE_TILT && state.tilt_detected;
 }
 
+/* Gravity as seen by the IMU when the body has the given sin(pitch) and
+ * sin(roll), using the processor's angle conventions. */
+static accel_data_t body_tilt(float sin_pitch, float sin_roll)
+{
+	float cos_pitch = __builtin_sqrtf(1.0f - sin_pitch * sin_pitch);
+	float cos_roll = __builtin_sqrtf(1.0f - sin_roll * sin_roll);
+	accel_data_t a = {0};
+
+	a.ax = -GRAVITY_MS2 * sin_pitch;
+	a.ay = GRAVITY_MS2 * cos_pitch * sin_roll;
+	a.az = GRAVITY_MS2 * cos_pitch * cos_roll;
+	return a;
+}
+
+static BOOL near_m(float value, float expected)
+{
+	return value > expected - 0.0002f && value < expected + 0.0002f;
+}
+
 static BOOL hump_height_test(void)
 {
 	imu_state_t state;
 	const accel_data_t flat = {.az = GRAVITY_MS2};
+	const float h = 0.010f; /* 1 cm ramp */
+	/* Right wheel up by h: the axle centre rises h/2 (nose down by h/2 over L)
+	 * and the wheels differ by h across W. */
+	const accel_data_t right_ramp =
+		body_tilt(-(0.5f * h) / IMU_WHEELBASE_M, h / IMU_TRACK_WIDTH_M);
+	const accel_data_t left_ramp =
+		body_tilt(-(0.5f * h) / IMU_WHEELBASE_M, -h / IMU_TRACK_WIDTH_M);
+	/* Ball up by h with both wheels on the ground: nose up by h over L. */
+	const accel_data_t ball_ramp = body_tilt(h / IMU_WHEELBASE_M, 0.0f);
+	BOOL ok;
+
+	/* 1 cm under the right wheel only. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_update(&state, &flat, 0.00f, 10U) &&
+	     state.fsm_state == IMU_STATE_MONITORING &&
+	     imu_processor_update(&state, &right_ramp, 0.05f, 20U) &&
+	     state.fsm_state == IMU_STATE_HUMP_RISING &&
+	     near_m(state.wheel_right_m, h) && near_m(state.wheel_left_m, 0.0f) &&
+	     near_m(state.ball_m, 0.0f) && near_m(state.current_hump_m, h) &&
+	     state.hump_peak_m == 0.0f && /* not yet held for 3 samples */
+	     imu_processor_update(&state, &right_ramp, 0.06f, 25U) &&
+	     imu_processor_update(&state, &right_ramp, 0.07f, 30U) &&
+	     near_m(state.hump_peak_m, h) &&
+	     imu_processor_update(&state, &flat, 0.10f, 35U) &&
+	     state.fsm_state == IMU_STATE_HUMP_FALLING &&
+	     near_m(state.hump_peak_m, h) &&
+	     ((state.packed_telemetry >> 6U) & 0x3FU) == 4U && /* 1.00 cm */
+	     imu_processor_update(&state, &flat, 0.15f, 35U + IMU_HUMP_END_HOLD_MS) &&
+	     state.fsm_state == IMU_STATE_MONITORING && !state.hump_active;
+
+	/* End-of-hump hold: a 150 ms dip to flat in the middle of one ramp, then
+	 * a reading between the end and start levels, keeps it one hump. */
+	{
+		const accel_data_t right_4mm =
+			body_tilt(-0.002f / IMU_WHEELBASE_M, 0.004f / IMU_TRACK_WIDTH_M);
+		ok = imu_processor_init(&state) &&
+		     imu_processor_update(&state, &right_ramp, 0.05f, 100U) &&
+		     imu_processor_update(&state, &flat, 0.06f, 150U) &&
+		     imu_processor_update(&state, &flat, 0.07f, 250U) &&
+		     state.fsm_state == IMU_STATE_HUMP_FALLING && state.hump_active &&
+		     /* 4 mm: not a new start, but restarts the hold. */
+		     imu_processor_update(&state, &right_4mm, 0.08f, 400U) &&
+		     imu_processor_update(&state, &flat, 0.09f, 650U) &&
+		     state.fsm_state == IMU_STATE_HUMP_FALLING && state.hump_active &&
+		     imu_processor_update(&state, &right_ramp, 0.10f, 700U) &&
+		     state.fsm_state == IMU_STATE_HUMP_RISING &&
+		     /* Then flat for the full hold: the hump ends. */
+		     imu_processor_update(&state, &flat, 0.11f, 750U) &&
+		     imu_processor_update(&state, &flat, 0.12f, 750U + IMU_HUMP_END_HOLD_MS) &&
+		     state.fsm_state == IMU_STATE_MONITORING && !state.hump_active && ok;
+	}
+
+	/* 1 cm under the left wheel only. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_update(&state, &left_ramp, 0.05f, 10U) &&
+	     imu_processor_update(&state, &left_ramp, 0.06f, 20U) &&
+	     imu_processor_update(&state, &left_ramp, 0.07f, 30U) &&
+	     near_m(state.wheel_left_m, h) && near_m(state.wheel_right_m, 0.0f) &&
+	     near_m(state.hump_peak_m, h) && ok;
+
+	/* 1 cm under the ball only. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_update(&state, &ball_ramp, 0.05f, 10U) &&
+	     imu_processor_update(&state, &ball_ramp, 0.06f, 20U) &&
+	     imu_processor_update(&state, &ball_ramp, 0.07f, 30U) &&
+	     near_m(state.ball_m, h) && near_m(state.wheel_left_m, 0.0f) &&
+	     near_m(state.wheel_right_m, 0.0f) && near_m(state.hump_peak_m, h) && ok;
+
+	/* A one-sample spike to 2 cm on a 1 cm hump does not set the peak. */
+	{
+		const accel_data_t right_spike =
+			body_tilt(-(0.5f * 2.0f * h) / IMU_WHEELBASE_M, 2.0f * h / IMU_TRACK_WIDTH_M);
+		ok = imu_processor_init(&state) &&
+		     imu_processor_update(&state, &right_ramp, 0.05f, 10U) &&
+		     imu_processor_update(&state, &right_ramp, 0.06f, 20U) &&
+		     imu_processor_update(&state, &right_spike, 0.07f, 30U) &&
+		     near_m(state.current_hump_m, 2.0f * h) &&
+		     imu_processor_update(&state, &right_ramp, 0.08f, 40U) &&
+		     imu_processor_update(&state, &right_ramp, 0.09f, 50U) &&
+		     near_m(state.hump_peak_m, h) && ok;
+	}
+
+	/* Board rotated on the chassis: the standing-still reading from the robot
+	 * (right wheel on 10 mm, roll 5.29 deg, pitch -3.26 deg) is corrected by
+	 * IMU_MOUNT_YAW_DEG so the left wheel and ball read 0. */
+	{
+		const accel_data_t measured =
+			body_tilt(-0.056865f /* sin(-3.26 deg) */, 0.092200f /* sin(5.29 deg) */);
+		ok = imu_processor_init(&state) &&
+		     !imu_processor_set_mount_yaw(&state, 50.0f) &&
+		     !imu_processor_set_mount_yaw(NULL, 0.0f) &&
+		     imu_processor_set_mount_yaw(&state, IMU_MOUNT_YAW_DEG) &&
+		     imu_processor_update(&state, &measured, 0.05f, 10U) &&
+		     near_m(state.wheel_right_m, 0.0101f) &&
+		     near_m(state.wheel_left_m, 0.0f) && near_m(state.ball_m, 0.0f) &&
+		     /* Without the correction the same reading gives 10.6 mm. */
+		     imu_processor_set_mount_yaw(&state, 0.0f) &&
+		     imu_processor_update(&state, &measured, 0.06f, 20U) &&
+		     near_m(state.wheel_right_m, 0.0106f) && ok;
+	}
+
+	/* Uneven floor: a 4 mm difference (below IMU_HUMP_START_M) is not a hump. */
+	{
+		const accel_data_t uneven_floor =
+			body_tilt(-0.002f / IMU_WHEELBASE_M, 0.004f / IMU_TRACK_WIDTH_M);
+		ok = imu_processor_init(&state) &&
+		     imu_processor_update(&state, &uneven_floor, 0.05f, 10U) &&
+		     near_m(state.wheel_right_m, 0.004f) &&
+		     state.fsm_state == IMU_STATE_MONITORING && !state.hump_active &&
+		     state.hump_peak_m == 0.0f && ok;
+	}
+
+	/* A slow push stays on the hump for 10 s without timing out, but a hump
+	 * still rising after IMU_HUMP_TIMEOUT_MS is reset. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_update(&state, &right_ramp, 0.0f, 100U) &&
+	     imu_processor_update(&state, &right_ramp, 0.10f, 10100U) &&
+	     state.fsm_state == IMU_STATE_HUMP_RISING && state.hump_active &&
+	     imu_processor_update(&state, &right_ramp, 0.20f, 100U + IMU_HUMP_TIMEOUT_MS + 1U) &&
+	     state.fsm_state == IMU_STATE_MONITORING && !state.hump_active && ok;
+	return ok;
+}
+
+static BOOL near_deg(float value, float expected)
+{
+	return value > expected - 0.1f && value < expected + 0.1f;
+}
+
+static BOOL level_filter_test(void)
+{
+	imu_state_t state;
+	const accel_data_t flat = {.az = GRAVITY_MS2};
+	/* Board mounted 9 deg nose-up, then the robot climbs a further 5 deg. */
+	const accel_data_t mount_9_deg = {.ax = -1.534085f, .az = 9.685914f};
+	const accel_data_t mount_plus_5_deg = {.ax = -2.372421f, .az = 9.515378f};
 	const accel_data_t ramp_30_deg = {.ax = -4.903325f, .az = 8.492808f};
+	const accel_data_t too_steep = {.ax = -4.903325f, .az = 8.492808f};
+	const accel_data_t low_az = {.az = 6.0f};
+	const accel_data_t lifted_roll = {.ay = 5.0f, .az = 8.4f};
+	BOOL ok;
 
-	if (!imu_processor_init(&state) ||
-	    !imu_processor_update(&state, &ramp_30_deg, 0.0f, 10U) ||
-	    state.fsm_state != IMU_STATE_HUMP_RISING ||
-	    !imu_processor_update(&state, &ramp_30_deg, 0.10f, 20U) ||
-	    state.current_hump_m < 0.049f || state.current_hump_m > 0.051f ||
-	    !imu_processor_update(&state, &ramp_30_deg, 0.20f, 30U) ||
-	    !imu_processor_update(&state, &flat, 0.20f, 40U) ||
-	    state.fsm_state != IMU_STATE_HUMP_FALLING ||
-	    state.hump_peak_m < 0.099f || state.hump_peak_m > 0.101f ||
-	    ((state.packed_telemetry >> 6U) & 0x3FU) != 40U ||
-	    !imu_processor_update(&state, &flat, 0.20f, 50U) ||
-	    state.fsm_state != IMU_STATE_MONITORING)
-		return false;
+	/* Level calibration removes the mounting offset. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_set_level(&state, &mount_9_deg) &&
+	     near_deg(state.pitch_offset_deg, 9.0f) &&
+	     imu_processor_update(&state, &mount_9_deg, 0.0f, 10U) &&
+	     near_deg(state.current_pitch_deg, 0.0f) &&
+	     state.fsm_state == IMU_STATE_MONITORING &&
+	     imu_processor_update(&state, &mount_plus_5_deg, 0.0f, 20U) &&
+	     near_deg(state.current_pitch_deg, 5.0f) &&
+	     state.fsm_state == IMU_STATE_HUMP_RISING;
 
-	return imu_processor_init(&state) &&
-	       imu_processor_update(&state, &ramp_30_deg, 0.0f, 100U) &&
-	       imu_processor_update(&state, &ramp_30_deg, 0.20f, 5101U) &&
-	       state.fsm_state == IMU_STATE_MONITORING && !state.hump_active &&
-	       state.current_hump_m == 0.0f && state.hump_peak_m == 0.0f;
+	/* Implausible level readings are rejected and leave the offsets alone. */
+	ok = imu_processor_init(&state) &&
+	     !imu_processor_set_level(&state, &too_steep) &&
+	     !imu_processor_set_level(&state, &low_az) &&
+	     !imu_processor_set_level(&state, NULL) &&
+	     !imu_processor_set_level(NULL, &flat) &&
+	     state.pitch_offset_deg == 0.0f && state.roll_offset_deg == 0.0f && ok;
+
+	/* The filter smooths terrain pitch; the first sample seeds it. */
+	ok = imu_processor_init(&state) &&
+	     !imu_processor_set_terrain_filter(&state, 0.0f) &&
+	     !imu_processor_set_terrain_filter(&state, 1.5f) &&
+	     imu_processor_set_terrain_filter(&state, 0.5f) &&
+	     imu_processor_update(&state, &flat, 0.0f, 10U) &&
+	     near_deg(state.terrain_pitch_deg, 0.0f) &&
+	     imu_processor_update(&state, &ramp_30_deg, 0.0f, 20U) &&
+	     near_deg(state.current_pitch_deg, 30.0f) &&
+	     near_deg(state.terrain_pitch_deg, 15.0f) &&
+	     state.fsm_state == IMU_STATE_HUMP_RISING && ok;
+
+	/* Tilt detection ignores the filter and reacts to one sample. */
+	ok = imu_processor_init(&state) &&
+	     imu_processor_set_terrain_filter(&state, 0.1f) &&
+	     imu_processor_update(&state, &flat, 0.0f, 10U) &&
+	     imu_processor_update(&state, &lifted_roll, 0.0f, 20U) &&
+	     state.tilt_detected && state.fsm_state == IMU_STATE_TILT && ok;
+
+	/* Startup calibrator: still samples give the offset; movement, a steep
+	 * mount or too few samples are rejected without changing the state. */
+	{
+		imu_level_calibrator_t calibrator;
+		accel_data_t moved = mount_9_deg;
+		unsigned i;
+
+		moved.ay += 1.0f;
+		ok = imu_processor_init_vehicle(&state) &&
+		     state.terrain_filter_alpha == IMU_TERRAIN_FILTER_ALPHA && ok;
+		imu_level_calibrator_reset(&calibrator);
+		ok = !imu_level_calibrator_add(&calibrator, NULL) &&
+		     imu_processor_apply_level(&state, &calibrator) == IMU_LEVEL_INCOMPLETE && ok;
+		for (i = 0U; i < IMU_LEVEL_SAMPLES; i++)
+			ok = imu_level_calibrator_add(&calibrator, &mount_9_deg) && ok;
+		ok = imu_level_calibrator_full(&calibrator) &&
+		     imu_processor_apply_level(&state, &calibrator) == IMU_LEVEL_OK &&
+		     near_deg(state.pitch_offset_deg, 9.0f) && ok;
+
+		ok = imu_processor_init_vehicle(&state) && ok;
+		imu_level_calibrator_reset(&calibrator);
+		for (i = 0U; i < IMU_LEVEL_SAMPLES; i++)
+			ok = imu_level_calibrator_add(&calibrator, i == 7U ? &moved : &mount_9_deg) && ok;
+		ok = imu_processor_apply_level(&state, &calibrator) == IMU_LEVEL_MOVING &&
+		     state.pitch_offset_deg == 0.0f && ok;
+
+		imu_level_calibrator_reset(&calibrator);
+		for (i = 0U; i < IMU_LEVEL_SAMPLES; i++)
+			ok = imu_level_calibrator_add(&calibrator, &too_steep) && ok;
+		ok = imu_processor_apply_level(&state, &calibrator) == IMU_LEVEL_NOT_LEVEL &&
+		     state.pitch_offset_deg == 0.0f && ok;
+	}
+	return ok;
 }
 
 static BOOL clock_test(void)
@@ -111,16 +326,19 @@ static BOOL clock_test(void)
 	imu_state_t second;
 	const accel_data_t ramp = {.ax = -1.4f, .az = 9.70f};
 
+	const uint32_t expired = 100U + IMU_HUMP_TIMEOUT_MS + 1U;
+
 	return imu_processor_init(&first) && imu_processor_init(&second) &&
 	       imu_processor_update(&first, &ramp, 0.0f, 100U) &&
-	       imu_processor_update(&second, &ramp, 0.0f, 4100U) &&
-	       imu_processor_update(&first, &ramp, 0.0f, 5101U) &&
+	       imu_processor_update(&second, &ramp, 0.0f, expired - 1000U) &&
+	       imu_processor_update(&first, &ramp, 0.0f, expired) &&
 	       first.fsm_state == IMU_STATE_MONITORING &&
-	       imu_processor_update(&second, &ramp, 0.0f, 5101U) &&
+	       imu_processor_update(&second, &ramp, 0.0f, expired) &&
 	       second.fsm_state == IMU_STATE_HUMP_RISING &&
 	       imu_processor_init(&first) &&
 	       imu_processor_update(&first, &ramp, 0.0f, UINT32_MAX - 1000U) &&
-	       imu_processor_update(&first, &ramp, 0.0f, 4000U) &&
+	       /* Wraps past zero: elapsed is IMU_HUMP_TIMEOUT_MS + 1. */
+	       imu_processor_update(&first, &ramp, 0.0f, IMU_HUMP_TIMEOUT_MS - 1000U) &&
 	       first.fsm_state == IMU_STATE_MONITORING;
 }
 
@@ -307,6 +525,7 @@ BOOL imu_processor_test(void)
 	BOOL producer_ok;
 	BOOL accel_ok;
 	BOOL reader_ok;
+	BOOL level_filter_ok;
 	TEST_INIT();
 
 	terrain_ok = terrain_test();
@@ -317,6 +536,7 @@ BOOL imu_processor_test(void)
 	producer_ok = producer_test();
 	accel_ok = accel_decode_test();
 	reader_ok = accel_reader_test();
+	level_filter_ok = level_filter_test();
 	TEST_CHECK("IMU-U01", terrain_ok, "flat, ramp and hump transitions");
 	TEST_CHECK("IMU-U02", safety_ok, "tilt and invalid samples");
 	TEST_CHECK("IMU-U09", pickup_tilt_ok, "pickup roll, low vertical acceleration and tilt latch");
@@ -325,8 +545,9 @@ BOOL imu_processor_test(void)
 	TEST_CHECK("IMU-U04", producer_ok, "typed estimates and odometry validation");
 	TEST_CHECK("IMU-U07", accel_ok, "LSM303DLHC acceleration decoding");
 	TEST_CHECK("IMU-U08", reader_ok, "fresh accelerometer transfer and fault latch");
+	TEST_CHECK("IMU-U11", level_filter_ok, "level calibration offset and terrain pitch filter");
 	TEST_SUMMARY("imu");
 	return terrain_ok && safety_ok && pickup_tilt_ok && hump_height_ok &&
-	       clock_ok && producer_ok && accel_ok && reader_ok;
+	       clock_ok && producer_ok && accel_ok && reader_ok && level_filter_ok;
 }
 #endif

@@ -123,7 +123,7 @@ endif
 
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
-SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic servo encoder line_barcode line barcode
+SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
 $(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
@@ -135,6 +135,9 @@ BARCODE_TEST_MODULE_COUNTS ?= 0
 BARCODE_TEST_BLACK_ADC ?= 1000
 BARCODE_TEST_WHITE_ADC ?= 600
 BARCODE_TEST_DEBOUNCE_COUNTS ?= 4
+# obstacle_width: confirm distance, and optional known object width for calibration.
+OBSTACLE_DETECT_MM ?= 400
+OBSTACLE_TRUE_WIDTH_MM ?= 0
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -147,6 +150,8 @@ else ifeq ($(SENSOR_TEST),imu)
 SENSOR_TEST_VALUE := 2
 else ifeq ($(SENSOR_TEST),ultrasonic)
 SENSOR_TEST_VALUE := 3
+else ifeq ($(SENSOR_TEST),obstacle_width)
+SENSOR_TEST_VALUE := 11
 else ifeq ($(SENSOR_TEST),servo)
 SENSOR_TEST_VALUE := 4
 else ifeq ($(SENSOR_TEST),encoder)
@@ -263,6 +268,10 @@ endif
 ifeq ($(SENSOR_TEST),servo)
 CFLAGS  += -DSERVO_TEST_US=$(SERVO_TEST_US)
 endif
+ifeq ($(SENSOR_TEST),obstacle_width)
+CFLAGS  += -DOBS_WIDTH_TEST_DETECT_MM=$(OBSTACLE_DETECT_MM)U
+CFLAGS  += -DOBS_WIDTH_TEST_TRUE_WIDTH_MM=$(OBSTACLE_TRUE_WIDTH_MM)U
+endif
 CFLAGS  += -DTM_CONSOLE_UART=$(CRASH_REPORT)
 ifeq ($(CRASH_REPORT),0)
 CFLAGS  += -DBOARD_UART0_FREE=1
@@ -298,6 +307,9 @@ endif
 PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
 ifeq ($(SENSOR_TEST),barcode)
 PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BARCODE_TEST_WHITE_ADC)-$(BARCODE_TEST_BLACK_ADC)-debounce$(BARCODE_TEST_DEBOUNCE_COUNTS)
+endif
+ifeq ($(SENSOR_TEST),obstacle_width)
+PROFILE_ID := $(PROFILE_ID)-detect$(OBSTACLE_DETECT_MM)-truewidth$(OBSTACLE_TRUE_WIDTH_MM)
 endif
 PROFILE_FILE := .build_profile
 

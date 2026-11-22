@@ -7,6 +7,7 @@
 #include "subsystem3/line_barcode/line_adc_reader.h"
 #include "subsystem5/obstacle/obs_pico_port.h"
 #include "subsystem5/obstacle/obs_task.h"
+#include "subsystem5/obstacle/obs_width_hwtest.h"
 #include "vehicle_buffers.h"
 #include "vehicle_messages.h"
 
@@ -18,6 +19,7 @@
 #include "subsystem6/odometry/odometry_task.h"
 #elif APP_SENSOR_TEST == 10
 #include "subsystem6/odometry/odometry_producer.h"
+#include "subsystem4/imu/imu_processor_config.h"
 #endif
 
 #if APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6 || APP_SENSOR_TEST == 10
@@ -452,6 +454,11 @@ static void sensor_test_task(INT stacd, void *exinf)
 #define IMU_LIVE_SAMPLE_DELAY_MS 50U
 #define IMU_LIVE_REPORT_INTERVAL_MS 1000U
 #define IMU_LIVE_STARTUP_SAMPLES 5U
+#if APP_SENSOR_TEST == 6
+/* Bench-only re-arm: clear the tilt flag after this long back on level ground. */
+#define IMU_TILT_CLEAR_LEVEL_MS 500U
+#define IMU_TILT_CLEAR_SAMPLES (IMU_TILT_CLEAR_LEVEL_MS / IMU_LIVE_SAMPLE_DELAY_MS)
+#endif
 #if APP_SENSOR_TEST == 2
 #define IMU_PROBE_INTERVAL_MS 20U
 #define IMU_PROBE_READY_WAIT_MS 100U
@@ -700,6 +707,9 @@ static void sensor_test_task(INT stacd, void *exinf)
 	imu_state_t imu;
 	uint32_t last_report_ms = 0U;
 	unsigned startup_samples = 0U;
+#if APP_SENSOR_TEST == 6
+	unsigned level_samples = 0U;
+#endif
 	ER error;
 
 	(void)stacd;
@@ -788,13 +798,19 @@ static void sensor_test_task(INT stacd, void *exinf)
 		report_error_forever("IMU", "tilt processor init", E_SYS);
 	tm_printf((UB*)"[HWTEST][IMU] vehicle reader: CTRL1=0x2f CTRL4=0x80; "
 		  "data-ready gating enabled; sample time is a lower bound\n");
+#if APP_SENSOR_TEST == 6
+	tm_printf((UB*)"[HWTEST][IMU] tilt-only check: flag clears after %u ms level "
+		  "(bench only; vehicle still latches)\n", (unsigned)IMU_TILT_CLEAR_LEVEL_MS);
+#else
 	tm_printf((UB*)"[HWTEST][IMU] tilt-only check: reset on level ground between trials\n");
+#endif
 	for (;;) {
 		accel_data_t sample;
 		SYSTIM now;
 		uint32_t timestamp;
 		bool was_tilted = imu.tilt_detected;
 		bool tilt_latched;
+		bool tilt_cleared = false;
 		bool report_startup = startup_samples < IMU_LIVE_STARTUP_SAMPLES;
 
 		error = lsm303dlhc_i2c_read(&sensor, &sample, &timestamp);
@@ -805,9 +821,26 @@ static void sensor_test_task(INT stacd, void *exinf)
 		if (!imu_processor_update(&imu, &sample, 0.0f, now.lo))
 			report_error_forever("IMU", "tilt processor update", E_SYS);
 		tilt_latched = !was_tilted && imu.tilt_detected;
+#if APP_SENSOR_TEST == 6
+		if (tilt_latched)
+			tm_printf((UB*)"[HWTEST][IMU] TILT DETECTED\n");
+		/* The processor leaves IMU_STATE_TILT once level; re-arm the latch here only. */
+		if (imu.tilt_detected && imu.fsm_state != IMU_STATE_TILT) {
+			if (++level_samples >= IMU_TILT_CLEAR_SAMPLES) {
+				imu.tilt_detected = false;
+				level_samples = 0U;
+				tilt_cleared = true;
+				tm_printf((UB*)"[HWTEST][IMU] TILT CLEARED (level for %u ms)\n",
+					  (unsigned)IMU_TILT_CLEAR_LEVEL_MS);
+			}
+		} else {
+			level_samples = 0U;
+		}
+#else
 		if (tilt_latched)
 			tm_printf((UB*)"[HWTEST][IMU] TILT DETECTED (latched until reset)\n");
-		if (report_startup || tilt_latched ||
+#endif
+		if (report_startup || tilt_latched || tilt_cleared ||
 		    now.lo - last_report_ms >= IMU_LIVE_REPORT_INTERVAL_MS) {
 			if (report_startup) startup_samples++;
 			tm_printf((UB*)"[HWTEST][IMU] vehicle startup_sample=%u "
@@ -844,7 +877,9 @@ static void sensor_test_task(INT stacd, void *exinf)
 	lsm303dlhc_i2c_t sensor = {0};
 	lsm303dlhc_i2c_config_t sensor_config;
 	odometry_producer_t odometry_state = {0};
-	wheel_odometry_message_t odometry;
+	wheel_odometry_message_t odometry = {0};
+	uint32_t last_odometry_ms;
+	bool encoder_faulted = false;
 	encoder_snapshot_t snapshot;
 	accel_data_t warmup_sample;
 	accel_data_t sample;
@@ -876,8 +911,37 @@ static void sensor_test_task(INT stacd, void *exinf)
 		  (int)warmup_sample.raw_y, (int)warmup_sample.raw_z);
 	error = tk_dly_tsk(IMU_HUMP_TEST_SAMPLE_DELAY_MS);
 	if (error != E_OK) report_error_forever("IMU-HUMP", "warm-up delay", error);
-	if (!imu_processor_init(&imu))
+	/* Same processor setup and startup calibration as the vehicle IMU task. */
+	if (!imu_processor_init_vehicle(&imu))
 		report_error_forever("IMU-HUMP", "processor init", E_SYS);
+
+	{
+		imu_level_calibrator_t calibrator;
+		imu_level_result_t result = IMU_LEVEL_INCOMPLETE;
+
+		tm_printf((UB*)"[HWTEST][IMU-H02] level calibration: keep the robot still "
+			  "on flat ground for about 1 s\n");
+		while (result != IMU_LEVEL_OK) {
+			imu_level_calibrator_reset(&calibrator);
+			while (!imu_level_calibrator_full(&calibrator)) {
+				error = lsm303dlhc_i2c_read(&sensor, &sample, &sample_timestamp);
+				if (error != E_OK) report_error_forever("IMU-HUMP", "level read", error);
+				if (!imu_level_calibrator_add(&calibrator, &sample))
+					report_error_forever("IMU-HUMP", "level sample", E_PAR);
+				error = tk_dly_tsk(IMU_HUMP_TEST_SAMPLE_DELAY_MS);
+				if (error != E_OK) report_error_forever("IMU-HUMP", "level delay", error);
+			}
+			result = imu_processor_apply_level(&imu, &calibrator);
+			if (result != IMU_LEVEL_OK)
+				tm_printf((UB*)"[HWTEST][IMU-H02] level calibration %s; retrying\n",
+					  result == IMU_LEVEL_MOVING ? "saw movement" : "found it not level");
+		}
+		tm_printf((UB*)"[HWTEST][IMU-H02] level offsets: pitch_mdeg=%ld roll_mdeg=%ld "
+			  "(removed from every reading); mount_yaw_mdeg=%ld\n",
+			  (long)(imu.pitch_offset_deg * 1000.0f),
+			  (long)(imu.roll_offset_deg * 1000.0f),
+			  (long)(IMU_MOUNT_YAW_DEG * 1000.0f));
+	}
 
 	error = encoder_source_snapshot(&snapshot);
 	if (error != E_OK || !snapshot.valid)
@@ -890,10 +954,16 @@ static void sensor_test_task(INT stacd, void *exinf)
 		report_error_forever("IMU-HUMP", "odometry init", E_SYS);
 
 	last_report_ms = now.lo;
-	tm_printf((UB*)"[HWTEST][IMU-H02] odometry counts/rev=%u wheel_circumference_cm=%.1f "
+	last_odometry_ms = now.lo;
+	/* tm_printf has no %f support; print the circumference in millimetres. */
+	tm_printf((UB*)"[HWTEST][IMU-H02] odometry counts/rev=%u wheel_circumference_mm=%u "
 		  "left_sign=-1 right_sign=+1\n",
 		  (unsigned)IMU_HUMP_TEST_COUNTS_PER_REV,
-		  (double)IMU_HUMP_TEST_WHEEL_CIRC_CM);
+		  (unsigned)(IMU_HUMP_TEST_WHEEL_CIRC_CM * 10.0f + 0.5f));
+	tm_printf((UB*)"[HWTEST][IMU-H02] geometry: track_W_mm=%u wheelbase_L_mm=%u; "
+		  "heights below are in 0.1 mm (100 = 1 cm)\n",
+		  (unsigned)(IMU_TRACK_WIDTH_M * 1000.0f + 0.5f),
+		  (unsigned)(IMU_WHEELBASE_M * 1000.0f + 0.5f));
 	tm_printf((UB*)"[HWTEST][IMU-H02] motors are not started; keep motor power off. "
 		  "Push straight forward over a known gentle ramp.\n");
 	for (;;) {
@@ -902,12 +972,25 @@ static void sensor_test_task(INT stacd, void *exinf)
 		error = tk_get_otm(&now);
 		if (error != E_OK) report_error_forever("IMU-HUMP", "clock", error);
 		error = encoder_source_snapshot(&snapshot);
-		if (error != E_OK || !snapshot.valid)
-			report_error_forever("IMU-HUMP", "encoder snapshot",
-					     error != E_OK ? error : E_IO);
-		if (!odometry_producer_update(&odometry_state, snapshot.left_count,
-					      snapshot.right_count, now.lo, &odometry))
-			report_error_forever("IMU-HUMP", "odometry update", E_SYS);
+		if (error != E_OK)
+			report_error_forever("IMU-HUMP", "encoder snapshot", error);
+		/* A missed quadrature edge (e.g. a wheel jolting off the ramp) latches
+		 * the encoder invalid until restart. The hump height does not use
+		 * odometry, so freeze travel_mm and keep measuring. */
+		if (!snapshot.valid && !encoder_faulted) {
+			encoder_faulted = true;
+			tm_printf((UB*)"[HWTEST][IMU-H02] encoder fault latched (missed edge); "
+				  "travel_mm frozen at %ld, height measurement continues\n",
+				  (long)odometry.distance_mm);
+		}
+		/* The kernel clock ticks every 10 ms and the producer rejects a repeated
+		 * timestamp, so keep the previous distance until the clock advances. */
+		if (!encoder_faulted && now.lo != last_odometry_ms) {
+			if (!odometry_producer_update(&odometry_state, snapshot.left_count,
+						      snapshot.right_count, now.lo, &odometry))
+				report_error_forever("IMU-HUMP", "odometry update", E_SYS);
+			last_odometry_ms = now.lo;
+		}
 		if (!imu_processor_update(&imu, &sample,
 					  (float)odometry.distance_mm / 1000.0f, now.lo))
 			report_error_forever("IMU-HUMP", "processor update", E_SYS);
@@ -915,16 +998,19 @@ static void sensor_test_task(INT stacd, void *exinf)
 		if (!have_report ||
 		    (uint32_t)(now.lo - last_report_ms) >= IMU_HUMP_TEST_REPORT_INTERVAL_MS ||
 		    (uint8_t)imu.fsm_state != last_state) {
-			tm_printf((UB*)"[HWTEST][IMU-H02] t=%u travel_mm=%ld pitch_mdeg=%ld "
-				  "roll_mdeg=%ld sample_age_ms=%u state=%u hump_active=%u "
-				  "rise_mm=%ld peak_mm=%ld tilt=%u\n",
+			tm_printf((UB*)"[HWTEST][IMU-H02] t=%u travel_mm=%ld "
+				  "pitch_mdeg=%ld roll_mdeg=%ld "
+				  "left=%ld right=%ld ball=%ld "
+				  "state=%u hump=%ld peak=%ld tilt=%u\n",
 				  (unsigned)now.lo, (long)odometry.distance_mm,
-				  (long)(imu.current_pitch_deg * 1000.0f),
-				  (long)(imu.current_roll_deg * 1000.0f),
-				  (unsigned)(now.lo - sample_timestamp),
-				  (unsigned)imu.fsm_state, imu.hump_active ? 1U : 0U,
-				  (long)(imu.current_hump_m * 1000.0f),
-				  (long)(imu.hump_peak_m * 1000.0f),
+				  (long)(imu.terrain_pitch_deg * 1000.0f),
+				  (long)(imu.terrain_roll_deg * 1000.0f),
+				  (long)(imu.wheel_left_m * 10000.0f),
+				  (long)(imu.wheel_right_m * 10000.0f),
+				  (long)(imu.ball_m * 10000.0f),
+				  (unsigned)imu.fsm_state,
+				  (long)(imu.current_hump_m * 10000.0f),
+				  (long)(imu.hump_peak_m * 10000.0f),
 				  imu.tilt_detected ? 1U : 0U);
 			last_report_ms = now.lo;
 			last_state = (uint8_t)imu.fsm_state;
@@ -1029,6 +1115,14 @@ static void sensor_test_task(INT stacd, void *exinf)
 		  (unsigned)in_w(SERVO_TEST_SLICE_BASE + PWM_CHx_CC));
 #endif
 	tk_slp_tsk(TMO_FEVR);
+}
+#elif APP_SENSOR_TEST == 11
+/* Obstacle width measurement; body in subsystem5/obstacle/obs_width_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	obs_width_hwtest_run();
 }
 #else
 #error Unsupported APP_SENSOR_TEST diagnostic

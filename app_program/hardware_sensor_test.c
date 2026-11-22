@@ -8,6 +8,8 @@
 #include "subsystem5/obstacle/obs_pico_port.h"
 #include "subsystem5/obstacle/obs_task.h"
 #include "subsystem5/obstacle/obs_width_hwtest.h"
+#include "subsystem2/motion/spin_heading_hwtest.h"
+#include "subsystem2/motion/motor_moves_hwtest.h"
 #include "vehicle_buffers.h"
 #include "vehicle_messages.h"
 
@@ -1123,6 +1125,22 @@ static void sensor_test_task(INT stacd, void *exinf)
 	(void)stacd;
 	(void)exinf;
 	obs_width_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 12
+/* Turn-in-place heading test (DRIVES MOTORS); subsystem2/motion/spin_heading_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	spin_heading_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 13
+/* Manoeuvres + wheel balance (DRIVES MOTORS); subsystem2/motion/motor_moves_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	motor_moves_hwtest_run();
 }
 #else
 #error Unsupported APP_SENSOR_TEST diagnostic

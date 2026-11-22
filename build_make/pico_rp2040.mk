@@ -123,7 +123,7 @@ endif
 
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
-SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width servo encoder line_barcode line barcode
+SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
 $(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
@@ -138,6 +138,19 @@ BARCODE_TEST_DEBOUNCE_COUNTS ?= 4
 # obstacle_width: confirm distance, and optional known object width for calibration.
 OBSTACLE_DETECT_MM ?= 400
 OBSTACLE_TRUE_WIDTH_MM ?= 0
+# spin_heading (DRIVES MOTORS): wheel track and turning PWM percentages.
+SPIN_TRACK_MM ?= 110
+SPIN_PWM ?= 40
+SPIN_PWM_SLOW ?= 30
+SPIN_RIGHT_TRIM ?= 0
+# motor_moves (DRIVES MOTORS): open-loop PWM %, per-wheel trim %, straight
+# distance, wheel track and inner-wheel share % for the arcs.
+MOVE_PWM ?= 50
+MOVE_TRIM_L ?= 100
+MOVE_TRIM_R ?= 100
+MOVE_DIST_MM ?= 500
+MOVE_TRACK_MM ?= 110
+MOVE_ARC_INNER ?= 50
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -152,6 +165,10 @@ else ifeq ($(SENSOR_TEST),ultrasonic)
 SENSOR_TEST_VALUE := 3
 else ifeq ($(SENSOR_TEST),obstacle_width)
 SENSOR_TEST_VALUE := 11
+else ifeq ($(SENSOR_TEST),spin_heading)
+SENSOR_TEST_VALUE := 12
+else ifeq ($(SENSOR_TEST),motor_moves)
+SENSOR_TEST_VALUE := 13
 else ifeq ($(SENSOR_TEST),servo)
 SENSOR_TEST_VALUE := 4
 else ifeq ($(SENSOR_TEST),encoder)
@@ -272,6 +289,14 @@ ifeq ($(SENSOR_TEST),obstacle_width)
 CFLAGS  += -DOBS_WIDTH_TEST_DETECT_MM=$(OBSTACLE_DETECT_MM)U
 CFLAGS  += -DOBS_WIDTH_TEST_TRUE_WIDTH_MM=$(OBSTACLE_TRUE_WIDTH_MM)U
 endif
+ifeq ($(SENSOR_TEST),spin_heading)
+CFLAGS  += -DSPIN_TRACK_MM=$(SPIN_TRACK_MM)U -DSPIN_PWM=$(SPIN_PWM)U -DSPIN_PWM_SLOW=$(SPIN_PWM_SLOW)U
+CFLAGS  += -DSPIN_RIGHT_TRIM=$(SPIN_RIGHT_TRIM)
+endif
+ifeq ($(SENSOR_TEST),motor_moves)
+CFLAGS  += -DMOVE_PWM=$(MOVE_PWM)U -DMOVE_TRIM_L=$(MOVE_TRIM_L)U -DMOVE_TRIM_R=$(MOVE_TRIM_R)U
+CFLAGS  += -DMOVE_DIST_MM=$(MOVE_DIST_MM)U -DMOVE_TRACK_MM=$(MOVE_TRACK_MM)U -DMOVE_ARC_INNER=$(MOVE_ARC_INNER)U
+endif
 CFLAGS  += -DTM_CONSOLE_UART=$(CRASH_REPORT)
 ifeq ($(CRASH_REPORT),0)
 CFLAGS  += -DBOARD_UART0_FREE=1
@@ -310,6 +335,12 @@ PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BAR
 endif
 ifeq ($(SENSOR_TEST),obstacle_width)
 PROFILE_ID := $(PROFILE_ID)-detect$(OBSTACLE_DETECT_MM)-truewidth$(OBSTACLE_TRUE_WIDTH_MM)
+endif
+ifeq ($(SENSOR_TEST),spin_heading)
+PROFILE_ID := $(PROFILE_ID)-track$(SPIN_TRACK_MM)-pwm$(SPIN_PWM)-$(SPIN_PWM_SLOW)-trim$(SPIN_RIGHT_TRIM)
+endif
+ifeq ($(SENSOR_TEST),motor_moves)
+PROFILE_ID := $(PROFILE_ID)-pwm$(MOVE_PWM)-trim$(MOVE_TRIM_L)-$(MOVE_TRIM_R)-dist$(MOVE_DIST_MM)-track$(MOVE_TRACK_MM)-arc$(MOVE_ARC_INNER)
 endif
 PROFILE_FILE := .build_profile
 

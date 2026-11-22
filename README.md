@@ -635,6 +635,31 @@ because off-axis echoes read 10-20 mm longer. On the bench that weak cue was
 right in 5 of 6 off-centre scans and fell back to CENTRE in the sixth, never
 the wrong side.
 
+Because the beam is wider than the servo sweep, width will be measured by
+turning the whole robot in place (spin scan). Step 1 is
+`make SENSOR_TEST=spin_heading` (**drives the motors**): with the robot on
+the floor, each press of the GO button (GP20) turns it in place to the next
+heading in L30, 0, R30, 0, L60, 0, R60, 0, L90, 0, R90, 0 and one full left
+turn, using wheel encoders only (heading = (right − left wheel travel) / track;
+the IMU has no gyro). It prints where it braked and settled; compare with tape
+marks to tune the effective track width (`SPIN_TRACK_MM`, ruler 110) and
+turning power (`SPIN_PWM`, `SPIN_PWM_SLOW`, defaults 40 % and 30 %).
+Pressing GO during a turn stops it; a timeout, stall, wrong-way turn or
+overtravel past 135 degrees also stops the motors and ends the test.
+
+For basic driving, `make SENSOR_TEST=motor_moves` (**drives the motors**)
+runs open loop at a fixed PWM and uses the encoders only to measure each
+wheel. The first GO press runs a wheel-balance sweep at 25/40/55/70 % with
+the robot on a block, wheels in the air. Each later press runs one floor move:
+forward and reverse `MOVE_DIST_MM` (500), spin left 90, spin right 90, spin 180,
+then forward + right and forward + left 90-degree arcs (inner wheel at
+`MOVE_ARC_INNER` %, default 50). Each step prints per-wheel travel and steady
+speed, which wheel is faster and by how much, and a suggested
+`MOVE_TRIM_L`/`MOVE_TRIM_R` (% scale on that wheel, default 100). Rebuild with
+those values to confirm, e.g.
+`make SENSOR_TEST=motor_moves MOVE_PWM=50 MOVE_TRIM_R=94`. GO during a move,
+a timeout, a stalled wheel or a wheel turning the wrong way stops the test.
+
 The opt-in application WiFi service supports simulated callbacks or an outbound
 MQTT bridge backend.
 The template's built-in `cyw43_utk_task` owns CYW43, lwIP and MQTT; neither the
@@ -769,7 +794,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

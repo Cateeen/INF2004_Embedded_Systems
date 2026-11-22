@@ -222,10 +222,18 @@ make SENSOR_TEST=barcode -j8    # flash *_sensor_barcode.uf2
 Keep motor power disconnected. The line-only image samples GP27 and GP26
 and prints `LOST`, `LEFT`, `RIGHT`, or `JUNCTION`; the wheels can stay still.
 The barcode-only image samples GP28 and reads the encoders directly. It
-doesn't start line tracking. Start on white space and slowly roll both
+normalizes the observed encoder polarities (left -1, right +1) before
+averaging: negative raw left and positive raw right counts now add rather
+than cancel. The console still shows raw `left`/`right` counts and also
+the normalized `mean` used for decoding. The wheels are mirror-mounted, so the
+vehicle (`VEHICLE_LEFT_SIGN`/`VEHICLE_RIGHT_SIGN` in `app_main.c`) and the
+combined diagnostic use the same signs.
+It doesn't start line tracking. Start on white space and slowly roll both
 wheels over one known Code 39 label (for example, data `AB`, with no optional
 check digit). The console reports the decode or character rejection reason
-and measured widths in encoder counts. `narrow_max` should be clearly below
+and measured widths in encoder counts. Each completed character also prints
+its nine bar/space widths and the `n`/`w` pattern they were classified as.
+`narrow_max` should be clearly below
 `wide_min`; if they overlap, try a slower, steadier pass or a larger print.
 
 The barcode image defaults to calibration mode: it accepts nonzero run

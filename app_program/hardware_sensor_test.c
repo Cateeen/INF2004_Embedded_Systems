@@ -107,7 +107,7 @@ static void sensor_test_task(INT stacd, void *exinf)
 #define LINE_BARCODE_TEST_COUNTS_PER_MODULE 250U
 
 static const odometry_producer_config_t s_line_barcode_odometry_config = {
-	{2500U, 20.4f}, {2500U, 20.4f}, 1, 1
+	{2500U, 20.4f}, {2500U, 20.4f}, -1, 1
 };
 
 static const line_barcode_task_config_t s_line_barcode_task_config = {
@@ -312,6 +312,14 @@ static void report_bench_barcode(void)
 			  info.symbol ? info.symbol : '?', barcode_reject_name(info.reject),
 			  (int)info.direction, (unsigned)info.narrow_max, (unsigned)info.wide_min,
 			  (unsigned)info.gap_counts, (unsigned)info.offending_counts);
+		if (info.run_count == BARCODE_ELEMENTS)
+			tm_printf((UB*)"[HWTEST][BAR-H02]   pattern=%s widths=%u %u %u %u %u %u %u %u %u\n",
+				  info.raw_pattern[0] ? info.raw_pattern : "?",
+				  (unsigned)info.run_counts[0], (unsigned)info.run_counts[1],
+				  (unsigned)info.run_counts[2], (unsigned)info.run_counts[3],
+				  (unsigned)info.run_counts[4], (unsigned)info.run_counts[5],
+				  (unsigned)info.run_counts[6], (unsigned)info.run_counts[7],
+				  (unsigned)info.run_counts[8]);
 	}
 	if (barcode_scanner_take_result(&s_bench_scanner, payload, BARCODE_MAX_PAYLOAD, &length)) {
 		barcode_scanner_config_t suggested;
@@ -339,7 +347,7 @@ static void sensor_test_task(INT stacd, void *exinf)
 	if (error == E_OK) error = gpio_dispatcher_start();
 	if (error != E_OK) report_error_forever("BAR-H02", "encoder startup", error);
 	tm_printf((UB*)"[HWTEST][BAR-H02] GP28 barcode; keep motor power off; "
-		  "module_counts=%u (0 = learn from a scan)\n",
+		  "module_counts=%u (0 = learn from a scan); encoder signs: left=-1 right=+1\n",
 		  (unsigned)BARCODE_TEST_MODULE_COUNTS);
 	for (;;) {
 		ir_readings_t readings;
@@ -352,8 +360,8 @@ static void sensor_test_task(INT stacd, void *exinf)
 		error = encoder_source_snapshot(&snapshot);
 		if (error != E_OK || !snapshot.valid)
 			report_error_forever("BAR-H02", "encoder snapshot", error != E_OK ? error : E_IO);
-		/* Same wheel polarities as the vehicle calibration (+1, +1). */
-		count = (int32_t)(((int64_t)snapshot.left_count + snapshot.right_count) / 2);
+		/* Straight travel gives negative raw left counts and positive right counts. */
+		count = (int32_t)((-(int64_t)snapshot.left_count + snapshot.right_count) / 2);
 		if (!initialized) {
 			initialized = barcode_scanner_init(&s_bench_scanner, &s_bench_barcode_config,
 							   readings.barcode.black, count);
@@ -365,9 +373,9 @@ static void sensor_test_task(INT stacd, void *exinf)
 		if (!s_bench_scanner.collecting && !s_bench_scanner.in_frame &&
 		    timestamp - last_report >= SENSOR_TEST_INTERVAL_MS) {
 			last_report = timestamp;
-			tm_printf((UB*)"[HWTEST][BAR-H02] adc=%u black=%u left=%d right=%d\n",
+			tm_printf((UB*)"[HWTEST][BAR-H02] adc=%u black=%u left=%d right=%d mean=%d\n",
 				  (unsigned)readings.barcode.raw, readings.barcode.black ? 1U : 0U,
-				  (int)snapshot.left_count, (int)snapshot.right_count);
+				  (int)snapshot.left_count, (int)snapshot.right_count, (int)count);
 		}
 		error = tk_dly_tsk(10U);
 		if (error != E_OK) report_error_forever("BAR-H02", "delay", error);

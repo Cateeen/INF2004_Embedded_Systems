@@ -134,7 +134,9 @@ static BOOL go_button_test(void)
 /* Odometry calibration, verified with ODO-H01 (encoder bring-up). */
 #define VEHICLE_COUNTS_PER_REV		2500U
 #define VEHICLE_WHEEL_CIRC_CM		20.4f
-#define VEHICLE_LEFT_SIGN		1
+/* Wheels are mirror-mounted: the left encoder counts down when driving
+ * forward (verified with BAR-H02), so it is negated. */
+#define VEHICLE_LEFT_SIGN		(-1)
 #define VEHICLE_RIGHT_SIGN		1
 
 static go_button_t s_go_button;

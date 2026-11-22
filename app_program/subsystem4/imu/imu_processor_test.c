@@ -55,6 +55,56 @@ static BOOL safety_test(void)
 	       !imu_processor_init(NULL);
 }
 
+static BOOL pickup_tilt_test(void)
+{
+	imu_state_t state;
+	const accel_data_t flat = {.az = GRAVITY_MS2};
+	const accel_data_t ramp = {.ax = -1.4f, .az = 9.70f};
+	const accel_data_t picked_up = {.ay = 2.8f, .az = 9.4f};
+	const accel_data_t low_az = {.az = 6.4f};
+
+	return imu_processor_init(&state) &&
+	       imu_processor_update(&state, &flat, 0.0f, 10U) &&
+	       !state.tilt_detected &&
+	       imu_processor_update(&state, &ramp, 0.0f, 20U) &&
+	       state.hump_active &&
+	       imu_processor_update(&state, &picked_up, 0.0f, 30U) &&
+	       state.fsm_state == IMU_STATE_TILT && state.tilt_detected &&
+	       !state.hump_active &&
+	       imu_processor_update(&state, &flat, 0.0f, 40U) &&
+	       state.fsm_state == IMU_STATE_MONITORING && state.tilt_detected &&
+	       imu_processor_init(&state) &&
+	       imu_processor_update(&state, &low_az, 0.0f, 50U) &&
+	       state.fsm_state == IMU_STATE_TILT && state.tilt_detected;
+}
+
+static BOOL hump_height_test(void)
+{
+	imu_state_t state;
+	const accel_data_t flat = {.az = GRAVITY_MS2};
+	const accel_data_t ramp_30_deg = {.ax = -4.903325f, .az = 8.492808f};
+
+	if (!imu_processor_init(&state) ||
+	    !imu_processor_update(&state, &ramp_30_deg, 0.0f, 10U) ||
+	    state.fsm_state != IMU_STATE_HUMP_RISING ||
+	    !imu_processor_update(&state, &ramp_30_deg, 0.10f, 20U) ||
+	    state.current_hump_m < 0.049f || state.current_hump_m > 0.051f ||
+	    !imu_processor_update(&state, &ramp_30_deg, 0.20f, 30U) ||
+	    !imu_processor_update(&state, &flat, 0.20f, 40U) ||
+	    state.fsm_state != IMU_STATE_HUMP_FALLING ||
+	    state.hump_peak_m < 0.099f || state.hump_peak_m > 0.101f ||
+	    ((state.packed_telemetry >> 6U) & 0x3FU) != 40U ||
+	    !imu_processor_update(&state, &flat, 0.20f, 50U) ||
+	    state.fsm_state != IMU_STATE_MONITORING)
+		return false;
+
+	return imu_processor_init(&state) &&
+	       imu_processor_update(&state, &ramp_30_deg, 0.0f, 100U) &&
+	       imu_processor_update(&state, &ramp_30_deg, 0.20f, 5101U) &&
+	       state.fsm_state == IMU_STATE_MONITORING && !state.hump_active &&
+	       state.current_hump_m == 0.0f && state.hump_peak_m == 0.0f;
+}
+
 static BOOL clock_test(void)
 {
 	imu_state_t first;
@@ -251,6 +301,8 @@ BOOL imu_processor_test(void)
 {
 	BOOL terrain_ok;
 	BOOL safety_ok;
+	BOOL pickup_tilt_ok;
+	BOOL hump_height_ok;
 	BOOL clock_ok;
 	BOOL producer_ok;
 	BOOL accel_ok;
@@ -259,17 +311,22 @@ BOOL imu_processor_test(void)
 
 	terrain_ok = terrain_test();
 	safety_ok = safety_test();
+	pickup_tilt_ok = pickup_tilt_test();
+	hump_height_ok = hump_height_test();
 	clock_ok = clock_test();
 	producer_ok = producer_test();
 	accel_ok = accel_decode_test();
 	reader_ok = accel_reader_test();
 	TEST_CHECK("IMU-U01", terrain_ok, "flat, ramp and hump transitions");
 	TEST_CHECK("IMU-U02", safety_ok, "tilt and invalid samples");
+	TEST_CHECK("IMU-U09", pickup_tilt_ok, "pickup roll, low vertical acceleration and tilt latch");
+	TEST_CHECK("IMU-U10", hump_height_ok, "known ramp height, telemetry quantization and timeout");
 	TEST_CHECK("IMU-U03", clock_ok, "independent timeouts and clock wrap");
 	TEST_CHECK("IMU-U04", producer_ok, "typed estimates and odometry validation");
 	TEST_CHECK("IMU-U07", accel_ok, "LSM303DLHC acceleration decoding");
 	TEST_CHECK("IMU-U08", reader_ok, "fresh accelerometer transfer and fault latch");
 	TEST_SUMMARY("imu");
-	return terrain_ok && safety_ok && clock_ok && producer_ok && accel_ok && reader_ok;
+	return terrain_ok && safety_ok && pickup_tilt_ok && hump_height_ok &&
+	       clock_ok && producer_ok && accel_ok && reader_ok;
 }
 #endif

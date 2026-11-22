@@ -48,6 +48,7 @@ typedef struct
     int8_t direction;
     bool in_frame;
     bool aborted_frame;
+    bool label_reversed;
     uint8_t run_count;
     uint32_t run_counts[BARCODE_ELEMENTS];
     char raw_pattern[BARCODE_PATTERN_LENGTH];
@@ -88,6 +89,7 @@ typedef struct
     bool result_ready;
     int32_t last_encoder_count;
     int8_t scan_direction;
+    bool label_reversed;   /* frame started from a backwards '*' */
     uint32_t run_counts[BARCODE_ELEMENTS];
     uint8_t run_count;
     uint8_t payload[BARCODE_MAX_PAYLOAD];

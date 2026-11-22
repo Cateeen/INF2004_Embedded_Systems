@@ -123,7 +123,7 @@ endif
 
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
-SENSOR_TEST_MODES := none ir imu imu_tilt ultrasonic servo encoder line_barcode line barcode
+SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
 $(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
@@ -132,6 +132,9 @@ $(error Unknown SENSOR_TEST '$(SENSOR_TEST)'; use one of: $(SENSOR_TEST_MODES))
 endif
 SERVO_TEST_US ?= 0
 BARCODE_TEST_MODULE_COUNTS ?= 0
+BARCODE_TEST_BLACK_ADC ?= 1000
+BARCODE_TEST_WHITE_ADC ?= 600
+BARCODE_TEST_DEBOUNCE_COUNTS ?= 4
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -150,6 +153,8 @@ else ifeq ($(SENSOR_TEST),encoder)
 SENSOR_TEST_VALUE := 5
 else ifeq ($(SENSOR_TEST),imu_tilt)
 SENSOR_TEST_VALUE := 6
+else ifeq ($(SENSOR_TEST),imu_hump)
+SENSOR_TEST_VALUE := 10
 else ifeq ($(SENSOR_TEST),line_barcode)
 SENSOR_TEST_VALUE := 7
 else ifeq ($(SENSOR_TEST),line)
@@ -251,6 +256,9 @@ CFLAGS  += -DAPP_VEHICLE=$(VEHICLE)
 CFLAGS  += -DAPP_SENSOR_TEST=$(SENSOR_TEST_VALUE)
 ifeq ($(SENSOR_TEST),barcode)
 CFLAGS  += -DBARCODE_TEST_MODULE_COUNTS=$(BARCODE_TEST_MODULE_COUNTS)
+CFLAGS  += -DBARCODE_TEST_BLACK_ADC=$(BARCODE_TEST_BLACK_ADC)
+CFLAGS  += -DBARCODE_TEST_WHITE_ADC=$(BARCODE_TEST_WHITE_ADC)
+CFLAGS  += -DBARCODE_TEST_DEBOUNCE_COUNTS=$(BARCODE_TEST_DEBOUNCE_COUNTS)
 endif
 ifeq ($(SENSOR_TEST),servo)
 CFLAGS  += -DSERVO_TEST_US=$(SERVO_TEST_US)
@@ -289,7 +297,7 @@ endif
 
 PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
 ifeq ($(SENSOR_TEST),barcode)
-PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)
+PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BARCODE_TEST_WHITE_ADC)-$(BARCODE_TEST_BLACK_ADC)-debounce$(BARCODE_TEST_DEBOUNCE_COUNTS)
 endif
 PROFILE_FILE := .build_profile
 

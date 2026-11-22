@@ -196,9 +196,21 @@ barcode acquisition using the same operating clock as odometry. It stops on stal
 out-of-sequence odometry, unsynchronized barcode edges, read or delivery errors,
 and retries fault delivery. Consumers must also fail safe on stale data when a
 fault cannot be delivered. The scanner uses the mean of polarity-normalized
-wheel count changes, so compatible wheel count scales are required. Tests use
+wheel count changes, so compatible wheel count scales are required. It
+classifies bars and spaces separately (Code 39 has either 2 wide bars and 1
+wide space, or 3 wide spaces), so a sensor that reads bars consistently
+thinner than spaces still decodes. The label can face either way: a start
+character that only reads as `*` backwards starts a reversed frame, the stop
+`*` must then also read backwards, and the payload is returned in label
+order (`label=reversed` in the barcode diagnostic). Tests use
 simulated samples; sensor thresholds, encoder direction, sampling/odometry
 timing and barcode behavior must be verified on hardware before use.
+Vehicle startup uses 35 counts per module for the tested label, but does not
+yet use the barcode-only diagnostic's hysteresis, distance debounce, or 2 ms
+sampling. Its 20 ms samples and 50 ms odometry updates can also fault on
+unsynchronized edges. The successful bench scan does not establish that the
+vehicle barcode path works, and the vehicle currently has no barcode-event
+consumer.
 `line_adc_reader_start_task()` optionally binds the actual ADC reader to the
 line/barcode task; ADC open and pin setup occur inside that task. It requires
 caller-supplied channel selection, thresholds, polarity and timing limits.
@@ -232,9 +244,21 @@ It doesn't start line tracking. Start on white space and slowly roll both
 wheels over one known Code 39 label (for example, data `AB`, with no optional
 check digit). The console reports the decode or character rejection reason
 and measured widths in encoder counts. Each completed character also prints
-its nine bar/space widths and the `n`/`w` pattern they were classified as.
+its nine bar/space widths, the `n`/`w` pattern they were classified as, and
+the ADC range seen since the previous character.
 `narrow_max` should be clearly below
 `wide_min`; if they overlap, try a slower, steadier pass or a larger print.
+
+The barcode-only image samples every 2 ms and uses hysteresis: a reading at
+or above `BARCODE_TEST_BLACK_ADC` (default 1000) is black, one at or below
+`BARCODE_TEST_WHITE_ADC` (default 600) is white, and readings in between keep
+the previous colour. A colour change is also only accepted once the encoders
+have moved `BARCODE_TEST_DEBOUNCE_COUNTS` (default 4) with the new colour held;
+the edge is placed where the change began, so widths are not shifted. Very
+short widths (a few counts) inside a character mean
+the edges are still noisy. Pick values that sit well inside the logged
+`adc_min`/`adc_max`, for example
+`make SENSOR_TEST=barcode BARCODE_TEST_WHITE_ADC=500 BARCODE_TEST_BLACK_ADC=1200 -j8`.
 
 The barcode image defaults to calibration mode: it accepts nonzero run
 widths, retains the wide/narrow separation check, and allows gaps up to
@@ -484,9 +508,10 @@ vehicle's data-ready-gated reader with a requested 50 ms delay. `t_lower` is
 the conservative timestamp lower bound, and `age_bound` is its age measured
 immediately before printing; neither is an exact acquisition time. The standalone test does not
 run the IMU task's 200 ms age check or test controller disarming. The live
-reader feeds the production IMU processor with zero travel (no hump-height
-measurement). The live reader prints its first five samples after reopening
-the sensor (`startup_sample=1` through `5`), then reports about once per
+`imu` and `imu_tilt` feed the production IMU processor with zero travel (no
+hump-height measurement); use `SENSOR_TEST=imu_hump` for the live
+accelerometer-plus-odometry check. The live reader prints its first five
+samples after reopening the sensor (`startup_sample=1` through `5`), then reports about once per
 second (`startup_sample=0`) without slowing the sampling loop. When the flag
 first latches, `TILT DETECTED` and the triggering reading print immediately.
 With motor power
@@ -504,6 +529,16 @@ It then evaluates every reading, prints the first five evaluated samples, and
 continues logging about once per second. The vehicle IMU task is unchanged.
 With motor power disconnected, wait for `tilt_detected=0` on level ground
 before lifting. Reset on level ground between trials.
+
+For a physical hump-height check, build `make SENSOR_TEST=imu_hump`. With motor
+power disconnected, it reads the IMU and wheel encoders but does not start a
+motor task. The serial output reports travel, pitch, roll, current rise and
+peak rise in millimeters. The diagnostic currently assumes 2500 encoder counts
+per revolution, 20.4 cm wheel circumference, and left/right signs -1/+1; verify
+these against the robot before trusting the height. Reset on level ground for
+each trial, then push straight and steadily over a known gentle ramp. Keep the
+robot below 35 degrees pitch and 15 degrees roll, and compare `peak_mm` with
+the ramp's ruler-measured vertical rise.
 
 For a manual GP15 servo check, build `make SENSOR_TEST=servo`: this default
 image emits no servo PWM. To command a single pulse width, build, for example,
@@ -662,7 +697,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `ultrasonic`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line` and `barcode` are independent, motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, and `imu_hump` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

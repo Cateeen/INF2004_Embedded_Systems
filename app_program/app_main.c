@@ -196,8 +196,8 @@ static void vehicle_start(void)
 	static const line_barcode_task_config_t line_config = {
 		20U,	/* period_ms */
 		200U,	/* odometry_max_age_ms */
-		/* counts_per_module must be calibrated to the printed code. */
-		{250U, 25U, 0U, 0U, 0U},
+		/* Bench-calibrated for the tested printed code. */
+		{35U, 25U, 0U, 0U, 0U},
 		NULL, NULL, NULL	/* reader installed by the ADC helper */
 	};
 	static const imu_task_config_t imu_config = {

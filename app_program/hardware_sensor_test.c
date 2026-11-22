@@ -16,9 +16,11 @@
 
 #if APP_SENSOR_TEST == 7
 #include "subsystem6/odometry/odometry_task.h"
+#elif APP_SENSOR_TEST == 10
+#include "subsystem6/odometry/odometry_producer.h"
 #endif
 
-#if APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6
+#if APP_SENSOR_TEST == 2 || APP_SENSOR_TEST == 6 || APP_SENSOR_TEST == 10
 #include "subsystem4/imu/imu_processor.h"
 #endif
 
@@ -290,6 +292,54 @@ static void sensor_test_task(INT stacd, void *exinf)
 _Static_assert(BARCODE_TEST_MODULE_COUNTS >= 0 &&
 	       BARCODE_TEST_MODULE_COUNTS <= UINT32_MAX,
 	       "BARCODE_TEST_MODULE_COUNTS must be 0 or a positive 32-bit count");
+_Static_assert(BARCODE_TEST_WHITE_ADC >= 0 &&
+	       BARCODE_TEST_WHITE_ADC < BARCODE_TEST_BLACK_ADC &&
+	       BARCODE_TEST_BLACK_ADC <= 4095,
+	       "barcode ADC thresholds need 0 <= WHITE < BLACK <= 4095");
+_Static_assert(BARCODE_TEST_DEBOUNCE_COUNTS >= 0,
+	       "BARCODE_TEST_DEBOUNCE_COUNTS must not be negative");
+
+/* Hysteresis: the colour only changes once the reading clearly passes the
+ * opposite threshold, so noise on a slow bar edge cannot add extra runs. */
+static bool bench_barcode_black(uint16_t raw, bool previous)
+{
+	if (raw >= BARCODE_TEST_BLACK_ADC) return true;
+	if (raw <= BARCODE_TEST_WHITE_ADC) return false;
+	return previous;
+}
+
+static uint16_t s_bench_adc_min = UINT16_MAX;
+static uint16_t s_bench_adc_max;
+
+/* A colour change is accepted only after the encoders have moved
+ * BARCODE_TEST_DEBOUNCE_COUNTS with the new colour held. The edge is placed
+ * where the change began, so accepted widths are not shifted. */
+static bool s_debounce_black;
+static bool s_debounce_pending;
+static int32_t s_debounce_start;
+
+static bool bench_debounce(bool black, int32_t count, int32_t *edge_count)
+{
+	*edge_count = count;
+	if (black == s_debounce_black) {
+		s_debounce_pending = false;
+		return s_debounce_black;
+	}
+	if (!s_debounce_pending) {
+		s_debounce_pending = true;
+		s_debounce_start = count;
+	}
+	{
+		int32_t moved = (int32_t)((uint32_t)count - (uint32_t)s_debounce_start);
+		uint32_t distance = (moved < 0) ? 0U - (uint32_t)moved : (uint32_t)moved;
+
+		if (distance < (uint32_t)BARCODE_TEST_DEBOUNCE_COUNTS) return s_debounce_black;
+	}
+	s_debounce_black = black;
+	s_debounce_pending = false;
+	*edge_count = s_debounce_start;
+	return s_debounce_black;
+}
 
 /* Calibration mode allows short runs before the module size is known. */
 static const barcode_scanner_config_t s_bench_barcode_config = {
@@ -307,19 +357,24 @@ static void report_bench_barcode(void)
 	if (barcode_scanner_take_event(&s_bench_scanner, &info)) {
 		if (info.reject == BARCODE_REJECT_NONE && info.symbol == '*' && info.in_frame)
 			barcode_scanner_reset_stats(&s_bench_scanner);
-		tm_printf((UB*)"[HWTEST][BAR-H02] char=%c %s dir=%d narrow_max=%u "
+		tm_printf((UB*)"[HWTEST][BAR-H02] char=%c %s dir=%d label=%s narrow_max=%u "
 			  "wide_min=%u gap=%u offending=%u\n",
 			  info.symbol ? info.symbol : '?', barcode_reject_name(info.reject),
-			  (int)info.direction, (unsigned)info.narrow_max, (unsigned)info.wide_min,
+			  (int)info.direction, info.label_reversed ? "reversed" : "normal",
+			  (unsigned)info.narrow_max, (unsigned)info.wide_min,
 			  (unsigned)info.gap_counts, (unsigned)info.offending_counts);
 		if (info.run_count == BARCODE_ELEMENTS)
-			tm_printf((UB*)"[HWTEST][BAR-H02]   pattern=%s widths=%u %u %u %u %u %u %u %u %u\n",
+			tm_printf((UB*)"[HWTEST][BAR-H02]   pattern=%s widths=%u %u %u %u %u %u %u %u %u "
+				  "adc_min=%u adc_max=%u\n",
 				  info.raw_pattern[0] ? info.raw_pattern : "?",
 				  (unsigned)info.run_counts[0], (unsigned)info.run_counts[1],
 				  (unsigned)info.run_counts[2], (unsigned)info.run_counts[3],
 				  (unsigned)info.run_counts[4], (unsigned)info.run_counts[5],
 				  (unsigned)info.run_counts[6], (unsigned)info.run_counts[7],
-				  (unsigned)info.run_counts[8]);
+				  (unsigned)info.run_counts[8],
+				  (unsigned)s_bench_adc_min, (unsigned)s_bench_adc_max);
+		s_bench_adc_min = UINT16_MAX;
+		s_bench_adc_max = 0U;
 	}
 	if (barcode_scanner_take_result(&s_bench_scanner, payload, BARCODE_MAX_PAYLOAD, &length)) {
 		barcode_scanner_config_t suggested;
@@ -337,6 +392,7 @@ static void sensor_test_task(INT stacd, void *exinf)
 {
 	line_adc_reader_t reader = {0};
 	bool initialized = false;
+	bool black = false;
 	uint32_t last_report = 0U;
 	ER error;
 
@@ -347,13 +403,16 @@ static void sensor_test_task(INT stacd, void *exinf)
 	if (error == E_OK) error = gpio_dispatcher_start();
 	if (error != E_OK) report_error_forever("BAR-H02", "encoder startup", error);
 	tm_printf((UB*)"[HWTEST][BAR-H02] GP28 barcode; keep motor power off; "
-		  "module_counts=%u (0 = learn from a scan); encoder signs: left=-1 right=+1\n",
-		  (unsigned)BARCODE_TEST_MODULE_COUNTS);
+		  "module_counts=%u (0 = learn from a scan); encoder signs: left=-1 right=+1; "
+		  "white<=%u black>=%u\n",
+		  (unsigned)BARCODE_TEST_MODULE_COUNTS, (unsigned)BARCODE_TEST_WHITE_ADC,
+		  (unsigned)BARCODE_TEST_BLACK_ADC);
 	for (;;) {
 		ir_readings_t readings;
 		encoder_snapshot_t snapshot;
 		uint32_t timestamp;
 		int32_t count;
+		int32_t edge_count;
 
 		error = line_adc_reader_read_barcode(&reader, &readings, &timestamp);
 		if (error != E_OK) report_error_forever("BAR-H02", "ADC read", error);
@@ -362,22 +421,30 @@ static void sensor_test_task(INT stacd, void *exinf)
 			report_error_forever("BAR-H02", "encoder snapshot", error != E_OK ? error : E_IO);
 		/* Straight travel gives negative raw left counts and positive right counts. */
 		count = (int32_t)((-(int64_t)snapshot.left_count + snapshot.right_count) / 2);
+		black = bench_barcode_black(readings.barcode.raw,
+					    initialized ? black : readings.barcode.raw >= BARCODE_TEST_BLACK_ADC);
+		if (readings.barcode.raw < s_bench_adc_min) s_bench_adc_min = readings.barcode.raw;
+		if (readings.barcode.raw > s_bench_adc_max) s_bench_adc_max = readings.barcode.raw;
 		if (!initialized) {
+			s_debounce_black = black;
 			initialized = barcode_scanner_init(&s_bench_scanner, &s_bench_barcode_config,
-							   readings.barcode.black, count);
+							   black, count);
 			if (!initialized) report_error_forever("BAR-H02", "scanner init", E_SYS);
-		} else if (!barcode_scanner_update(&s_bench_scanner, readings.barcode.black, count)) {
-			report_error_forever("BAR-H02", "scanner update", E_SYS);
+		} else {
+			bool filtered_black = bench_debounce(black, count, &edge_count);
+			if (!barcode_scanner_update(&s_bench_scanner, filtered_black, edge_count))
+				report_error_forever("BAR-H02", "scanner update", E_SYS);
 		}
 		report_bench_barcode();
 		if (!s_bench_scanner.collecting && !s_bench_scanner.in_frame &&
 		    timestamp - last_report >= SENSOR_TEST_INTERVAL_MS) {
 			last_report = timestamp;
 			tm_printf((UB*)"[HWTEST][BAR-H02] adc=%u black=%u left=%d right=%d mean=%d\n",
-				  (unsigned)readings.barcode.raw, readings.barcode.black ? 1U : 0U,
+				  (unsigned)readings.barcode.raw, black ? 1U : 0U,
 				  (int)snapshot.left_count, (int)snapshot.right_count, (int)count);
 		}
-		error = tk_dly_tsk(10U);
+		/* A short period keeps several samples inside each narrow bar. */
+		error = tk_dly_tsk(2U);
 		if (error != E_OK) report_error_forever("BAR-H02", "delay", error);
 	}
 }
@@ -758,6 +825,113 @@ static void sensor_test_task(INT stacd, void *exinf)
 		}
 		error = tk_dly_tsk(IMU_LIVE_SAMPLE_DELAY_MS);
 		if (error != E_OK) report_error_forever("IMU", "delay", error);
+	}
+}
+#elif APP_SENSOR_TEST == 10
+#define IMU_HUMP_TEST_COUNTS_PER_REV 2500U
+#define IMU_HUMP_TEST_WHEEL_CIRC_CM 20.4f
+#define IMU_HUMP_TEST_SAMPLE_DELAY_MS 50U
+#define IMU_HUMP_TEST_REPORT_INTERVAL_MS 250U
+
+static const odometry_producer_config_t s_imu_hump_odometry_config = {
+	{IMU_HUMP_TEST_COUNTS_PER_REV, IMU_HUMP_TEST_WHEEL_CIRC_CM},
+	{IMU_HUMP_TEST_COUNTS_PER_REV, IMU_HUMP_TEST_WHEEL_CIRC_CM},
+	-1, 1
+};
+
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	lsm303dlhc_i2c_t sensor = {0};
+	lsm303dlhc_i2c_config_t sensor_config;
+	odometry_producer_t odometry_state = {0};
+	wheel_odometry_message_t odometry;
+	encoder_snapshot_t snapshot;
+	accel_data_t warmup_sample;
+	accel_data_t sample;
+	imu_state_t imu;
+	SYSTIM now;
+	uint32_t sample_timestamp;
+	uint32_t warmup_timestamp;
+	uint32_t last_report_ms;
+	bool have_report = false;
+	uint8_t last_state = 0U;
+	ER error;
+
+	(void)stacd;
+	(void)exinf;
+	error = encoder_source_register();
+	if (error != E_OK) report_error_forever("IMU-HUMP", "encoder registration", error);
+	error = gpio_dispatcher_start();
+	if (error != E_OK) report_error_forever("IMU-HUMP", "GPIO dispatcher", error);
+	error = lsm303dlhc_i2c_default_config(&sensor_config, 20U);
+	if (error != E_OK) report_error_forever("IMU-HUMP", "default config", error);
+	sensor_config.profile = LSM303DLHC_I2C_PROFILE_32_FAMILY;
+	error = lsm303dlhc_i2c_init(&sensor, &sensor_config);
+	if (error != E_OK) report_error_forever("IMU-HUMP", "sensor init", error);
+	error = lsm303dlhc_i2c_read(&sensor, &warmup_sample, &warmup_timestamp);
+	if (error != E_OK) report_error_forever("IMU-HUMP", "warm-up read", error);
+	tm_printf((UB*)"[HWTEST][IMU-H02] warmup_sample t_lower=%u ms "
+		  "raw_x=%d raw_y=%d raw_z=%d (not measured)\n",
+		  (unsigned)warmup_timestamp, (int)warmup_sample.raw_x,
+		  (int)warmup_sample.raw_y, (int)warmup_sample.raw_z);
+	error = tk_dly_tsk(IMU_HUMP_TEST_SAMPLE_DELAY_MS);
+	if (error != E_OK) report_error_forever("IMU-HUMP", "warm-up delay", error);
+	if (!imu_processor_init(&imu))
+		report_error_forever("IMU-HUMP", "processor init", E_SYS);
+
+	error = encoder_source_snapshot(&snapshot);
+	if (error != E_OK || !snapshot.valid)
+		report_error_forever("IMU-HUMP", "initial encoder snapshot",
+				     error != E_OK ? error : E_IO);
+	error = tk_get_otm(&now);
+	if (error != E_OK) report_error_forever("IMU-HUMP", "clock", error);
+	if (!odometry_producer_init(&odometry_state, &s_imu_hump_odometry_config,
+				    snapshot.left_count, snapshot.right_count, now.lo))
+		report_error_forever("IMU-HUMP", "odometry init", E_SYS);
+
+	last_report_ms = now.lo;
+	tm_printf((UB*)"[HWTEST][IMU-H02] odometry counts/rev=%u wheel_circumference_cm=%.1f "
+		  "left_sign=-1 right_sign=+1\n",
+		  (unsigned)IMU_HUMP_TEST_COUNTS_PER_REV,
+		  (double)IMU_HUMP_TEST_WHEEL_CIRC_CM);
+	tm_printf((UB*)"[HWTEST][IMU-H02] motors are not started; keep motor power off. "
+		  "Push straight forward over a known gentle ramp.\n");
+	for (;;) {
+		error = lsm303dlhc_i2c_read(&sensor, &sample, &sample_timestamp);
+		if (error != E_OK) report_error_forever("IMU-HUMP", "sensor read", error);
+		error = tk_get_otm(&now);
+		if (error != E_OK) report_error_forever("IMU-HUMP", "clock", error);
+		error = encoder_source_snapshot(&snapshot);
+		if (error != E_OK || !snapshot.valid)
+			report_error_forever("IMU-HUMP", "encoder snapshot",
+					     error != E_OK ? error : E_IO);
+		if (!odometry_producer_update(&odometry_state, snapshot.left_count,
+					      snapshot.right_count, now.lo, &odometry))
+			report_error_forever("IMU-HUMP", "odometry update", E_SYS);
+		if (!imu_processor_update(&imu, &sample,
+					  (float)odometry.distance_mm / 1000.0f, now.lo))
+			report_error_forever("IMU-HUMP", "processor update", E_SYS);
+
+		if (!have_report ||
+		    (uint32_t)(now.lo - last_report_ms) >= IMU_HUMP_TEST_REPORT_INTERVAL_MS ||
+		    (uint8_t)imu.fsm_state != last_state) {
+			tm_printf((UB*)"[HWTEST][IMU-H02] t=%u travel_mm=%ld pitch_mdeg=%ld "
+				  "roll_mdeg=%ld sample_age_ms=%u state=%u hump_active=%u "
+				  "rise_mm=%ld peak_mm=%ld tilt=%u\n",
+				  (unsigned)now.lo, (long)odometry.distance_mm,
+				  (long)(imu.current_pitch_deg * 1000.0f),
+				  (long)(imu.current_roll_deg * 1000.0f),
+				  (unsigned)(now.lo - sample_timestamp),
+				  (unsigned)imu.fsm_state, imu.hump_active ? 1U : 0U,
+				  (long)(imu.current_hump_m * 1000.0f),
+				  (long)(imu.hump_peak_m * 1000.0f),
+				  imu.tilt_detected ? 1U : 0U);
+			last_report_ms = now.lo;
+			last_state = (uint8_t)imu.fsm_state;
+			have_report = true;
+		}
+		error = tk_dly_tsk(IMU_HUMP_TEST_SAMPLE_DELAY_MS);
+		if (error != E_OK) report_error_forever("IMU-HUMP", "delay", error);
 	}
 }
 #elif APP_SENSOR_TEST == 3

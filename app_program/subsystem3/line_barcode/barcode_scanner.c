@@ -153,6 +153,7 @@ static void publish_event(barcode_scanner_t *scanner, barcode_char_info_t *info)
         info->direction = scanner->scan_direction;
     }
     info->in_frame = scanner->in_frame;
+    info->label_reversed = scanner->label_reversed;
 
     scanner->stats.rejects[info->reject]++;
     if (scanner->event_pending)
@@ -206,74 +207,186 @@ static char symbol_for_index(int index)
     return (index == (int)CODE39_STAR_INDEX) ? '*' : code39_characters[index];
 }
 
-/*
- * Every Code 39 character has exactly 3 wide elements out of 9, so the 3
- * widest runs are marked wide. This needs no speed or module calibration.
- * The character is rejected if the wide/narrow split is not clearly
- * separated. Fills the pattern, symbol and width fields of info.
- */
-static barcode_reject_t classify_character(
-    const barcode_scanner_t *scanner,
-    bool reverse,
-    barcode_char_info_t *info)
+typedef struct
 {
-    bool is_wide[BARCODE_ELEMENTS] = { false };
-    char reversed[BARCODE_PATTERN_LENGTH];
-    uint32_t narrow_max = 0U;
-    uint32_t wide_min = UINT32_MAX;
+    bool is_wide[BARCODE_ELEMENTS];
+    uint32_t narrow_max;
+    uint32_t wide_min;
+    uint64_t score;        /* limiting wide/narrow ratio, in percent */
+    bool separated;
     int index;
     int alt_index;
-    uint8_t i;
-    uint8_t k;
+} code39_split_t;
 
-    for (k = 0U; k < CODE39_WIDE_ELEMENTS; k++)
+/* Marks the `wide` widest runs among elements first, first + 2, ... */
+static void mark_widest(const uint32_t *runs, uint8_t first, uint8_t wide,
+                        bool *is_wide)
+{
+    uint8_t k;
+    uint8_t i;
+
+    for (k = 0U; k < wide; k++)
     {
         uint8_t best = BARCODE_ELEMENTS;
-        for (i = 0U; i < BARCODE_ELEMENTS; i++)
+        for (i = first; i < BARCODE_ELEMENTS; i += 2U)
         {
             if (!is_wide[i] &&
-                ((best == BARCODE_ELEMENTS) ||
-                 (scanner->run_counts[i] > scanner->run_counts[best])))
+                ((best == BARCODE_ELEMENTS) || (runs[i] > runs[best])))
             {
                 best = i;
             }
         }
         is_wide[best] = true;
     }
+}
+
+static void group_limits(const uint32_t *runs, const bool *is_wide,
+                         uint8_t first, uint32_t *narrow_min,
+                         uint32_t *narrow_max, uint32_t *wide_min)
+{
+    uint8_t i;
+
+    *narrow_min = UINT32_MAX;
+    *narrow_max = 0U;
+    *wide_min = UINT32_MAX;
+    for (i = first; i < BARCODE_ELEMENTS; i += 2U)
+    {
+        if (is_wide[i])
+        {
+            if (runs[i] < *wide_min) *wide_min = runs[i];
+        }
+        else
+        {
+            if (runs[i] < *narrow_min) *narrow_min = runs[i];
+            if (runs[i] > *narrow_max) *narrow_max = runs[i];
+        }
+    }
+}
+
+static uint64_t ratio_percent(uint32_t wide, uint32_t narrow)
+{
+    return ((uint64_t)wide * 100U) / ((narrow == 0U) ? 1U : narrow);
+}
+
+/*
+ * Code 39 characters have either 2 wide bars and 1 wide space, or no wide
+ * bars and 3 wide spaces. Bars and spaces are split separately so that a
+ * sensor which systematically reads bars thinner (or thicker) than spaces
+ * does not mix up the two groups.
+ */
+static void evaluate_split(const barcode_scanner_t *scanner,
+                           uint8_t wide_bars, uint8_t wide_spaces,
+                           code39_split_t *split)
+{
+    const uint32_t *runs = scanner->run_counts;
+    uint64_t ratio = barcode_scanner_wide_ratio_percent(scanner);
+    uint32_t bar_narrow_min, bar_narrow_max, bar_wide_min;
+    uint32_t space_narrow_min, space_narrow_max, space_wide_min;
+    uint64_t space_score;
+    char pattern[BARCODE_PATTERN_LENGTH];
+    char reversed[BARCODE_PATTERN_LENGTH];
+    uint8_t i;
+
+    memset(split, 0, sizeof(*split));
+    mark_widest(runs, 0U, wide_bars, split->is_wide);
+    mark_widest(runs, 1U, wide_spaces, split->is_wide);
+    group_limits(runs, split->is_wide, 0U,
+                 &bar_narrow_min, &bar_narrow_max, &bar_wide_min);
+    group_limits(runs, split->is_wide, 1U,
+                 &space_narrow_min, &space_narrow_max, &space_wide_min);
+    (void)space_narrow_min;
+
+    space_score = ratio_percent(space_wide_min, space_narrow_max);
+    split->narrow_max = space_narrow_max;
+    split->wide_min = space_wide_min;
+    split->score = space_score;
+    split->separated = space_score >= ratio;
+    if (wide_bars > 0U)
+    {
+        uint64_t bar_score = ratio_percent(bar_wide_min, bar_narrow_max);
+
+        split->separated = split->separated && (bar_score >= ratio);
+        if (bar_score < space_score)
+        {
+            split->narrow_max = bar_narrow_max;
+            split->wide_min = bar_wide_min;
+            split->score = bar_score;
+        }
+    }
+    else
+    {
+        /* With no wide bars, every bar must look narrow. */
+        split->separated = split->separated &&
+            (ratio_percent(bar_narrow_max, bar_narrow_min) < ratio);
+    }
 
     for (i = 0U; i < BARCODE_ELEMENTS; i++)
     {
-        uint32_t count = scanner->run_counts[i];
+        pattern[i] = split->is_wide[i] ? 'w' : 'n';
+        reversed[i] = split->is_wide[BARCODE_ELEMENTS - 1U - i] ? 'w' : 'n';
+    }
+    split->index = find_pattern(pattern);
+    split->alt_index = find_pattern(reversed);
+}
 
-        if (is_wide[i])
-        {
-            if (count < wide_min)
-            {
-                wide_min = count;
-            }
-        }
-        else if (count > narrow_max)
-        {
-            narrow_max = count;
-        }
-        info->raw_pattern[i] = is_wide[i] ? 'w' : 'n';
-        reversed[i] = is_wide[BARCODE_ELEMENTS - 1U - i] ? 'w' : 'n';
+/*
+ * Needs no speed or module calibration: each character is classified from
+ * the relative widths of its own bars and spaces. The character is rejected
+ * if the wide/narrow split is not clearly separated. Fills the pattern,
+ * symbol and width fields of info.
+ */
+static barcode_reject_t classify_character(
+    const barcode_scanner_t *scanner,
+    bool reverse,
+    barcode_char_info_t *info)
+{
+    code39_split_t splits[2];
+    const code39_split_t *chosen = NULL;
+    int index;
+    int alt_index;
+    uint8_t s;
+    uint8_t i;
+
+    evaluate_split(scanner, 2U, 1U, &splits[0]);
+    evaluate_split(scanner, 0U, CODE39_WIDE_ELEMENTS, &splits[1]);
+
+    /* Prefer a separated split that decodes, then any separated split,
+     * then the best-separated one for diagnostics. */
+    for (s = 0U; s < 2U; s++)
+    {
+        const code39_split_t *split = &splits[s];
+        bool decodes = (split->index >= 0) || (split->alt_index >= 0);
+
+        if (!split->separated || !decodes) continue;
+        if ((chosen == NULL) || (split->score > chosen->score)) chosen = split;
+    }
+    for (s = 0U; (chosen == NULL) && (s < 2U); s++)
+    {
+        if (splits[s].separated) chosen = &splits[s];
+    }
+    if (chosen == NULL)
+    {
+        chosen = (splits[1].score > splits[0].score) ? &splits[1] : &splits[0];
+    }
+
+    for (i = 0U; i < BARCODE_ELEMENTS; i++)
+    {
+        info->raw_pattern[i] = chosen->is_wide[i] ? 'w' : 'n';
+        info->pattern[i] = chosen->is_wide[reverse ?
+            (BARCODE_ELEMENTS - 1U - i) : i] ? 'w' : 'n';
     }
     info->raw_pattern[BARCODE_ELEMENTS] = '\0';
-    reversed[BARCODE_ELEMENTS] = '\0';
-    memcpy(info->pattern, reverse ? reversed : info->raw_pattern,
-           BARCODE_PATTERN_LENGTH);
-    info->narrow_max = narrow_max;
-    info->wide_min = wide_min;
+    info->pattern[BARCODE_ELEMENTS] = '\0';
+    info->narrow_max = chosen->narrow_max;
+    info->wide_min = chosen->wide_min;
 
-    if ((uint64_t)wide_min * 100U <
-        (uint64_t)narrow_max * barcode_scanner_wide_ratio_percent(scanner))
+    if (!chosen->separated)
     {
         return BARCODE_REJECT_SEPARATION;
     }
 
-    index = find_pattern(info->pattern);
-    alt_index = find_pattern(reverse ? info->raw_pattern : reversed);
+    index = reverse ? chosen->alt_index : chosen->index;
+    alt_index = reverse ? chosen->index : chosen->alt_index;
     if (alt_index >= 0)
     {
         info->alt_symbol = symbol_for_index(alt_index);
@@ -285,6 +398,15 @@ static barcode_reject_t classify_character(
     }
     return (alt_index >= 0) ? BARCODE_REJECT_WRONG_ORIENTATION :
                               BARCODE_REJECT_NO_MATCH;
+}
+
+/*
+ * The bars arrive mirrored when the robot moves backwards or the label
+ * faces the other way; both together cancel out.
+ */
+static bool reading_reversed(const barcode_scanner_t *scanner)
+{
+    return (scanner->scan_direction < 0) != scanner->label_reversed;
 }
 
 /* Returns false if the payload buffer overflowed (the frame is dropped). */
@@ -303,7 +425,7 @@ static bool accept_character(barcode_scanner_t *scanner, char character)
         }
         else if (scanner->payload_length > 0U)
         {
-            if (scanner->scan_direction < 0)
+            if (reading_reversed(scanner))
             {
                 uint8_t i;
                 uint8_t half_length = scanner->payload_length / 2U;
@@ -366,7 +488,25 @@ static void finish_character(barcode_scanner_t *scanner)
     bool was_in_frame = scanner->in_frame;
 
     init_info(scanner, &info);
-    reject = classify_character(scanner, scanner->scan_direction < 0, &info);
+    if (!was_in_frame)
+    {
+        scanner->label_reversed = false;
+    }
+    reject = classify_character(scanner, reading_reversed(scanner), &info);
+
+    /*
+     * Outside a frame, a character that is '*' only when read backwards
+     * means the label faces the other way; read the frame flipped. The
+     * stop '*' must then also read backwards, guarding against false starts.
+     */
+    if (!was_in_frame && (info.symbol != '*') && (info.alt_symbol == '*') &&
+        ((reject == BARCODE_REJECT_NONE) ||
+         (reject == BARCODE_REJECT_WRONG_ORIENTATION)))
+    {
+        scanner->label_reversed = true;
+        init_info(scanner, &info);
+        reject = classify_character(scanner, reading_reversed(scanner), &info);
+    }
 
     if (reject == BARCODE_REJECT_NONE)
     {
@@ -566,6 +706,7 @@ void barcode_scanner_reset(barcode_scanner_t *scanner)
     scanner->collecting = false;
     scanner->in_frame = false;
     scanner->scan_direction = 0;
+    scanner->label_reversed = false;
     scanner->payload_length = 0U;
     scanner->result_ready = false;
     scanner->gap_counts = 0U;

@@ -97,6 +97,13 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
 
     case IMU_STATE_HUMP_RISING:
         state->motion_event = IMU_EVENT_CLIMBING;
+
+        if ((uint32_t)(now_ms - state->hump_start_ms) > 5000U) {
+            state->fsm_state   = IMU_STATE_MONITORING;
+            state->hump_active = false;
+            break;
+        }
+
         {
             float delta_dist = current_distance_m - state->last_distance_m;
             if (delta_dist > 0.0f) {
@@ -109,12 +116,6 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
                 }
             }
             state->last_distance_m = current_distance_m;
-        }
-
-        if ((uint32_t)(now_ms - state->hump_start_ms) > 5000U) {
-            state->fsm_state   = IMU_STATE_MONITORING;
-            state->hump_active = false;
-            break;
         }
 
         if (state->current_pitch_deg <= PITCH_END_DEG) {

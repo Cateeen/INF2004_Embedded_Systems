@@ -15,6 +15,7 @@
  *   9    spin 180 in place
  *   10   forward + right arc, 90 deg
  *   11   forward + left arc, 90 deg
+ * MOVE_SKIP_BALANCE=1 skips steps 1-4 and starts at the floor moves.
  *
  * Per-wheel command = dir * PWM * (wheel share %) * (MOVE_TRIM_x %).
  * Heading (positive = LEFT) = (right_mm - left_mm) / MOVE_TRACK_MM.
@@ -56,6 +57,9 @@
 #ifndef MOVE_ARC_INNER
 #define MOVE_ARC_INNER 50U    /* inner wheel share (% of outer) on the arcs */
 #endif
+#ifndef MOVE_SKIP_BALANCE
+#define MOVE_SKIP_BALANCE 0U  /* 1 = start at the floor moves (step 5) */
+#endif
 
 _Static_assert(MOVE_PWM >= 15U && MOVE_PWM <= 80U, "need 15 <= MOVE_PWM <= 80");
 _Static_assert(MOVE_TRIM_L >= 50U && MOVE_TRIM_L <= 100U, "need 50 <= MOVE_TRIM_L <= 100");
@@ -63,6 +67,7 @@ _Static_assert(MOVE_TRIM_R >= 50U && MOVE_TRIM_R <= 100U, "need 50 <= MOVE_TRIM_
 _Static_assert(MOVE_DIST_MM >= 100U && MOVE_DIST_MM <= 2000U, "need 100 <= MOVE_DIST_MM <= 2000");
 _Static_assert(MOVE_TRACK_MM >= 50U && MOVE_TRACK_MM <= 300U, "MOVE_TRACK_MM out of range");
 _Static_assert(MOVE_ARC_INNER <= 90U, "MOVE_ARC_INNER must be <= 90");
+_Static_assert(MOVE_SKIP_BALANCE <= 1U, "MOVE_SKIP_BALANCE must be 0 or 1");
 
 /* Same calibration as the vehicle (app_main.c) and spin_heading_hwtest.c. */
 #define COUNTS_PER_REV     2500.0f
@@ -141,6 +146,7 @@ static const move_t s_moves[] = {
 	  1, 1, (uint8_t)MOVE_ARC_INNER, 100, 0, END_HEADING, 90, false },
 };
 #define MOVE_COUNT (sizeof(s_moves) / sizeof(s_moves[0]))
+#define BALANCE_STEPS 4U   /* the in-air sweep at the start of s_moves */
 
 static bool s_go_last_pressed;
 
@@ -413,7 +419,7 @@ static void report(const move_t *m, const move_result_t *res)
 	if (m->left_dir == m->right_dir && m->left_share == m->right_share) {
 		/* Straight: any heading change is the two wheels not matching. */
 		if (res->have_speed) report_balance(res->l_speed, res->r_speed, "speed mm/s");
-		else report_balance(res->l_mm, res->r_mm, "distance mm");
+		else tm_printf((UB*)TAG "  ended before a steady speed -- no balance verdict\n");
 		tm_printf((UB*)TAG "  encoder heading drift %s deg (settled %s). "
 			  "Measure the real sideways drift from the tape line.\n",
 			  fdeg(b1, h_brake), fdeg(b2, h_fin));
@@ -457,6 +463,43 @@ static const char *status_text(move_status_t s)
 	}
 }
 
+/* Encoder noise spikes absorbed so far (they do not affect the counts). */
+static void report_glitches(void)
+{
+	encoder_fault_t f;
+
+	if (encoder_source_fault(&f) >= E_OK && f.glitches != 0U)
+		tm_printf((UB*)TAG "  encoder glitches ignored so far: %u (noise; counts unaffected)\n",
+			  (unsigned)f.glitches);
+}
+
+/* Explains why the encoder went invalid (first fault only). */
+static void report_encoder_fault(void)
+{
+	static const char *const reason_text[] = {
+		"none recorded (the snapshot read itself failed)",
+		"MULTI_EDGE: edges on both A and B in one IRQ (IRQ too late or heavy noise)",
+		"BAD_STEP: a pin changed with no edge on it (lost edge)",
+		"BAD_LEVEL: edge direction disagrees with the pin level (short glitch)",
+	};
+	encoder_fault_t f;
+
+	if (encoder_source_fault(&f) < E_OK) {
+		tm_printf((UB*)TAG "  encoder fault details unavailable\n");
+		return;
+	}
+	tm_printf((UB*)TAG "  ENCODER FAULT: %s wheel, %s\n",
+		  f.wheel == 1U ? "LEFT" : (f.wheel == 2U ? "RIGHT" : "no"),
+		  reason_text[f.reason <= ENCODER_FAULT_BAD_LEVEL ? f.reason : 0U]);
+	if (f.reason != ENCODER_FAULT_NONE)
+		tm_printf((UB*)TAG "  edges%s%s%s%s  AB before %u%u  AB now %u%u  at count %d\n",
+			  (f.events & 0x08U) ? " A-rise" : "", (f.events & 0x04U) ? " A-fall" : "",
+			  (f.events & 0x80U) ? " B-rise" : "", (f.events & 0x40U) ? " B-fall" : "",
+			  (unsigned)((f.previous_state >> 1U) & 1U), (unsigned)(f.previous_state & 1U),
+			  (unsigned)((f.current_state >> 1U) & 1U), (unsigned)(f.current_state & 1U),
+			  (int)f.count);
+}
+
 void motor_moves_hwtest_run(void)
 {
 	unsigned i;
@@ -479,8 +522,10 @@ void motor_moves_hwtest_run(void)
 		  (unsigned)MOVE_PWM, (unsigned)MOVE_TRIM_L, (unsigned)MOVE_TRIM_R,
 		  (unsigned)MOVE_DIST_MM, (unsigned)MOVE_TRACK_MM, (unsigned)MOVE_ARC_INNER);
 	tm_printf((UB*)TAG "each GO press runs the next step; GO during a move = STOP\n");
+	if (MOVE_SKIP_BALANCE)
+		tm_printf((UB*)TAG "MOVE_SKIP_BALANCE=1: skipping the in-air balance sweep\n");
 
-	for (i = 0U; i < MOVE_COUNT; i++) {
+	for (i = MOVE_SKIP_BALANCE ? BALANCE_STEPS : 0U; i < MOVE_COUNT; i++) {
 		const move_t *m = &s_moves[i];
 		move_result_t res;
 		move_status_t st;
@@ -504,9 +549,11 @@ void motor_moves_hwtest_run(void)
 		st = run_move(m, &res);
 		(void)motor_emergency_stop();
 		report(m, &res);
+		report_glitches();
 		if (st != MOVE_OK) {
 			tm_printf((UB*)TAG "MOVE ENDED: %s -- test stopped, reset to retry\n",
 				  status_text(st));
+			if (st == MOVE_IO) report_encoder_fault();
 			for (;;) tk_dly_tsk(5000U);
 		}
 	}

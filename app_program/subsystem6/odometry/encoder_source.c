@@ -52,3 +52,18 @@ ER encoder_source_snapshot(encoder_snapshot_t *snapshot)
 	EI(saved);
 	return E_OK;
 }
+
+ER encoder_source_fault(encoder_fault_t *fault)
+{
+	UINT saved;
+
+	if (fault == NULL) return E_PAR;
+#if TK_SUPPORT_SMP
+	if (tk_get_prc() != TP_PRC1) return E_CTX;
+#endif
+	if (!s_registered || !gpio_dispatcher_is_started()) return E_OBJ;
+	DI(saved);
+	*fault = encoder_pair_fault(&s_pair);
+	EI(saved);
+	return E_OK;
+}

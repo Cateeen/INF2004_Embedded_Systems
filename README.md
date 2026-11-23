@@ -659,6 +659,20 @@ speed, which wheel is faster and by how much, and a suggested
 those values to confirm, e.g.
 `make SENSOR_TEST=motor_moves MOVE_PWM=50 MOVE_TRIM_R=94`. GO during a move,
 a timeout, a stalled wheel or a wheel turning the wrong way stops the test.
+`MOVE_SKIP_BALANCE=1` skips the in-air sweep and starts at the floor moves.
+
+To tune the vehicle's closed-loop wheel speed control,
+`make SENSOR_TEST=pid_tune` (**drives the motors**) runs the vehicle's own
+`wheel_speed_control` PID per wheel, updated every `PID_PERIOD_MS` (50, the
+odometry period) from encoder speeds. GO runs, in turn: a step response with
+the wheels in the air for `PID_AIR_MS` (3000), then forward and reverse
+`PID_DIST_MM` (400) on the floor. Each step prints a trace (time, speed and
+PWM per wheel; `PID_TRACE=0` hides it) and, per wheel, rise time, overshoot,
+steady-state error, ripple and settled PWM, followed by tuning hints. Set the
+gains (decimals allowed) and target, e.g.
+`make SENSOR_TEST=pid_tune PID_KP=2 PID_KI=1 PID_SPEED=15 PID_BASE=23`
+(defaults KP 2, KI 0, KD 0, 15 cm/s, base 20 %, max 60 %), then copy the
+chosen values into `motion_config` in `app_program/app_main.c`.
 
 The opt-in application WiFi service supports simulated callbacks or an outbound
 MQTT bridge backend.
@@ -794,7 +808,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `pid_tune`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

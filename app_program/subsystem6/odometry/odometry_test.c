@@ -47,6 +47,31 @@ static BOOL encoder_pair_invalid_test(void)
 	return !encoder_pair_snapshot(&pair).valid;
 }
 
+/* One-channel spikes resolve exactly from the levels: count them, stay valid. */
+static BOOL encoder_pair_glitch_test(void)
+{
+	encoder_pair_t pair;
+	encoder_snapshot_t snapshot;
+	uint32_t pins = 0U;
+
+	encoder_pair_init(&pair, pins);
+	/* Right B rose and fell inside one IRQ (as seen on the car): net zero. */
+	encoder_pair_update(&pair, 0x0000c000U, pins);
+	/* A lone latched edge whose pulse already ended: net zero. */
+	encoder_pair_update(&pair, 0x00000080U, pins);
+	snapshot = encoder_pair_snapshot(&pair);
+	if (!snapshot.valid || snapshot.left_count != 0 || snapshot.right_count != 0 ||
+	    encoder_pair_fault(&pair).glitches != 2U)
+		return FALSE;
+	/* Left B toggled an odd number of times: one real step (00 -> 01 = +1). */
+	pins = 1U << ENCODER_LEFT_B_PIN;
+	encoder_pair_update(&pair, 0x000000c0U, pins);
+	snapshot = encoder_pair_snapshot(&pair);
+	return snapshot.valid && snapshot.left_count == 1 &&
+	       encoder_pair_fault(&pair).glitches == 3U &&
+	       encoder_pair_fault(&pair).reason == ENCODER_FAULT_NONE;
+}
+
 BOOL odometry_test(void)
 {
 	encoder_t encoder;
@@ -58,6 +83,7 @@ BOOL odometry_test(void)
 	BOOL invalid_ok;
 	BOOL pair_ok;
 	BOOL pair_invalid_ok;
+	BOOL pair_glitch_ok;
 	TEST_INIT();
 
 	encoder_init(&encoder, 0U, 0U);
@@ -96,13 +122,16 @@ BOOL odometry_test(void)
 		     !wheel_odometry_calculate(&config, 2500, 0.0f, &result);
 	pair_ok = encoder_pair_test();
 	pair_invalid_ok = encoder_pair_invalid_test();
+	pair_glitch_ok = encoder_pair_glitch_test();
 
 	TEST_CHECK("ODO-U01", encoder_ok, "quadrature forward, reverse and invalid transitions");
 	TEST_CHECK("ODO-U02", distance_ok, "calibrated wheel distance and speed");
 	TEST_CHECK("ODO-U03", invalid_ok, "invalid calibration and elapsed time rejected");
 	TEST_CHECK("ODO-U06", pair_ok, "coherent independent encoder counts");
 	TEST_CHECK("ODO-U07", pair_invalid_ok, "ambiguous encoder events latch invalid");
+	TEST_CHECK("ODO-U11", pair_glitch_ok, "one-channel encoder glitches counted, not latched");
 	TEST_SUMMARY("odometry");
-	return encoder_ok && distance_ok && invalid_ok && pair_ok && pair_invalid_ok;
+	return encoder_ok && distance_ok && invalid_ok && pair_ok && pair_invalid_ok &&
+	       pair_glitch_ok;
 }
 #endif

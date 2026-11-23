@@ -123,7 +123,7 @@ endif
 
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
-SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves servo encoder line_barcode line barcode
+SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves pid_tune servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
 $(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
@@ -151,6 +151,20 @@ MOVE_TRIM_R ?= 100
 MOVE_DIST_MM ?= 500
 MOVE_TRACK_MM ?= 110
 MOVE_ARC_INNER ?= 50
+MOVE_SKIP_BALANCE ?= 0
+# pid_tune (DRIVES MOTORS): wheel speed PID gains (decimals allowed), target
+# cm/s, base and max PWM %, update period, floor distance, in-air run time and
+# per-sample trace (0/1).
+PID_KP ?= 2.0
+PID_KI ?= 0.0
+PID_KD ?= 0.0
+PID_SPEED ?= 15
+PID_BASE ?= 20
+PID_MAX ?= 60
+PID_PERIOD_MS ?= 50
+PID_DIST_MM ?= 400
+PID_AIR_MS ?= 3000
+PID_TRACE ?= 1
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -169,6 +183,8 @@ else ifeq ($(SENSOR_TEST),spin_heading)
 SENSOR_TEST_VALUE := 12
 else ifeq ($(SENSOR_TEST),motor_moves)
 SENSOR_TEST_VALUE := 13
+else ifeq ($(SENSOR_TEST),pid_tune)
+SENSOR_TEST_VALUE := 14
 else ifeq ($(SENSOR_TEST),servo)
 SENSOR_TEST_VALUE := 4
 else ifeq ($(SENSOR_TEST),encoder)
@@ -295,7 +311,13 @@ CFLAGS  += -DSPIN_RIGHT_TRIM=$(SPIN_RIGHT_TRIM)
 endif
 ifeq ($(SENSOR_TEST),motor_moves)
 CFLAGS  += -DMOVE_PWM=$(MOVE_PWM)U -DMOVE_TRIM_L=$(MOVE_TRIM_L)U -DMOVE_TRIM_R=$(MOVE_TRIM_R)U
-CFLAGS  += -DMOVE_DIST_MM=$(MOVE_DIST_MM)U -DMOVE_TRACK_MM=$(MOVE_TRACK_MM)U -DMOVE_ARC_INNER=$(MOVE_ARC_INNER)U
+CFLAGS  += -DMOVE_DIST_MM=$(MOVE_DIST_MM)U -DMOVE_TRACK_MM=$(MOVE_TRACK_MM)U -DMOVE_ARC_INNER=$(MOVE_ARC_INNER)U -DMOVE_SKIP_BALANCE=$(MOVE_SKIP_BALANCE)U
+endif
+ifeq ($(SENSOR_TEST),pid_tune)
+CFLAGS  += -DPID_KP=$(PID_KP) -DPID_KI=$(PID_KI) -DPID_KD=$(PID_KD)
+CFLAGS  += -DPID_SPEED=$(PID_SPEED)U -DPID_BASE=$(PID_BASE)U -DPID_MAX=$(PID_MAX)U
+CFLAGS  += -DPID_PERIOD_MS=$(PID_PERIOD_MS)U -DPID_DIST_MM=$(PID_DIST_MM)U
+CFLAGS  += -DPID_AIR_MS=$(PID_AIR_MS)U -DPID_TRACE=$(PID_TRACE)U
 endif
 CFLAGS  += -DTM_CONSOLE_UART=$(CRASH_REPORT)
 ifeq ($(CRASH_REPORT),0)
@@ -340,7 +362,10 @@ ifeq ($(SENSOR_TEST),spin_heading)
 PROFILE_ID := $(PROFILE_ID)-track$(SPIN_TRACK_MM)-pwm$(SPIN_PWM)-$(SPIN_PWM_SLOW)-trim$(SPIN_RIGHT_TRIM)
 endif
 ifeq ($(SENSOR_TEST),motor_moves)
-PROFILE_ID := $(PROFILE_ID)-pwm$(MOVE_PWM)-trim$(MOVE_TRIM_L)-$(MOVE_TRIM_R)-dist$(MOVE_DIST_MM)-track$(MOVE_TRACK_MM)-arc$(MOVE_ARC_INNER)
+PROFILE_ID := $(PROFILE_ID)-pwm$(MOVE_PWM)-trim$(MOVE_TRIM_L)-$(MOVE_TRIM_R)-dist$(MOVE_DIST_MM)-track$(MOVE_TRACK_MM)-arc$(MOVE_ARC_INNER)-skipbal$(MOVE_SKIP_BALANCE)
+endif
+ifeq ($(SENSOR_TEST),pid_tune)
+PROFILE_ID := $(PROFILE_ID)-kp$(PID_KP)-ki$(PID_KI)-kd$(PID_KD)-v$(PID_SPEED)-base$(PID_BASE)-max$(PID_MAX)-T$(PID_PERIOD_MS)-dist$(PID_DIST_MM)-air$(PID_AIR_MS)-trace$(PID_TRACE)
 endif
 PROFILE_FILE := .build_profile
 

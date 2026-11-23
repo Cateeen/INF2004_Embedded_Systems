@@ -177,10 +177,14 @@ static void vehicle_start(void)
 		{VEHICLE_COUNTS_PER_REV, VEHICLE_WHEEL_CIRC_CM},
 		VEHICLE_LEFT_SIGN, VEHICLE_RIGHT_SIGN
 	};
-	/* PID gains and base/max PWM are S5 placeholders: tune on blocks. */
+	/* Wheel speed PID {kp, ki, kd, target (set per command), base %, max %},
+	 * tuned with SENSOR_TEST=pid_tune on the mat at 15 and 20 cm/s: steady
+	 * error within 2.5 % per wheel forward and reverse, no oscillation
+	 * (MOT-H01). Base 22 % is the floor PWM at 15 cm/s; KI 4 makes up the
+	 * extra ~7 % needed at 20 cm/s within ~1 s. */
 	static motion_task_config_t motion_config = {
 		{{{0}, {0}, 150U, 250U},
-		 {2.0f, 0.0f, 0.0f, 10.0f, 20U, 60U}},
+		 {2.0f, 4.0f, 0.0f, 10.0f, 22U, 60U}},
 		10U,	/* period_ms */
 		100U,	/* command_max_age_ms */
 		500U,	/* max_duration_ms */

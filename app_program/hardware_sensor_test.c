@@ -10,6 +10,7 @@
 #include "subsystem5/obstacle/obs_width_hwtest.h"
 #include "subsystem2/motion/spin_heading_hwtest.h"
 #include "subsystem2/motion/motor_moves_hwtest.h"
+#include "subsystem2/motion/pid_tune_hwtest.h"
 #include "vehicle_buffers.h"
 #include "vehicle_messages.h"
 
@@ -1141,6 +1142,14 @@ static void sensor_test_task(INT stacd, void *exinf)
 	(void)stacd;
 	(void)exinf;
 	motor_moves_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 14
+/* Wheel speed PID tuning (DRIVES MOTORS); subsystem2/motion/pid_tune_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	pid_tune_hwtest_run();
 }
 #else
 #error Unsupported APP_SENSOR_TEST diagnostic

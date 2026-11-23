@@ -12,4 +12,8 @@ ER encoder_source_register(void);
  * flag is latched until restart; counts are then diagnostic only. */
 ER encoder_source_snapshot(encoder_snapshot_t *snapshot);
 
+/* Same rules as encoder_source_snapshot(). Reports why the valid flag first
+ * went false (reason ENCODER_FAULT_NONE while still valid). */
+ER encoder_source_fault(encoder_fault_t *fault);
+
 #endif

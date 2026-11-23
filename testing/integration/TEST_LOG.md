@@ -26,6 +26,7 @@ historical reference; they cannot be run against the current vehicle firmware.
 | ODO-U08 | simulated snapshot becomes a message in each odometry buffer | odometry task | auto | `odometry_task_test()` before tasks start | `[TEST] ODO-U08 PASS` |
 | ODO-U09 | invalid snapshots, timestamps and full queues cause task faults | odometry task | auto | `odometry_task_test()` before tasks start | `[TEST] ODO-U09 PASS` |
 | ODO-U10 | a full opted-in motion odometry queue causes a delivery fault | odometry task | auto | `odometry_task_test()` before tasks start | `[TEST] ODO-U10 PASS` |
+| ODO-U11 | one-channel glitches (spike, lone stale edge, odd toggles) are counted without latching invalid or changing the count | encoder snapshot | auto | `odometry_test()` before tasks start | `[TEST] ODO-U11 PASS` |
 | INT-04 | independent odometry message delivery and full-buffer reporting | odometry buffers | auto | `odometry_producer_test()` before tasks start | `[TEST] INT-04 PASS` |
 | INT-05 | optional copied motion odometry and independent full-buffer handling | odometry buffers | auto | `odometry_producer_test()` before tasks start | `[TEST] INT-05 PASS` |
 | ODO-H01 | live encoder counts and signs for each wheel | GPIO encoder bring-up | manual | Build `TEST=1 ODOMETRY_TEST=1` or `SENSOR_TEST=encoder`; with motor power off, rotate each wheel slowly by hand and compare count deltas over several marked revolutions in both directions. | Each wheel changes independently and reproducibly; about 2500 absolute counts per revolution, opposite sign when reversed. |
@@ -94,6 +95,7 @@ historical reference; they cannot be run against the current vehicle firmware.
 | MOT-U10 | simulation does not publish motion status | motion task simulation | auto | `motion_task_test()` before tasks start | `[TEST] MOT-U10 PASS` |
 | MOT-U11 | forward and reverse actuator commands preserve the imported left/right motor polarity | motion task actuator mapping | auto | `motion_task_test()` before tasks start | `[TEST] MOT-U11 PASS` |
 | MOT-U12 | hardware status shape reports commanded PWM and latched faults | motion task status contract | auto | `motion_task_test()` before tasks start | `[TEST] MOT-U12 PASS` |
+| MOT-H01 | closed-loop wheel speed PID holds both wheels at the target speed | wheel speed control on the robot | manual | Build `SENSOR_TEST=pid_tune` with candidate `PID_KP`/`PID_KI`/`PID_BASE`; run the in-air step, then forward and reverse `PID_DIST_MM` on the mat along a tape line. | Each wheel within 3 % of `PID_SPEED` at steady state, ripple under 30 %, no PWM saturation; real sideways drift and distance recorded for forward and reverse. |
 | VC-U01 | go, emergency stop and fault motion vetoes | controller gate | auto | `car_gate_test()` before tasks start | `[TEST] VC-U01 PASS` |
 | VC-U02 | obstacles veto line following | controller gate | auto | `car_gate_test()` before tasks start | `[TEST] VC-U02 PASS` |
 | VC-U03 | line-following rearm requires a go edge with safety conditions clear | controller gate | auto | `car_gate_test()` before tasks start | `[TEST] VC-U03 PASS` |

@@ -1,25 +1,26 @@
+﻿Debug
+Release
 
-# Compiled executables
-*.exe
-
-# CMake build files
-build/
-cmake-build-*/
-
-# Python temporary files
-__pycache__/
-*.pyc
-
-# Generated firmware files
+# Build artifacts
 *.elf
 *.uf2
-*.bin
-*.hex
 *.map
-*.dis
+*.o
+*.d
+build_make/tools/elf2uf2
+tools/elf2uf2/elf2uf2
+build_make/.build_profile
 
-# Local VS Code configuration
-.vscode/settings.json
+# Real WiFi credentials -- never commit these. Copy config/wifi_secrets.example.h
+# to config/wifi_secrets.h and fill in your own network's SSID/password.
+config/wifi_secrets.h
 
-# Local Wi-Fi and MQTT credentials
-include/wifi_mqtt_config.h
+# Videos are shared as unlisted YouTube links (videos/README.md), never committed
+*.mp4
+*.mov
+*.webm
+*.avi
+*.mkv
+
+# macOS
+.DS_Store

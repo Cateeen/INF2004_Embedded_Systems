@@ -2,9 +2,7 @@
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include <stdio.h>
-
-#define WIFI_SSID "wx"
-#define WIFI_PASSWORD "wenxinxin"
+#include "wifi_mqtt_config.h"
 
 #define WIFI_TIMEOUT_MS 30000
 

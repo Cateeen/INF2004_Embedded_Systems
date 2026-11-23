@@ -72,7 +72,8 @@ bool car_feedback_distance_m(float *out)
 bool car_feedback_take_barcode(uint8_t payload[32], uint8_t *length)
 {
     if (!s_ready) return false;
-    return barcode_scanner_take_result(&s_barcode, payload, length);
+    return barcode_scanner_take_result(
+        &s_barcode, payload, 32U, length);
 }
 
 bool car_feedback_pid_configure(const wheel_speed_config_t *speed,

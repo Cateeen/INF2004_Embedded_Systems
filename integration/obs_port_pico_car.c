@@ -40,6 +40,7 @@
 
 static queue_t s_q_to_vc;               /* obs_msg_t */
 static queue_t s_q_to_obs;              /* uint8_t   */
+static queue_t s_q_motion_to_vc;        /* uint8_t manual motion */
 
 /*
  * Shared safety status.
@@ -69,6 +70,7 @@ void car_link_init(void)
 {
     queue_init(&s_q_to_vc, sizeof(obs_msg_t), QUEUE_DEPTH);
     queue_init(&s_q_to_obs, 1U, QUEUE_DEPTH);
+    queue_init(&s_q_motion_to_vc, 1U, QUEUE_DEPTH);
 
     critical_section_init(&s_safety_lock);
 
@@ -102,12 +104,23 @@ void vc_port_cmd_send(uint8_t cmd)
     }
 }
 
-static void car_run_set(bool enabled)
+void vc_port_set_run(bool enabled)
 {
     critical_section_enter_blocking(&s_safety_lock);
     /* Fault latched: GO cannot re-arm the vehicle. */
     s_run = enabled && (s_fault_bits == 0U);
     critical_section_exit(&s_safety_lock);
+}
+
+void vc_port_motion_send(uint8_t motion)
+{
+    if (!queue_try_add(&s_q_motion_to_vc, &motion))
+        obs_port_fault_set(CAR_FAULT_QUEUE_OVERFLOW);
+}
+
+bool vc_port_motion_recv(uint8_t *motion)
+{
+    return motion != NULL && queue_try_remove(&s_q_motion_to_vc, motion);
 }
 
 bool vc_port_run_enabled(void)
@@ -210,8 +223,8 @@ bool obs_port_cmd_recv(uint8_t *cmd, uint32_t timeout_ms)
         int c = getchar_timeout_us(0);
         if (c != PICO_ERROR_TIMEOUT) {
             switch (c) {
-            case 'g': car_run_set(true);  ts(); printf("[KEY] GO\n");   break;
-            case 'x': car_run_set(false); ts(); printf("[KEY] STOP\n"); break;
+            case 'g': vc_port_set_run(true);  ts(); printf("[KEY] GO\n");   break;
+            case 'x': vc_port_set_run(false); ts(); printf("[KEY] STOP\n"); break;
             case 'l': s_line_until_ms = obs_port_ms() + LINE_PULSE_MS; ts(); printf("[KEY] fake line for 1 s\n"); break;
             case 's': ts(); printf("[KEY] SCAN\n"); *cmd = (uint8_t)OBS_CMD_SCAN_REQ; return true;
             case 'a': ts(); printf("[KEY] ABORT\n"); *cmd = (uint8_t)OBS_CMD_ABORT; return true;

@@ -5,6 +5,7 @@
 #include "imu_processor.h"
 #include "imu_config.h"
 #include "telemetry_protocol.h"
+#include "wifi_mqtt_port.h"
 
 static bool is_hump_state(imu_fsm_state_t state)
 {
@@ -183,6 +184,15 @@ int main(void) {
             last_network_print_ms = now;
             printf("Buddy 1 network state: %s\n",
                    network_state_name(buddy1_network_state(&telemetry)));
+            printf("  Wi-Fi: %s, MQTT: %s, subscription: %s, publish time: %lu\n",
+                   wifi_mqtt_port_wifi_connected() ? "CONNECTED" : "DOWN",
+                   wifi_mqtt_port_mqtt_connected() ? "CONNECTED" : "DOWN",
+                   wifi_mqtt_port_subscribed() ? "ACKNOWLEDGED" : "PENDING",
+                   (unsigned long)telemetry.last_publish_ms);
+            if (wifi_mqtt_port_connection_failed()) {
+                printf("  MQTT adapter reports connection failure\n");
+            }
+            stdio_flush();
         }
 
         // Maintain a 100 Hz sensor and network-poll loop.

@@ -38,6 +38,39 @@ PWM frequency: 20 kHz.
 4. Integrate Buddy 2 with the other system modules.
 5. Perform physical hardware testing after safety checks.
 
+## µT-Kernel Vehicle Architecture
+
+The migrated vehicle task architecture is enabled with
+`PICOCAR_USE_UTKERNEL=ON`. The µT-Kernel port must provide a header at
+`<include-dir>/tk/tkernel.h`; pass that parent directory through
+`PICOCAR_UTKERNEL_INCLUDE_DIR`.
+
+Example configuration:
+
+```text
+cmake -S . -B build -G Ninja ^
+  -DPICOCAR_USE_UTKERNEL=ON ^
+  -DPICOCAR_ENABLE_MQTT=ON ^
+  -DPICOCAR_UTKERNEL_INCLUDE_DIR=C:\path\to\utkernel\include ^
+  -DPICOCAR_ODOMETRY_COUNTS_PER_REV=<verified-count>
+```
+
+The calibrated `PICOCAR_ODOMETRY_COUNTS_PER_REV` default is `2500`. Set it to
+`0` to disable odometry, or override it if the encoder/wheel setup changes.
+The default wheel circumference is 20 cm and can be overridden with
+`PICOCAR_ODOMETRY_WHEEL_CIRCUMFERENCE_CM`.
+
+Build and flash the `encoder_calibration_test` target to measure the encoder
+counts without enabling the motors. Rotate each wheel exactly one mechanical
+revolution and record the stable left/right counts. Repeat several times and
+use the average absolute count as `PICOCAR_ODOMETRY_COUNTS_PER_REV`. Compare
+the left and right readings; if they differ substantially, calibrate each side
+separately before relying on odometry.
+
+Only the WiFi Service Task may call the MQTT/lwIP adapter. The Vehicle
+Controller communicates with it through the typed message buffers and must not
+include network headers.
+
 ## Buddy 1 + Buddy 4 - Pico W MQTT/IMU Test
 
 The `buddy4_imu_test` firmware also runs Buddy 1's telemetry publisher. It

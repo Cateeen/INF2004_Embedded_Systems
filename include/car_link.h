@@ -24,6 +24,9 @@ void vc_port_cmd_send(uint8_t cmd);
 
 /* Bench "go" switch: USB-serial key g = true, key x = false. Motors never move while false. */
 bool vc_port_run_enabled(void);
+void vc_port_set_run(bool enabled);
+bool vc_port_motion_recv(uint8_t *motion);
+void vc_port_motion_send(uint8_t motion);
 
 /*
  * Cross-core safety status.

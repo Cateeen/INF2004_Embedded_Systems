@@ -71,6 +71,8 @@ static void mqtt_connection_callback(mqtt_client_t *client, void *arg,
                                      mqtt_connection_status_t status)
 {
     (void)arg;
+    printf("MQTT connection callback status: %d\n", (int)status);
+    stdio_flush();
     if (status == MQTT_CONNECT_ACCEPTED) {
         mqtt_connecting = false;
         mqtt_set_inpub_callback(client, mqtt_incoming_publish_callback,
@@ -140,6 +142,8 @@ static void mqtt_incoming_data_callback(void *arg, const u8_t *data,
 static void mqtt_subscribe_callback(void *arg, err_t result)
 {
     (void)arg;
+    printf("MQTT subscription callback result: %d\n", (int)result);
+    stdio_flush();
     subscription_pending = false;
     if (result == ERR_OK) {
         subscription_active = true;
@@ -167,6 +171,9 @@ static void start_mqtt_connect(void)
     }
 
     mqtt_connecting = true;
+    printf("MQTT connecting to %s:%u\n", MQTT_BROKER_HOST,
+           (unsigned int)MQTT_BROKER_PORT);
+    stdio_flush();
     result = mqtt_client_connect(mqtt_client, &broker_address,
                                  (u16_t)MQTT_BROKER_PORT,
                                  mqtt_connection_callback, NULL,

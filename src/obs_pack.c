@@ -133,6 +133,11 @@ void obs_msg_pack_proximity(obs_msg_t *m, uint16_t closest_mm){
     from64(m, field_put(start(OBS_MSG_PROXIMITY), closest_mm, 0U, 12U));
 }
 
+/* obs_msg_unpack_proximity - decode a proximity message. */
+uint16_t obs_msg_unpack_proximity(const obs_msg_t *m){
+    return (uint16_t)field_get(to64(m), 0U, 12U);
+}
+
 /* obs_msg_pack_simple - build a message with at most one 10-bit number.
  * Used for SCAN_CLEAR and LINE_REACQUIRED: [9:0] scan_ms, [63:61] type. */
 void obs_msg_pack_simple(obs_msg_t *m, obs_msg_type_t type, uint16_t scan_ms){
@@ -167,5 +172,4 @@ void obs_msg_from_bytes(obs_msg_t *m, const uint8_t in[8]){
     }
     from64(m, w);
 }
-
 

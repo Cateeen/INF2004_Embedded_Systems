@@ -87,6 +87,8 @@ void obs_msg_unpack_line_search(const obs_msg_t *m, uint8_t *dir_side, uint16_t 
 
 /* Pack PROXIMITY: closest distance in mm. */
 void obs_msg_pack_proximity(obs_msg_t *m, uint16_t closest_mm);
+/* Decode PROXIMITY: closest distance in mm. */
+uint16_t obs_msg_unpack_proximity(const obs_msg_t *m);
 /* Pack FAULT_EVT: the four OBS_FAULT_* bits.*/
 void obs_msg_pack_fault(obs_msg_t *m, uint32_t fault_bits);
 

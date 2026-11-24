@@ -5,6 +5,8 @@
 #include <sys/sysdef.h>
 #include <tk/syslib.h>
 
+#define ENCODER_PULL_SETTLE_MS 5
+
 static encoder_pair_t s_pair;
 static bool s_registered;
 
@@ -31,6 +33,15 @@ ER encoder_source_register(void)
 		clr_w(GPIO(pin), GPIO_PDE);
 		set_w(GPIO(pin), GPIO_PUE);
 	}
+	/* The pins come out of reset with pull-DOWNs on. A channel parked high
+	 * needs time to rise through the new pull-up before it is sampled:
+	 * sampling it mid-rise records a stale 0 as the starting state, and
+	 * gpio_dispatcher_start() then clears the latched rise edge. The first
+	 * real edge looks like "a channel changed without an edge" (BAD_STEP),
+	 * which latches the pair invalid until reboot and stops the motors.
+	 * Whether it happens depends on where the wheel stopped, which is why it
+	 * looked random across resets. */
+	tk_dly_tsk(ENCODER_PULL_SETTLE_MS);
 	encoder_pair_init(&s_pair, in_w(GPIO_IN));
 	er = gpio_dispatcher_register(mask, encoder_irq, NULL);
 	if (er < E_OK) return er;

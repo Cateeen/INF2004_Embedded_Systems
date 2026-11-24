@@ -127,6 +127,9 @@ static BOOL invalid_test(void)
 	if (wheel_speed_control_init(&control, &config)) return false;
 	config.max_pwm_percent = 60U;
 	if (!wheel_speed_control_init(&control, &config) ||
+	    wheel_speed_control_set_targets(&control, 0.0f, 10.0f) ||
+	    wheel_speed_control_set_targets(&control, 10.0f, __builtin_huge_valf()) ||
+	    control.left_target_cm_s != 10.0f || control.right_target_cm_s != 10.0f ||
 	    !wheel_speed_control_update(&control, 10.0f, 10.0f, 0.1f, &out) ||
 	    wheel_speed_control_update(&control, -1.0f, 10.0f, 0.1f, &out) ||
 	    out.left_pwm_percent != 0U || out.right_pwm_percent != 0U ||
@@ -140,6 +143,61 @@ static BOOL invalid_test(void)
 	       !wheel_speed_control_update(&control, 0.0f, 0.0f, 0.1f, &out) &&
 	       out.left_pwm_percent == 0U && out.right_pwm_percent == 0U &&
 	       control.left_pid.first_update && control.right_pid.first_update;
+}
+
+/* Per-wheel feed-forward: each wheel starts from the PWM for its own target. */
+static BOOL feed_forward_test(void)
+{
+	wheel_speed_control_t control;
+	/* Vehicle model: 22 % holds 15 cm/s, +1.4 % per cm/s. No PID action. */
+	wheel_speed_config_t config = {0.0f, 0.0f, 0.0f, 12.0f, 22U, 60U, 1.4f, 15.0f};
+	wheel_speed_output_t out;
+
+	/* A 4/18 turn: 22 - 1.4 * 11 = 6.6 -> 7 %; 22 + 1.4 * 3 = 26.2 -> 26 %. */
+	if (!wheel_speed_control_init(&control, &config) ||
+	    !wheel_speed_control_set_targets(&control, 4.0f, 18.0f) ||
+	    !wheel_speed_control_update(&control, 4.0f, 18.0f, 0.05f, &out) ||
+	    out.left_pwm_percent != 7U || out.right_pwm_percent != 26U)
+		return false;
+	/* Low targets stay above zero with this model: 22 - 1.4 * 14.9 = 1.1 %. */
+	if (!wheel_speed_control_set_targets(&control, 0.1f, 18.0f) ||
+	    !wheel_speed_control_update(&control, 0.1f, 18.0f, 0.05f, &out) ||
+	    out.left_pwm_percent != 1U)
+		return false;
+	/* Clamped to 0..max (reference 30 cm/s): 22 - 1.4 * 26 < 0; 22 + 1.4 * 30 > 60. */
+	config.ff_ref_speed_cm_s = 30.0f;
+	if (!wheel_speed_control_init(&control, &config) ||
+	    !wheel_speed_control_set_targets(&control, 4.0f, 60.0f) ||
+	    !wheel_speed_control_update(&control, 4.0f, 60.0f, 0.05f, &out) ||
+	    out.left_pwm_percent != 0U || out.right_pwm_percent != 60U)
+		return false;
+	config.ff_ref_speed_cm_s = 15.0f;
+	/* The PID corrects around it, and its limits follow it: a wheel far too
+	 * slow saturates at max (60), not at base + (max - base). */
+	config.kp = 100.0f;
+	if (!wheel_speed_control_init(&control, &config) ||
+	    !wheel_speed_control_set_targets(&control, 4.0f, 18.0f) ||
+	    !wheel_speed_control_update(&control, 4.0f, 0.0f, 0.05f, &out) ||
+	    out.left_pwm_percent != 7U || out.right_pwm_percent != 60U ||
+	    control.right_pid.output_max > 60.0f - 26.1f ||
+	    control.left_pid.output_min < -6.7f)
+		return false;
+	/* Zero slope is the old flat base for both wheels. */
+	config.kp = 0.0f;
+	config.ff_pwm_per_cm_s = 0.0f;
+	if (!wheel_speed_control_init(&control, &config) ||
+	    !wheel_speed_control_set_targets(&control, 4.0f, 18.0f) ||
+	    !wheel_speed_control_update(&control, 4.0f, 18.0f, 0.05f, &out) ||
+	    out.left_pwm_percent != 22U || out.right_pwm_percent != 22U)
+		return false;
+	/* Invalid: negative slope, slope without a reference, non-finite. */
+	config.ff_pwm_per_cm_s = -1.0f;
+	if (wheel_speed_control_init(&control, &config)) return false;
+	config.ff_pwm_per_cm_s = 1.4f;
+	config.ff_ref_speed_cm_s = 0.0f;
+	if (wheel_speed_control_init(&control, &config)) return false;
+	config.ff_ref_speed_cm_s = __builtin_huge_valf();
+	return !wheel_speed_control_init(&control, &config);
 }
 
 static wheel_odometry_message_t control_odometry(uint32_t sequence, uint32_t timestamp,
@@ -244,9 +302,11 @@ BOOL wheel_speed_test(void)
 	BOOL feedback_ok;
 	BOOL control_ok;
 	BOOL control_faults_ok;
+	BOOL feed_forward_ok;
 	TEST_INIT();
 
 	correction_ok = correction_test();
+	feed_forward_ok = feed_forward_test();
 	pid_ok = pid_state_test();
 	invalid_ok = invalid_test();
 	feedback_ok = feedback_test();
@@ -258,8 +318,10 @@ BOOL wheel_speed_test(void)
 	TEST_CHECK("MOT-U04", feedback_ok, "signed wheel feedback and stale inputs");
 	TEST_CHECK("MOT-U05", control_ok, "straight control waits for fresh wheel feedback");
 	TEST_CHECK("MOT-U06", control_faults_ok, "control faults latch and clear output");
+	TEST_CHECK("MOT-U14", feed_forward_ok,
+		   "per-wheel feed-forward from each target, clamped, PID limits follow it");
 	TEST_SUMMARY("wheel speed");
 	return correction_ok && pid_ok && invalid_ok && feedback_ok &&
-	       control_ok && control_faults_ok;
+	       control_ok && control_faults_ok && feed_forward_ok;
 }
 #endif

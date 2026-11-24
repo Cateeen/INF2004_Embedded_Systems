@@ -93,15 +93,18 @@ bool car_safety_line(car_safety_t *safety, const line_observation_message_t *mes
 	if (safety == NULL || !safety->initialized) return false;
 	if (!clock_valid(safety, now_ms) || !check_deadlines(safety, now_ms)) return false;
 	if (message == NULL || message->line_detected > 1U ||
-	    message->intersection_detected > 1U || message->confidence > 1000U)
+	    message->intersection_detected > 1U || message->picked_up > 1U ||
+	    message->confidence > 1000U)
 		return fail(safety, CAR_SAFETY_FAULT_LINE);
 	if (!accept(safety, &safety->line, &message->header, VEHICLE_MESSAGE_LINE_OBSERVATION,
 		    now_ms, safety->config.line_max_age_ms, safety->line_wait_ms,
 		    CAR_SAFETY_FAULT_LINE))
 		return false;
+	/* The line is required to ARM (car_safety_follow); once following, a
+	 * lost line is handled by the steering (300 ms hold, then a latched
+	 * stop) and is expected during a junction turn, so it does not disarm. */
 	safety->line_clear = message->line_detected == 1U &&
 			     message->confidence >= safety->config.min_line_confidence;
-	if (!safety->line_clear) safety->armed = false;
 	return true;
 }
 
@@ -189,19 +192,31 @@ bool car_safety_follow(car_safety_t *safety, uint32_t now_ms,
 		       bool go, bool go_rising, bool emergency_stopped)
 {
 	bool blocked;
+	bool arm_blocked;
 
 	if (safety == NULL || !safety->initialized) return false;
 	if (!clock_valid(safety, now_ms)) return false;
 	(void)check_deadlines(safety, now_ms);
 	if (emergency_stopped) (void)fail(safety, CAR_SAFETY_FAULT_EMERGENCY);
-	blocked = safety->scanning || !safety->line.have_message || !safety->line_clear ||
+	/* Hazards stop a following robot at once. The line must be seen to
+	 * (re)arm, but losing it while following is the steering's job. */
+	blocked = safety->scanning || !safety->line.have_message ||
 		  !safety->imu.have_message || !safety->imu_clear ||
 		  !safety->have_ahead || !safety->ahead_clear;
+	arm_blocked = blocked || !safety->line_clear;
 	if (!car_gate_follow(go, emergency_stopped, safety->faults, blocked)) {
 		safety->armed = false;
 	} else if (!safety->armed &&
-		   car_gate_rearm(go_rising, emergency_stopped, safety->faults, blocked)) {
+		   car_gate_rearm(go_rising, emergency_stopped, safety->faults, arm_blocked)) {
 		safety->armed = true;
 	}
 	return safety->armed;
+}
+
+bool car_safety_resume(car_safety_t *safety, uint32_t now_ms,
+		       bool go, bool emergency_stopped)
+{
+	/* The same gate as a GO press (go_rising), only without the press. */
+	if (!go) return false;
+	return car_safety_follow(safety, now_ms, go, true, emergency_stopped);
 }

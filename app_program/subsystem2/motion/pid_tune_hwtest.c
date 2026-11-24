@@ -11,6 +11,9 @@
  *   1  step response, wheels IN THE AIR, for PID_AIR_MS
  *   2  forward  PID_DIST_MM on the floor
  *   3  reverse  PID_DIST_MM on the floor (back along the same line)
+ *   4  forward arc left  PID_DIST_MM: wheels at PID_SPEED -/+ PID_TURN, as a
+ *      line-steering VELOCITY command drives them (PID_TURN=0 skips 4-5)
+ *   5  forward arc right
  *
  * Each step prints a trace (t, speed and PWM per wheel; PID_TRACE=0 hides it)
  * and a summary per wheel: rise time to 90 %, overshoot, steady-state speed
@@ -67,6 +70,13 @@
 #ifndef PID_TRACE
 #define PID_TRACE 1U
 #endif
+#ifndef PID_TURN
+#define PID_TURN 4U           /* arc steps: wheels at SPEED -/+ TURN; 0 skips */
+#endif
+#ifndef PID_FF
+#define PID_FF 0.0            /* feed-forward %PWM per cm/s around PID_BASE at PID_SPEED */
+#endif
+_Static_assert((PID_FF) >= 0.0 && (PID_FF) <= 5.0, "need 0 <= PID_FF <= 5");
 
 _Static_assert(PID_SPEED >= 3U && PID_SPEED <= 40U, "need 3 <= PID_SPEED <= 40 cm/s");
 _Static_assert(PID_BASE >= 1U && PID_BASE <= PID_MAX && PID_MAX <= 80U,
@@ -75,6 +85,8 @@ _Static_assert(PID_PERIOD_MS >= 10U && PID_PERIOD_MS <= 200U, "need 10 <= PID_PE
 _Static_assert(PID_DIST_MM >= 100U && PID_DIST_MM <= 2000U, "need 100 <= PID_DIST_MM <= 2000");
 _Static_assert(PID_AIR_MS >= 1000U && PID_AIR_MS <= 10000U, "need 1000 <= PID_AIR_MS <= 10000");
 _Static_assert(PID_TRACE <= 1U, "PID_TRACE must be 0 or 1");
+_Static_assert(PID_TURN < PID_SPEED && PID_SPEED + PID_TURN <= 40U,
+	       "need PID_TURN < PID_SPEED and PID_SPEED + PID_TURN <= 40");
 
 /* Same calibration as the vehicle (app_main.c) and motor_moves_hwtest.c. */
 #define COUNTS_PER_REV     2500.0f
@@ -102,17 +114,31 @@ typedef struct {
 	const char *setup;
 	int8_t dir;             /* +1 forward, -1 reverse */
 	bool timed;             /* true: PID_AIR_MS; false: PID_DIST_MM */
+	int8_t turn;            /* +1 arc left, -1 arc right (PID_TURN), 0 straight */
 } step_t;
 
 static const step_t s_steps[] = {
 	{ "step response (in the air)",
-	  "LIFT the robot onto a block so BOTH wheels spin freely in the air", 1, true },
+	  "LIFT the robot onto a block so BOTH wheels spin freely in the air", 1, true, 0 },
 	{ "forward on the floor",
-	  "put the robot ON THE FLOOR, nose along a tape line", 1, false },
+	  "put the robot ON THE FLOOR, nose along a tape line", 1, false, 0 },
 	{ "reverse on the floor",
-	  "leave it where it stopped; it backs up along the same line", -1, false },
+	  "leave it where it stopped; it backs up along the same line", -1, false, 0 },
+	{ "forward arc LEFT (line steering)",
+	  "re-square on the tape; needs room ahead and to the LEFT", 1, false, 1 },
+	{ "forward arc RIGHT (line steering)",
+	  "re-square on the tape; needs room ahead and to the RIGHT", 1, false, -1 },
 };
 #define STEP_COUNT (sizeof(s_steps) / sizeof(s_steps[0]))
+
+/* Wheel target for a step: left = speed - turn, right = speed + turn, as the
+ * motion task does for a VELOCITY command with angular_velocity = turn. */
+static float wheel_target(const step_t *st, bool left)
+{
+	float turn = (float)st->turn * (float)PID_TURN;
+
+	return (float)PID_SPEED + (left ? -turn : turn);
+}
 
 typedef enum { RUN_OK = 0, RUN_ABORT_GO, RUN_TIMEOUT, RUN_STALL_L, RUN_STALL_R,
 	       RUN_WRONG_L, RUN_WRONG_R, RUN_ENCODER, RUN_PID } run_status_t;
@@ -248,7 +274,10 @@ static run_status_t run_step(const step_t *st, wheel_speed_control_t *pid, run_r
 	char b1[16], b2[16];
 
 	*res = (run_result_t){ 0 };
-	if (!wheel_speed_control_reset(pid)) return RUN_PID;
+	if (!wheel_speed_control_reset(pid) ||
+	    !wheel_speed_control_set_targets(pid, wheel_target(st, true),
+					     wheel_target(st, false)))
+		return RUN_PID;
 	if (!read_mm(&l0, &r0)) return RUN_ENCODER;
 	pl = l = l0;
 	pr = r = r0;
@@ -335,9 +364,8 @@ typedef struct {
 	bool saturated;
 } wheel_stats_t;
 
-static wheel_stats_t wheel_stats(unsigned n, bool left)
+static wheel_stats_t wheel_stats(unsigned n, bool left, float target)
 {
-	const float target = (float)PID_SPEED;
 	unsigned start = n / 2U, steady_n = 0U, i;
 	wheel_stats_t w = { false, 0U, 0.0f, 0.0f, 1e9f, -1e9f, 0.0f, false };
 
@@ -366,28 +394,29 @@ static wheel_stats_t wheel_stats(unsigned n, bool left)
 	return w;
 }
 
-static void print_wheel(const char *name, const wheel_stats_t *w)
+static void print_wheel(const char *name, const wheel_stats_t *w, float target)
 {
-	const float target = (float)PID_SPEED;
-	char b1[16], b2[16], b3[16], b4[16], b5[16];
+	char b0[16], b1[16], b2[16], b3[16], b4[16], b5[16];
 
 	if (w->risen)
-		tm_printf((UB*)TAG "  %s: rise %u ms  overshoot %s%%  steady %s cm/s (%s%% err)  "
-			  "ripple %s cm/s  pwm %s%%\n", name, (unsigned)w->rise_ms,
+		tm_printf((UB*)TAG "  %s: target %s  rise %u ms  overshoot %s%%  steady %s cm/s "
+			  "(%s%% err)  ripple %s cm/s  pwm %s%%\n", name, f1(b0, target),
+			  (unsigned)w->rise_ms,
 			  f1(b1, (w->peak - target) / target * 100.0f), f1(b2, w->mean),
 			  f1(b3, (w->mean - target) / target * 100.0f), f1(b4, w->hi - w->lo),
 			  f1(b5, w->pwm));
 	else
-		tm_printf((UB*)TAG "  %s: NEVER reached 90%% of target; steady %s cm/s  pwm %s%%\n",
-			  name, f1(b2, w->mean), f1(b5, w->pwm));
+		tm_printf((UB*)TAG "  %s: target %s  NEVER reached 90%% of it; steady %s cm/s  "
+			  "pwm %s%%\n", name, f1(b0, target), f1(b2, w->mean), f1(b5, w->pwm));
 }
 
 static void report(const step_t *st, const run_result_t *res)
 {
 	const float target = (float)PID_SPEED;
+	const float tl = wheel_target(st, true), tr = wheel_target(st, false);
 	char b1[16], b2[16], b3[16], b4[16];
 	wheel_stats_t wl, wr;
-	float err_l, err_r, ripple, overshoot, lr_pct;
+	float err_l, err_r, ripple, overshoot, os_l, os_r, lr_pct;
 	bool hinted = false;
 
 	tm_printf((UB*)TAG "  ran %u ms; travel at brake L %s mm  R %s mm; after coast L %s  R %s\n",
@@ -397,24 +426,57 @@ static void report(const step_t *st, const run_result_t *res)
 		tm_printf((UB*)TAG "  too short to analyse\n");
 		return;
 	}
-	wl = wheel_stats(res->n, true);
-	wr = wheel_stats(res->n, false);
-	print_wheel("LEFT ", &wl);
-	print_wheel("RIGHT", &wr);
+	wl = wheel_stats(res->n, true, tl);
+	wr = wheel_stats(res->n, false, tr);
+	print_wheel("LEFT ", &wl, tl);
+	print_wheel("RIGHT", &wr, tr);
 
-	lr_pct = (wl.mean - wr.mean) / target * 100.0f;
-	tm_printf((UB*)TAG "  steady L-R difference %s%% of target\n", f1(b1, lr_pct));
-	if (!st->timed) {
+	if (st->turn == 0) {
+		lr_pct = (wl.mean - wr.mean) / target * 100.0f;
+		tm_printf((UB*)TAG "  steady L-R difference %s%% of target\n", f1(b1, lr_pct));
+		if (!st->timed) {
+			float h = (res->r_fin - res->l_fin) / TRACK_MM * (180.0f / PI_F);
+			tm_printf((UB*)TAG "  encoder heading drift %s%s deg -- measure the real drift too\n",
+				  h > 0.05f ? "L" : (h < -0.05f ? "R" : ""), f1(b1, absf(h)));
+		}
+	} else {
+		/* Arc: wheel speed ratio and the curve it drove, from the encoders. */
 		float h = (res->r_fin - res->l_fin) / TRACK_MM * (180.0f / PI_F);
-		tm_printf((UB*)TAG "  encoder heading drift %s%s deg -- measure the real drift too\n",
-			  h > 0.05f ? "L" : (h < -0.05f ? "R" : ""), f1(b1, absf(h)));
+		float d = res->r_fin - res->l_fin;
+		float radius = absf(d) > 1.0f ?
+			absf(TRACK_MM * 0.5f * (res->l_fin + res->r_fin) / d) : 0.0f;
+		float inner = st->turn > 0 ? wl.mean : wr.mean;
+		float outer = st->turn > 0 ? wr.mean : wl.mean;
+
+		tm_printf((UB*)TAG "  inner/outer speed %s%% (commanded %s%%)\n",
+			  f1(b1, outer > 0.0f ? inner / outer * 100.0f : 0.0f),
+			  f1(b2, (float)(PID_SPEED - PID_TURN) / (float)(PID_SPEED + PID_TURN) * 100.0f));
+		tm_printf((UB*)TAG "  turned %s%s deg, radius ~%s mm (robot centre) -- compare with "
+			  "the mat\n", h > 0.05f ? "L" : (h < -0.05f ? "R" : ""), f1(b3, absf(h)),
+			  f1(b4, radius));
+		/* Settled PWM per wheel = what each speed really needs, whatever the
+		 * feed-forward: their spread over the speed spread is the slope. */
+		{
+			float pwm_in = st->turn > 0 ? wl.pwm : wr.pwm;
+			float pwm_out = st->turn > 0 ? wr.pwm : wl.pwm;
+			float v_in = st->turn > 0 ? wl.mean : wr.mean;
+			float v_out = st->turn > 0 ? wr.mean : wl.mean;
+
+			if (v_out - v_in > 1.0f)
+				tm_printf((UB*)TAG "  settled PWM inner %s%% outer %s%% -> feed-forward "
+					  "slope ~%s %%/(cm/s) (vehicle uses 1.4)\n", f1(b1, pwm_in),
+					  f1(b2, pwm_out),
+					  f1(b3, (pwm_out - pwm_in) / (v_out - v_in)));
+		}
 	}
 
-	/* Hints, worst first. */
-	err_l = absf(wl.mean - target) / target;
-	err_r = absf(wr.mean - target) / target;
+	/* Hints, worst first; each wheel is judged against its own target. */
+	err_l = absf(wl.mean - tl) / tl;
+	err_r = absf(wr.mean - tr) / tr;
 	ripple = (wl.hi - wl.lo > wr.hi - wr.lo ? wl.hi - wl.lo : wr.hi - wr.lo) / target;
-	overshoot = ((wl.peak > wr.peak ? wl.peak : wr.peak) - target) / target;
+	os_l = (wl.peak - tl) / tl;
+	os_r = (wr.peak - tr) / tr;
+	overshoot = os_l > os_r ? os_l : os_r;
 	if (wl.saturated || wr.saturated) {
 		tm_printf((UB*)TAG "  HINT: PWM hit PID_MAX=%u -- lower PID_SPEED or raise PID_MAX\n",
 			  (unsigned)PID_MAX);
@@ -445,7 +507,7 @@ static void report(const step_t *st, const run_result_t *res)
 			  "near the steady pwm\n");
 		hinted = true;
 	}
-	{
+	if (st->turn == 0) {
 		unsigned base = (unsigned)__builtin_lroundf((wl.pwm + wr.pwm) * 0.5f);
 		if (base != PID_BASE && base >= 1U && base <= PID_MAX)
 			tm_printf((UB*)TAG "  TIP: wheels settled near %u%% PWM; PID_BASE=%u starts "
@@ -475,16 +537,18 @@ static void report_encoder_fault(void)
 	encoder_fault_t f;
 
 	if (encoder_source_fault(&f) < E_OK || f.reason == ENCODER_FAULT_NONE) return;
-	tm_printf((UB*)TAG "  ENCODER FAULT: %s wheel, reason %u (1 both channels, 2 lost edge, "
-		  "3 bad level), %u glitches ignored before it\n",
-		  f.wheel == 1U ? "LEFT" : "RIGHT", (unsigned)f.reason, (unsigned)f.glitches);
+	tm_printf((UB*)TAG "  ENCODER FAULT: %s wheel, reason %u (1 both channels jumped, over "
+		  "the limit; 2 lost edge; 3 bad level), %u glitches and %u both-channel jumps "
+		  "tolerated before it\n", f.wheel == 1U ? "LEFT" : "RIGHT", (unsigned)f.reason,
+		  (unsigned)f.glitches, (unsigned)f.ambiguous);
 }
 
 void pid_tune_hwtest_run(void)
 {
 	const wheel_speed_config_t config = {
 		(float)(PID_KP), (float)(PID_KI), (float)(PID_KD),
-		(float)PID_SPEED, (uint8_t)PID_BASE, (uint8_t)PID_MAX
+		(float)PID_SPEED, (uint8_t)PID_BASE, (uint8_t)PID_MAX,
+		(float)(PID_FF), (float)PID_SPEED
 	};
 	wheel_speed_control_t pid;
 	char b1[16], b2[16], b3[16];
@@ -505,15 +569,17 @@ void pid_tune_hwtest_run(void)
 	s_go_last_pressed = go_pressed_raw();
 
 	tm_printf((UB*)TAG "wheel speed PID tuning: KP %s KI %s KD %s, target %u cm/s, "
-		  "base %u%% max %u%%, every %u ms\n", f2(b1, config.kp), f2(b2, config.ki),
-		  f2(b3, config.kd), (unsigned)PID_SPEED, (unsigned)PID_BASE, (unsigned)PID_MAX,
-		  (unsigned)PID_PERIOD_MS);
+		  "base %u%% max %u%%, every %u ms, arc turn %u cm/s\n", f2(b1, config.kp),
+		  f2(b2, config.ki), f2(b3, config.kd), (unsigned)PID_SPEED, (unsigned)PID_BASE,
+		  (unsigned)PID_MAX, (unsigned)PID_PERIOD_MS, (unsigned)PID_TURN);
 	tm_printf((UB*)TAG "each GO press runs the next step; GO during a move = STOP\n");
 
 	for (i = 0U; i < STEP_COUNT; i++) {
 		const step_t *st = &s_steps[i];
 		run_result_t res;
 		run_status_t status;
+
+		if (st->turn != 0 && PID_TURN == 0U) continue;
 
 		tm_printf((UB*)TAG "SETUP: %s\n", st->setup);
 		tm_printf((UB*)TAG "---- step %u/%u: %s -- press GO ----\n", i + 1U,

@@ -468,9 +468,10 @@ static void report_glitches(void)
 {
 	encoder_fault_t f;
 
-	if (encoder_source_fault(&f) >= E_OK && f.glitches != 0U)
-		tm_printf((UB*)TAG "  encoder glitches ignored so far: %u (noise; counts unaffected)\n",
-			  (unsigned)f.glitches);
+	if (encoder_source_fault(&f) >= E_OK && (f.glitches != 0U || f.ambiguous != 0U))
+		tm_printf((UB*)TAG "  encoder noise ignored so far: %u glitches (counts unaffected), "
+			  "%u both-channel jumps (<= 2 counts each)\n",
+			  (unsigned)f.glitches, (unsigned)f.ambiguous);
 }
 
 /* Explains why the encoder went invalid (first fault only). */
@@ -478,7 +479,7 @@ static void report_encoder_fault(void)
 {
 	static const char *const reason_text[] = {
 		"none recorded (the snapshot read itself failed)",
-		"MULTI_EDGE: edges on both A and B in one IRQ (IRQ too late or heavy noise)",
+		"MULTI_EDGE: A and B jumped together too often (supply/ground noise, or IRQ too late)",
 		"BAD_STEP: a pin changed with no edge on it (lost edge)",
 		"BAD_LEVEL: edge direction disagrees with the pin level (short glitch)",
 	};

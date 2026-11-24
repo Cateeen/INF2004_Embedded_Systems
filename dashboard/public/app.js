@@ -1,84 +1,198 @@
 'use strict';
-const $=id=>document.getElementById(id);
-let latest=null;
-const get=x=>x===undefined||x===null||x===''?'—':x;
-const asNum=(x,digits=1)=>x===null||x===undefined?'—':Number(x).toFixed(digits);
-const clock=t=>new Date(t||Date.now()).toLocaleTimeString('en-SG',{hour12:false});
-function set(id,value){const node=$(id);if(node)node.textContent=String(value);}
-function statusColor(node,value){node.style.color=value==='Safe stop'?'var(--red)':value==='Line following'?'var(--green)':'var(--ink)';}
-function currentState(d){
-  if(d.vehicle==='FAULT'||d.faultFlags>0)return 'Safe stop';
-  if(d.obstacle==='DETECTED')return 'Obstacle avoidance';
-  if(d.terrain==='HUMP')return 'Terrain event';
-  if(d.line==='FOUND'&&d.vehicle==='RUNNING')return 'Line following';
-  return 'Idle';
+const $ = id => document.getElementById(id);
+const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+const MOVE = {forward: {icon: '↑', label: 'Go straight'}, left: {icon: '↰', label: 'Turn left'},
+  right: {icon: '↱', label: 'Turn right'}, uturn: {icon: '↻', label: 'U-turn'}};
+let latest = null;
+let clockSkew = 0;
+
+const num = (x, digits = 1) => x === null || x === undefined || Number.isNaN(Number(x)) ? '—' : Number(x).toFixed(digits);
+const cm = mm => mm == null ? '—' : num(mm / 10, 1) + ' cm';
+const clock = t => new Date(t || Date.now()).toLocaleTimeString('en-SG', {hour12: false});
+function set(id, value) { const node = $(id); if (node) node.textContent = String(value); }
+function el(tag, cls, text) { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; }
+function chip(id, text, tone) { const n = $(id); n.textContent = text; n.className = 'chip ' + (tone || ''); }
+
+function fmtDuration(ms) {
+  if (ms == null || ms < 0) return '00:00.0';
+  const m = Math.floor(ms / 60000), s = (ms % 60000) / 1000;
+  return String(m).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
 }
-function render(s){
-  latest=s;
-  const d=s.data;
-  const connected=s.carConnected===true;
-  const connectionLabel=connected?'CAR CONNECTED':s.brokerConnected?'MQTT CONNECTED · NO CAR':'NO MQTT CONNECTION';
-  set('connection-text',connectionLabel);
-  set('side-state',connectionLabel);
-  $('connection-dot').className='signal '+(connected?'ok':'bad');
-  $('side-dot').className='signal '+(connected?'ok':'bad');
-  $('stale-banner').classList.toggle('hidden',!s.stale);
-  ['robot-start','robot-stop','forward','reverse','left','right','uturn','save-mapping']
-    .forEach(id=>{const node=$(id);if(node)node.disabled=!connected;});
-  if(!d){
-    ['vehicle-status','speed','distance','speed-src','distance-src','safety-status','vehicle-hint','mqtt-status','mqtt-details','ir-status','ir-details','barcode-status','barcode-details','terrain-status','imu-details','obs-status','obs-details'].forEach(id=>set(id,'—'));
-    set('vehicle-hint','No current telemetry');set('safety-note','Unknown — do not assume clear');
-    return;
-  }
-  const state=currentState(d);
-  set('vehicle-status',state);statusColor($('vehicle-status'),state);
-  set('vehicle-hint','Live robot telemetry');
-  set('speed',asNum(d.speedMps,2));set('speed-src',d.speedMps==null?'not transmitted':'live telemetry');
-  set('distance',asNum(d.distanceM,2));set('distance-src',d.distanceM==null?'not transmitted':'live telemetry');
-  const emergency=d.vehicle==='FAULT'||d.faultFlags>0;
-  set('safety-status',emergency?'FAULT':'NO FAULT REPORTED');
-  $('safety-status').style.color=emergency?'var(--red)':'var(--green)';
-  set('safety-note',emergency?'Fault flags: '+(d.faults?.join(', ')||'unknown'):'Telemetry flags only · not physical safety assurance');
-  set('mqtt-status',s.broker);set('mqtt-details',`Seq ${get(d.sequence)} · ${s.packets} valid packets`);
-  set('ir-status',d.ir?`${d.ir.barcode}/${d.ir.center}/${d.ir.right}`:'NOT EXPOSED');
-  set('ir-details','barcode / centre / right');
-  set('barcode-status',d.barcode||'—');set('barcode-details','Latest decoded character');
-  set('terrain-status',d.terrain);set('imu-details',d.humpHeightCm==null?'Height unavailable':`${d.humpHeightCm} cm`);
-  set('obs-status',d.obstacle);set('obs-details',d.obstacleMm==null?'Distance unavailable':`${d.obstacleMm} mm`);
-  renderLog(s.events);
+function runTime(s) {
+  const r = s && s.run;
+  if (!r || !r.startedAt) return null;
+  return (r.endedAt || (Date.now() + clockSkew)) - r.startedAt;
 }
-function renderLog(events){
-  const el=$('event-list');el.replaceChildren();
-  if(!events.length){const n=document.createElement('div');n.className='emptylog';n.textContent='No recorded events yet';el.append(n);return;}
-  for(const e of events){
-    const r=document.createElement('div');r.className='logitem';
-    const t=document.createElement('time');t.textContent=clock(e.at);
-    const k=document.createElement('span');k.className='kind '+e.kind.toLowerCase();k.textContent=e.kind;
-    const m=document.createElement('span');m.textContent=e.message;r.append(t,k,m);el.append(r);
-  }
+function sinceRunStart(s, at) {
+  return s.run && s.run.startedAt ? '+' + fmtDuration(at - s.run.startedAt) : clock(at);
 }
-async function post(url,obj){
-  try{const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});if(!r.ok)throw Error(await r.text());}
-  catch(e){alert('Dashboard request failed: '+e.message);}
+
+function currentState(d, s) {
+  if (s.run.pickedUp) return ['Picked up · stopped', 'red'];
+  if (d.vehicle === 'FAULT' || d.faultFlags > 0) return ['Fault · safe stop', 'red'];
+  const phase = s.run.obstacle.phase;
+  if (d.obstacle === 'DETECTED' || ['SCANNING', 'BYPASS', 'SEARCH'].includes(phase)) return ['Avoiding obstacle', 'amber'];
+  if (d.terrain === 'HUMP') return ['On hump', 'amber'];
+  if (d.line === 'FOUND' && d.vehicle === 'RUNNING') return ['Line following', 'green'];
+  if (d.line === 'LOST' && d.vehicle === 'RUNNING') return ['Searching for line', 'amber'];
+  return [d.vehicle === 'COMPLETE' ? 'Complete' : 'Idle', ''];
 }
-$('robot-start').addEventListener('click',()=>post('/api/command',{type:'start'}));
-$('robot-stop').addEventListener('click',()=>post('/api/command',{type:'stop'}));
-document.querySelectorAll('[data-command]').forEach(button=>button.addEventListener('click',()=>post('/api/command',{type:button.dataset.command})));
-async function loadMapping(){try{const r=await fetch('/api/mapping');const mappings=await r.json();$('mapping-movement').value=mappings[$('mapping-letter').value]||'forward';}catch(e){console.warn('Mapping load failed',e);}}
-$('mapping-letter').addEventListener('change',loadMapping);
-$('save-mapping').addEventListener('click',()=>post('/api/mapping',{letter:$('mapping-letter').value,movement:$('mapping-movement').value}));
-loadMapping();
-$('clear-log').addEventListener('click',async()=>{
-  if(!confirm('Clear the event timeline?'))return;
-  await post('/api/events/clear',{});
+
+/* ---- Static parts built once ------------------------------------------- */
+const letterSelect = $('mapping-letter');
+LETTERS.forEach(l => letterSelect.append(new Option(l, l)));
+const grid = $('letter-grid');
+LETTERS.forEach(l => {
+  const b = el('button', 'letter');
+  b.type = 'button'; b.dataset.letter = l;
+  b.append(el('span', 'l', l), el('span', 'm', '↑'));
+  b.addEventListener('click', () => { letterSelect.value = l; syncMappingForm(); });
+  grid.append(b);
 });
-$('download-log').addEventListener('click',()=>{
-  const rows=[['Time','Type','Event'],...(latest?.events||[]).map(e=>[new Date(e.at).toISOString(),e.kind,e.message])];
-  const csv=rows.map(r=>r.map(s=>'"'+String(s).replaceAll('"','""')+'"').join(',')).join('\r\n');
-  const blob=new Blob([csv],{type:'text/csv'}),url=URL.createObjectURL(blob),a=document.createElement('a');
-  a.href=url;a.download='picocar-events.csv';a.click();URL.revokeObjectURL(url);
+let mappingShown = false;
+function syncMappingForm() {
+  if (latest) { $('mapping-movement').value = latest.mapping[letterSelect.value] || 'forward'; mappingShown = true; }
+  highlightEditing();
+}
+function highlightEditing() {
+  grid.querySelectorAll('.letter').forEach(b => b.classList.toggle('editing', b.dataset.letter === letterSelect.value));
+}
+letterSelect.addEventListener('change', syncMappingForm);
+
+/* ---- Render ----------------------------------------------------------------- */
+function renderNextJunction(s) {
+  const nj = s.nextJunction;
+  const mv = MOVE[nj.action] || MOVE.left;
+  set('nj-icon', mv.icon);
+  set('nj-action', mv.label.toUpperCase());
+  set('nj-source', nj.letter ? 'From barcode ' + nj.letter + ' · decoded ' + sinceRunStart(s, nj.at)
+    : 'Default — no barcode decoded yet');
+  $('next-card').classList.toggle('isdefault', !nj.letter);
+}
+
+function renderMapping(s) {
+  const last = s.run.barcodes[0];
+  grid.querySelectorAll('.letter').forEach(b => {
+    const mv = s.mapping[b.dataset.letter] || 'forward';
+    b.querySelector('.m').textContent = MOVE[mv].icon;
+    b.title = b.dataset.letter + ' → ' + MOVE[mv].label;
+    b.classList.toggle('changed', mv !== 'forward');
+    b.classList.toggle('lastread', !!last && last.letter === b.dataset.letter);
+  });
+  set('last-barcode-tag', last ? 'LAST DECODED: ' + last.letter : 'NO BARCODE YET');
+  const list = $('barcode-list');
+  list.replaceChildren();
+  if (!s.run.barcodes.length) { list.append(el('div', 'emptylog', 'No barcodes read this run')); return; }
+  for (const b of s.run.barcodes) {
+    const row = el('div', 'barcode-row');
+    row.append(el('span', 'code', b.letter), el('span', 'arrow', MOVE[b.action].icon + ' ' + MOVE[b.action].label),
+      el('span', 'status ' + b.status, b.status === 'done' ? 'EXECUTED' : 'SENT'), el('time', null, sinceRunStart(s, b.at)));
+    list.append(row);
+  }
+}
+
+function renderCards(s, d) {
+  const r = s.run;
+  /* Line */
+  set('line-word', !d ? '—' : d.line === 'FOUND' ? 'On line' : d.line === 'LOST' ? 'Line lost' : 'Unknown');
+  set('line-losses', r.startedAt ? r.line.losses + ' time' + (r.line.losses === 1 ? '' : 's') : '—');
+  set('ir-raw', d && d.ir ? `${d.ir.left ?? d.ir.barcode ?? '—'} / ${d.ir.center ?? '—'} / ${d.ir.right ?? '—'}` : 'not sent');
+  const line = d ? d.line : null;
+  chip('line-chip', line || '—', line === 'FOUND' ? 'green' : line === 'LOST' ? 'amber' : '');
+  /* Hump */
+  set('hump-peak', r.hump.peakCm == null ? '—' : num(r.hump.peakCm, 1));
+  const onHump = d && d.terrain === 'HUMP';
+  set('hump-now', onHump && d.humpHeightCm != null ? num(d.humpHeightCm, 1) + ' cm' : onHump ? 'on hump' : 'flat');
+  chip('terrain-chip', d ? d.terrain : '—', onHump ? 'amber' : d && d.terrain === 'FLAT' ? 'green' : '');
+  /* Obstacle */
+  const o = r.obstacle;
+  set('obs-width', o.widthMm == null ? '—' : num(o.widthMm / 10, 1));
+  set('obs-dist', d && d.obstacleMm != null ? cm(d.obstacleMm) : o.distanceMm != null ? cm(o.distanceMm) + ' (at detection)' : '—');
+  set('obs-clear', o.clearLeftMm == null && o.clearRightMm == null ? '—' : cm(o.clearLeftMm) + ' / ' + cm(o.clearRightMm));
+  set('obs-side', o.side || '—');
+  const total = (o.clearLeftMm || 0) + (o.widthMm || 0) + (o.clearRightMm || 0);
+  [['seg-left', o.clearLeftMm], ['seg-mid', o.widthMm], ['seg-right', o.clearRightMm]].forEach(([id, v]) => {
+    $(id).style.width = total ? ((v || 0) / total * 100) + '%' : '0%';
+  });
+  $('seg-left').classList.toggle('chosen', o.side === 'LEFT');
+  $('seg-right').classList.toggle('chosen', o.side === 'RIGHT');
+  const phase = o.phase === 'IDLE' ? (d && d.obstacle === 'CLEAR' ? 'CLEAR' : d ? d.obstacle : '—') : o.phase;
+  chip('obstacle-chip', phase, phase === 'REJOINED' || phase === 'CLEAR' ? 'green' : phase === '—' || phase === 'UNKNOWN' ? '' : 'amber');
+  /* MQTT */
+  const now = Date.now() + clockSkew;
+  set('mqtt-rate', s.carConnected ? num(s.rateHz, 1) : '—');
+  set('mqtt-age', s.lastSeen ? num((now - s.lastSeen) / 1000, 1) + ' s ago' : 'never');
+  set('mqtt-hb', s.lastHeartbeat ? num((now - s.lastHeartbeat) / 1000, 1) + ' s ago' : 'none received');
+  set('mqtt-count', s.packets + ' / ' + s.invalid);
+  chip('mqtt-chip', s.preview ? 'PREVIEW' : s.broker, s.carConnected ? 'green' : 'red');
+}
+
+function renderLog(events, s) {
+  const list = $('event-list');
+  list.replaceChildren();
+  if (!events.length) { list.append(el('div', 'emptylog', 'No recorded events yet')); return; }
+  for (const e of events) {
+    const r = el('div', 'logitem');
+    r.append(el('time', null, clock(e.at)), el('span', 'kind ' + e.kind.toLowerCase(), e.kind), el('span', null, e.message));
+    list.append(r);
+  }
+}
+
+function render(s) {
+  latest = s;
+  clockSkew = s.now - Date.now();
+  const d = s.data;
+  const connected = s.carConnected === true;
+  const label = s.preview ? 'PREVIEW · SIMULATED CAR' : connected ? 'CAR CONNECTED' : s.brokerConnected ? 'MQTT CONNECTED · NO CAR' : 'NO MQTT CONNECTION';
+  set('connection-text', label); set('side-state', label);
+  $('connection-dot').className = 'signal ' + (connected ? 'ok' : 'bad');
+  $('side-dot').className = 'signal ' + (connected ? 'ok' : 'bad');
+  $('preview-banner').classList.toggle('hidden', !s.preview);
+  $('stale-banner').classList.toggle('hidden', !s.stale || s.preview);
+  $('pickup-banner').classList.toggle('hidden', !s.run.pickedUp);
+  if (s.run.pickedUp) set('pickup-detail', 'End of demo · run time ' + fmtDuration(runTime(s)));
+  set('link-tag', s.preview ? 'PREVIEW' : 'LIVE MQTT');
+  set('footer-mode', s.preview ? 'Preview mode · simulated data' : 'Local dashboard · real MQTT data only');
+  ['robot-start', 'robot-stop', 'save-mapping'].forEach(id => { $(id).disabled = !s.brokerConnected; });
+  set('timer-label', s.run.endedAt ? 'FINAL RUN TIME' : s.run.startedAt ? 'RUN TIME' : 'RUN TIME · NOT STARTED');
+  $('run-timer').classList.toggle('frozen', !!s.run.endedAt);
+
+  if (d) {
+    const [state, tone] = currentState(d, s);
+    set('vehicle-status', state);
+    $('vehicle-status').className = 'kpi-value small ' + tone;
+    set('vehicle-hint', d.faults && d.faults.length ? 'Faults: ' + d.faults.join(', ') : 'Vehicle ' + d.vehicle.toLowerCase() + ' · line ' + d.line.toLowerCase());
+  } else {
+    set('vehicle-status', '—'); $('vehicle-status').className = 'kpi-value small';
+    set('vehicle-hint', 'No current telemetry');
+  }
+  renderNextJunction(s);
+  renderMapping(s);
+  renderCards(s, d);
+  renderLog(s.events, s);
+  if (mappingShown) highlightEditing(); else syncMappingForm();
+}
+
+/* ---- Actions ---------------------------------------------------------------- */
+async function post(url, obj) {
+  try {
+    const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(obj)});
+    if (!r.ok) throw Error(await r.text());
+  } catch (e) { alert('Dashboard request failed: ' + e.message); }
+}
+$('robot-start').addEventListener('click', () => post('/api/command', {type: 'start'}));
+$('robot-stop').addEventListener('click', () => post('/api/command', {type: 'stop'}));
+$('save-mapping').addEventListener('click', () => post('/api/mapping', {letter: letterSelect.value, movement: $('mapping-movement').value}));
+$('reset-run').addEventListener('click', () => { if (confirm('Clear the run timer and barcode history? Next junction returns to Turn left.')) post('/api/run/reset', {}); });
+$('clear-log').addEventListener('click', () => { if (confirm('Clear the event timeline?')) post('/api/events/clear', {}); });
+$('download-log').addEventListener('click', () => {
+  const rows = [['Time', 'Type', 'Event'], ...(latest?.events || []).map(e => [new Date(e.at).toISOString(), e.kind, e.message])];
+  const csv = rows.map(r => r.map(x => '"' + String(x).replaceAll('"', '""') + '"').join(',')).join('\r\n');
+  const blob = new Blob([csv], {type: 'text/csv'}), url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = 'picocar-run.csv'; a.click(); URL.revokeObjectURL(url);
 });
-setInterval(()=>set('localtime',clock()),1000);set('localtime',clock());
-const feed=new EventSource('/api/events');
-feed.onmessage=e=>{try{render(JSON.parse(e.data));}catch(err){console.warn('Invalid dashboard event',err);}};
-feed.onerror=()=>set('connection-text','Dashboard reconnecting…');
+
+setInterval(() => set('run-timer', fmtDuration(runTime(latest))), 100);
+const feed = new EventSource('/api/events');
+feed.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) { console.warn('Invalid dashboard event', err); } };
+feed.onerror = () => set('connection-text', 'Dashboard reconnecting…');

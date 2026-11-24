@@ -4,14 +4,13 @@
 
 #define MOTION_MAX_CONTROL_INTERVAL_MS 250U
 
-bool motion_control_start(motion_control_t *control,
-			  const motion_control_config_t *config,
-			  int8_t direction, uint32_t now_ms)
+static bool start(motion_control_t *control, const motion_control_config_t *config,
+		  int8_t direction, int8_t left, int8_t right, uint32_t now_ms)
 {
 	motion_control_t initial = {0};
 
 	if (control == NULL) return false;
-	if (config == NULL || (direction != 1 && direction != -1) ||
+	if (config == NULL || (left != 1 && left != -1) || (right != 1 && right != -1) ||
 	    config->feedback.max_interval_ms > MOTION_MAX_CONTROL_INTERVAL_MS ||
 	    config->feedback.max_age_ms > MOTION_MAX_CONTROL_INTERVAL_MS ||
 	    !motion_feedback_init(&initial.feedback, &config->feedback) ||
@@ -22,9 +21,40 @@ bool motion_control_start(motion_control_t *control,
 	initial.start_ms = now_ms;
 	initial.last_check_ms = now_ms;
 	initial.direction = direction;
+	initial.left_direction = left;
+	initial.right_direction = right;
 	initial.running = true;
 	*control = initial;
 	return true;
+}
+
+bool motion_control_start(motion_control_t *control,
+			  const motion_control_config_t *config,
+			  int8_t direction, uint32_t now_ms)
+{
+	if (direction != 1 && direction != -1) {
+		if (control != NULL) *control = (motion_control_t){.faulted = true};
+		return false;
+	}
+	return start(control, config, direction, direction, direction, now_ms);
+}
+
+bool motion_control_start_spin(motion_control_t *control,
+			       const motion_control_config_t *config,
+			       int8_t turn_direction, uint32_t now_ms)
+{
+	if (turn_direction != 1 && turn_direction != -1) {
+		if (control != NULL) *control = (motion_control_t){.faulted = true};
+		return false;
+	}
+	return start(control, config, 0, (int8_t)-turn_direction, turn_direction, now_ms);
+}
+
+bool motion_control_set_targets(motion_control_t *control,
+				float left_cm_s, float right_cm_s)
+{
+	if (control == NULL || !control->running || control->faulted) return false;
+	return wheel_speed_control_set_targets(&control->speed, left_cm_s, right_cm_s);
 }
 
 void motion_control_stop(motion_control_t *control)
@@ -71,8 +101,8 @@ motion_control_result_t motion_control_step(motion_control_t *control,
 		result = motion_feedback_update(&control->feedback, message, now_ms, &speeds);
 		if (result == MOTION_FEEDBACK_INVALID) return fault(control, output);
 		if (result == MOTION_FEEDBACK_READY) {
-			left = speeds.left_cm_per_second * control->direction;
-			right = speeds.right_cm_per_second * control->direction;
+			left = speeds.left_cm_per_second * control->left_direction;
+			right = speeds.right_cm_per_second * control->right_direction;
 			if (left < 0.0f || right < 0.0f ||
 			    !wheel_speed_control_update(&control->speed, left, right,
 							speeds.elapsed_seconds, &control->output))

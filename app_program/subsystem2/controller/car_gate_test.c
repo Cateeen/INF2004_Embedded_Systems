@@ -69,9 +69,14 @@ static BOOL safety_rearm_test(void)
 	     safety_inputs(&safety, 1U, 100U) &&
 	     !car_safety_follow(&safety, 100U, true, false, false) &&
 	     car_safety_follow(&safety, 100U, true, true, false);
+	/* A lost line does not disarm a following robot: the steering holds
+	 * 300 ms then latches a stop, and a junction turn leaves the line. */
 	line = safety_line(2U, 101U, 0U);
 	ok = car_safety_line(&safety, &line, 101U) &&
-	     !car_safety_follow(&safety, 101U, true, false, false) && ok;
+	     car_safety_follow(&safety, 101U, true, false, false) && ok;
+	/* Arming still needs the line: GO off, then a GO edge with no line. */
+	ok = !car_safety_follow(&safety, 101U, false, false, false) &&
+	     !car_safety_follow(&safety, 101U, true, true, false) && ok;
 	line = safety_line(3U, 102U, 1U);
 	ok = car_safety_line(&safety, &line, 102U) &&
 	     !car_safety_follow(&safety, 102U, true, false, false) &&
@@ -207,8 +212,11 @@ static BOOL controller_state_flow_test(void)
 	     controller_state_step(&controller, 100U, true, false) == CONTROLLER_BLOCKED &&
 	     controller_state_step(&controller, 100U, false, false) == CONTROLLER_WAITING &&
 	     controller_state_step(&controller, 100U, true, false) == CONTROLLER_FOLLOWING;
+	/* Losing the line keeps FOLLOWING; starting again needs it back. */
 	line = safety_line(2U, 101U, 0U);
 	ok = car_safety_line(&controller.safety, &line, 101U) &&
+	     controller_state_step(&controller, 101U, true, false) == CONTROLLER_FOLLOWING &&
+	     controller_state_step(&controller, 101U, false, false) == CONTROLLER_WAITING &&
 	     controller_state_step(&controller, 101U, true, false) == CONTROLLER_BLOCKED && ok;
 	line = safety_line(3U, 102U, 1U);
 	ok = car_safety_line(&controller.safety, &line, 102U) &&

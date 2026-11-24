@@ -174,7 +174,8 @@ and decoded barcodes. It and the ADC reader are not started by default.
 The reader exclusively opens the kernel ADC, configures only the explicitly
 selected GP26–GP28 inputs, and requires per-sensor thresholds and polarity.
 Its `line_adc_reader_default_config()` imports the original repository's
-barcode/center/right ADC channels (2/1/0), 1000-count thresholds, and
+barcode/center/right ADC channels (2/1/0), black thresholds (barcode 1000,
+center and right 1500 counts; `LINE_ADC_*_BLACK_THRESHOLD`), and
 black-above polarity; callers still choose the acquisition-span limit.
 The supplied pin map assigns left to GP28 (ADC2), center to GP27
 (ADC1), and right to GP26 (ADC0); the GPIO numbers were confirmed despite
@@ -193,7 +194,7 @@ device request may still access its conversion buffer.
 Startup requires an owned sensor-reader callback, barcode settings,
 sampling period and maximum sample/odometry age. The reader timestamps
 barcode acquisition using the same operating clock as odometry. It stops on stale, missing or
-out-of-sequence odometry, unsynchronized barcode edges, read or delivery errors,
+out-of-sequence odometry, read or delivery errors,
 and retries fault delivery. Consumers must also fail safe on stale data when a
 fault cannot be delivered. The scanner uses the mean of polarity-normalized
 wheel count changes, so compatible wheel count scales are required. It
@@ -207,8 +208,13 @@ simulated samples; sensor thresholds, encoder direction, sampling/odometry
 timing and barcode behavior must be verified on hardware before use.
 Vehicle startup uses 35 counts per module for the tested label, but does not
 yet use the barcode-only diagnostic's hysteresis, distance debounce, or 2 ms
-sampling. Its 20 ms samples and 50 ms odometry updates can also fault on
-unsynchronized edges. The successful bench scan does not establish that the
+sampling. It samples every 20 ms but odometry arrives every 50 ms, so each
+sample's wheel count is extrapolated from the last odometry at its measured
+rate (a barcode edge between odometry updates used to be a fault). With
+`junction_mm_per_count` set (the vehicle sets it), it also runs the junction
+detector (left sensor + line sensors) and flags the line observation of a
+confirmed junction with `intersection_detected`, which no longer means
+"both line sensors black". The successful bench scan does not establish that the
 vehicle barcode path works, and the vehicle currently has no barcode-event
 consumer.
 `line_adc_reader_start_task()` optionally binds the actual ADC reader to the
@@ -448,11 +454,35 @@ not connected. Independent motor-stop and watchdog mechanisms remain required.
 An opt-in `vehicle_controller_task` now connects this safety gate to the line,
 IMU, obstacle, fault and motion-status buffers and sends
 ARM/STOP/emergency-stop messages. Its required local-input callback supplies
-GO and emergency-stop levels; dashboard commands alone cannot arm. It
-sends no VELOCITY commands yet because the motion task still rejects steering
-commands. The motion status is commanded state, not physical feedback. The
+GO and emergency-stop levels; dashboard commands alone cannot arm. While
+`FOLLOWING` it sends one VELOCITY command per 50 ms cycle from
+`line_steering` (15 cm/s, turn ±4 cm/s; each command lasts 200 ms, so the
+motors stop by themselves if commands stop). The motion task turns speed v and
+turn w into per-wheel targets left = v − w and right = v + w, held by the wheel
+speed PIDs tuned with `SENSOR_TEST=pid_tune`. A motion status that reports
+movement is accepted only while a VELOCITY command is live and for one status
+period after STOP; otherwise the controller faults. The motion status is
+commanded state, not physical feedback. The
 controller exclusively consumes those buffers, so do not start it alongside
-`controller_monitor_start()`. It has not been hardware-tested.
+`controller_monitor_start()`. Line following has been unit-tested but not yet
+hardware-tested (VC-H01).
+
+Obstacles (`obstacle_bypass` in the controller config, on with `VEHICLE=1`):
+an ahead reading at or under 300 mm while `FOLLOWING` stops the robot as
+before, but instead of waiting for GO the controller waits until the motion
+task reports idle and hands the motors to the `vehicle_bypass` task (core 0,
+`subsystem2/controller/vehicle_bypass.c`). That task runs exactly the
+bench-tested `SENSOR_TEST=spin_width` manoeuvre (`subsystem2/motion/obstacle_bypass.c`,
+OBS-H03): spin scan, pull out right by default (left if the obstacle sticks out
+less on the left, or the right is blocked), drive past while looking across,
+and rejoin the line. The controller forwards the ahead readings to it and keeps
+every safety check running; a fault, or GO pressed to stop, aborts it and
+brakes the motors. When it finishes, the robot is re-armed with the same checks
+as a GO press (line seen, ahead clear, IMU clear) and line following resumes;
+otherwise it stays stopped and GO off/on resumes by hand. The obstacle task's
+emergency distance is 120 mm (a latched fault), well below the 300 mm stop
+distance, so the bypass can work 20-30 cm from the obstacle. Log lines start
+with `[BYPASS]`. Hardware test: OBS-H04.
 
 With `VEHICLE=1`, the local GO input is a momentary button between GP20 and
 GND, with the internal pull-up enabled. After an initial release, each
@@ -642,10 +672,91 @@ the floor, each press of the GO button (GP20) turns it in place to the next
 heading in L30, 0, R30, 0, L60, 0, R60, 0, L90, 0, R90, 0 and one full left
 turn, using wheel encoders only (heading = (right − left wheel travel) / track;
 the IMU has no gyro). It prints where it braked and settled; compare with tape
-marks to tune the effective track width (`SPIN_TRACK_MM`, ruler 110) and
-turning power (`SPIN_PWM`, `SPIN_PWM_SLOW`, defaults 40 % and 30 %).
+marks to tune the effective track width (`SPIN_TRACK_MM`, default 116; ruler
+110) and turning power (`SPIN_PWM`, `SPIN_PWM_SLOW`, defaults 25 % and 20 %).
+Calibrated on the mat: heading within about 2 degrees per full turn, stop
+overshoot about 3.5 degrees (right turns slightly more).
 Pressing GO during a turn stops it; a timeout, stall, wrong-way turn or
 overtravel past 135 degrees also stops the motors and ends the test.
+
+Step 2 is `make SENSOR_TEST=spin_width` (**drives the motors**): place the
+robot facing the obstacle about 30 cm from the sensor (the vehicle stops at
+300 mm, and the beam correction depends on distance). Each GO press first
+finds the right edge: from straight ahead it steps right in
+`SCAN_FIND_STEP_DEG` (6) degree steps until the obstacle is lost for two
+readings in a row (these readings are not used). It then measures in one
+direction only: from just past the right edge it steps left in about
+`SCAN_STEP_DEG` (3) degree steps (short pulse, stop, one fresh distance
+reading tagged with the encoder heading) across the obstacle until it is lost
+on the left. On each side it keeps going far enough to see a free gap of
+`SCAN_LANE_MM` (200: robot width plus clearance) beside the obstacle, and never
+turns past `SCAN_HALF_DEG` (60). A reading with no echo is read once more, and a
+single missed reading inside the obstacle is bridged, so one dropped echo does
+not split the obstacle. If nothing is heard straight ahead at the start, or with
+`SCAN_FULL=1`, it sweeps the whole R60 to L60 instead. It turns back to the
+start, braking early to allow for the coast (learnt from each scan's landing
+error, starting at 3.5 degrees), and prints every reading, the angles where the obstacle was heard, the
+raw width, the width after pulling each edge in by the beam correction
+`SCAN_TRIM_DEG` (default 11.6), the free gap on each side with a `PASSABLE`
+verdict, and a `CSV,` line. Side objects more than `SCAN_BEYOND_MM` (400:
+assumed depth plus robot length plus margin) beyond the obstacle are past the
+bypass and ignored. Calibrated on the mat with a 9 cm box at 30 cm:
+`SCAN_TRIM_DEG=11.6` keeps centred and 5 cm off-centre boxes within about
+±75 mm. The beam hears a flat face over a wider angle when it is straight
+ahead (mirror-like echo), so centred boxes read wide and off-centre ones
+narrow. With `SCAN_BYPASS=1` (default) it then pulls out: it bypasses on the
+right unless the obstacle sticks out more than 1 cm further right than left,
+turns 90 degrees to that side, drives (wheel-speed PID at `SCAN_SPEED_CM_S`, 15)
+until the car centre is the edge + `SCAN_MARGIN_MM` (80, the scan's width
+error) + `SCAN_CLEAR_MM` (50) + half of `SCAN_CAR_WIDTH_MM` (140) out, and turns
+back along the line. A side whose edge was not seen, or whose free gap is
+narrower than car + margin + 2 x clearance (320 mm, which the scan then looks
+for instead of `SCAN_LANE_MM`), is not used; if neither side is usable it does
+not move. With `SCAN_REJOIN=1` (default) it then drives past and rejoins the
+line: it drives forward to `SCAN_MIN_DEPTH_MM` (50) past the face, turns 90
+degrees to face the line and reads across, so the sensor faces the obstacle's
+side square on. An echo inside the strip the car will cross (sensor to line +
+half the car + clearance) means it is still beside the obstacle: it turns back,
+drives `SCAN_PASS_STEP_MM` (100) and looks again, giving up after
+`SCAN_MAX_DEPTH_MM` (600). Once clear it drives half the car + clearance further,
+turns to the line, drives onto it and turns back along it, and prints the
+obstacle's length to within half a step. Put the robot back on the line before the next scan, or use
+`SCAN_BYPASS=0` to scan only. The maths is the shared module
+`subsystem5/obstacle/spin_scan.c` (unit tests OBS-U10 to OBS-U13 and the
+bypass side choice OBS-U16 in `make TEST=1`); the whole manoeuvre is
+`subsystem2/motion/obstacle_bypass.c`, which the vehicle runs too. The sensor sits
+`SCAN_SENSOR_OFFSET_MM` (70) ahead of the turning point, which the geometry
+accounts for. With a known object, `SCAN_TRUE_WIDTH_MM=90` also prints the
+`SCAN_TRIM_DEG` that would give the true width; rebuild with it. The obstacle
+is the echo nearest straight ahead plus the readings within `SCAN_CLUSTER_MM`
+(60) of its distance. Objects farther or nearer than that are kept separate and
+reported as the free gap on that side; a nearer object that hides an edge
+marks it `HIDDEN` and the width as a lower bound. An object at about the same
+distance with less than about 16 cm between them (the beam spreads about 8 cm
+each side at 30 cm) cannot be separated and is measured together with the
+obstacle. The spin calibration (`SPIN_TRACK_MM`, `SPIN_PWM`,
+`SPIN_PWM_SLOW`) is shared with `spin_heading`.
+
+Step 3 is `make SENSOR_TEST=diag_width` (**drives the motors**), which measures
+the width a different way. A flat face echoes only while the sensor is in front
+of it, whichever way the sensor points (bench: a 9 cm box was heard over exactly
+9 cm of sideways travel), so the robot drives diagonally past the face and the
+width is the sideways distance between where the echo starts and stops. Place
+the robot on the line facing the obstacle about 30 cm away, with about 60 cm free
+behind and 30 cm to each side. Each GO press backs up `DIAG_BACKUP_MM` (100),
+turns to L`DIAG_ANGLE_DEG` (20) while the servo stays 20 degrees to the right (so
+the sensor faces the obstacle), drives forward until the sensor is past the left
+edge, then reverses on the same heading across the face. That leg gives both
+edges and the width, from the encoders, at `DIAG_SPEED_CM_S` (15) with the tuned
+wheel-speed PID and a heading hold. It then picks the side the obstacle sticks
+out less on (right on a tie), turns 90 degrees to it, drives until the car centre
+is the edge + half of `DIAG_CAR_WIDTH_MM` (140) + `DIAG_CLEAR_MM` (50) out, and
+turns back along the line (`DIAG_PULLOUT=0` stops after measuring). In
+simulation the width came out within 3 mm for a 90 mm box centred and up to 8 cm
+to either side (about 9 mm short with 10 % dropped echoes), in about 9-11 s to the
+result and 13-17 s including the pull-out; the robot ends 33-54 cm behind where
+it started. The logic is the shared module `subsystem5/obstacle/diag_pass.c`
+(unit tests OBS-U14 and OBS-U15).
 
 For basic driving, `make SENSOR_TEST=motor_moves` (**drives the motors**)
 runs open loop at a fixed PWM and uses the encoders only to measure each
@@ -665,8 +776,10 @@ To tune the vehicle's closed-loop wheel speed control,
 `make SENSOR_TEST=pid_tune` (**drives the motors**) runs the vehicle's own
 `wheel_speed_control` PID per wheel, updated every `PID_PERIOD_MS` (50, the
 odometry period) from encoder speeds. GO runs, in turn: a step response with
-the wheels in the air for `PID_AIR_MS` (3000), then forward and reverse
-`PID_DIST_MM` (400) on the floor. Each step prints a trace (time, speed and
+the wheels in the air for `PID_AIR_MS` (3000), forward and reverse
+`PID_DIST_MM` (400) on the floor, then a left and a right arc with the wheels
+at `PID_SPEED` ∓ `PID_TURN` (default 4 cm/s, as line steering drives them;
+`PID_TURN=0` skips the arcs). Each step prints a trace (time, speed and
 PWM per wheel; `PID_TRACE=0` hides it) and, per wheel, rise time, overshoot,
 steady-state error, ripple and settled PWM, followed by tuning hints. Set the
 gains (decimals allowed) and target, e.g.
@@ -721,6 +834,24 @@ after bridge creation. A stalled network owner or full fault queue
 requires independent supervision. Queued packets are checked for age on dequeue;
 they can become stale while disconnected. MQTT in this template is unencrypted;
 use only on a trusted network. No incoming commands are connected.
+
+### Connectivity test (Wi-Fi, MQTT, dashboard)
+
+`make SENSOR_TEST=wifi -j8` builds `*_wifi_lwip_mqtt_sensor_wifi.uf2` (lwIP and
+MQTT are switched on automatically). It drives no motors and reads no sensors.
+Fill in `config/wifi_secrets.h`, start the broker and the dashboard on the PC,
+flash, and open the serial console. It checks the three links in order and
+prints one `[HWTEST][WIFI] PASS`/`FAIL` line for each, with a hint on failure:
+
+1. `WIFI-H01`: joins `WIFI_SSID` and gets an IP address.
+2. `WIFI-H02`: MQTT session with `MQTT_BROKER_IP:MQTT_BROKER_PORT`.
+3. `WIFI-H03`: sends a test barcode (`W`) on `robot/barcode` and waits for
+   the dashboard's turn on `robot/command`, which proves both directions.
+
+It also publishes idle telemetry, so the dashboard's car card turns green.
+After the summary it prints a status line every 10 s and reports any
+Start/Stop presses. The test keeps retrying, so you can fix the broker or
+start the dashboard without reflashing.
 
 ### Read-only dashboard
 
@@ -808,7 +939,7 @@ the next plain `make` goes back to the defaults.
 | `WIFI` | **`cyw43`**, `none` | `cyw43` powers up the Pico W radio and its driver task; `none` leaves the radio off | `_wifi` / *(nothing)* | `TM_WIFI_CYW43` |
 | `TEST` | **`0`**, `1` | `1` runs vehicle startup tests | `_test` / *(nothing)* | `APP_TEST` (1 or 0) |
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
-| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `pid_tune`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
+| `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `pid_tune`, `spin_width`, `diag_width`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 

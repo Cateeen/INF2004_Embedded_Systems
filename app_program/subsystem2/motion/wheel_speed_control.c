@@ -38,6 +38,16 @@ static bool valid_config(
         return false;
     }
 
+    if (!isfinite(config->ff_pwm_per_cm_s) ||
+        !isfinite(config->ff_ref_speed_cm_s) ||
+        (config->ff_pwm_per_cm_s < 0.0f) ||
+        (config->ff_ref_speed_cm_s < 0.0f) ||
+        ((config->ff_pwm_per_cm_s > 0.0f) &&
+         (config->ff_ref_speed_cm_s <= 0.0f)))
+    {
+        return false;
+    }
+
     if ((config->base_pwm_percent == 0U) ||
         (config->max_pwm_percent == 0U) ||
         (config->max_pwm_percent > 100U) ||
@@ -68,6 +78,49 @@ static uint8_t calculate_pwm(
     }
 
     return (uint8_t)(command + 0.5f);
+}
+
+/*
+ * PWM a wheel starts from for its target: base at the reference speed,
+ * plus the feed-forward slope for the difference. With a zero slope this
+ * is exactly base_pwm_percent, as before feed-forward existed.
+ */
+static float feed_forward_pwm(
+    const wheel_speed_config_t *config,
+    float target_cm_s)
+{
+    float pwm = (float)config->base_pwm_percent;
+
+    if (config->ff_pwm_per_cm_s > 0.0f)
+    {
+        pwm += config->ff_pwm_per_cm_s *
+               (target_cm_s - config->ff_ref_speed_cm_s);
+    }
+
+    if (pwm < 0.0f)
+    {
+        pwm = 0.0f;
+    }
+
+    if (pwm > (float)config->max_pwm_percent)
+    {
+        pwm = (float)config->max_pwm_percent;
+    }
+
+    return pwm;
+}
+
+/*
+ * Keep feed-forward + correction inside 0..max, so the PID's conditional
+ * integration stops winding up exactly where the motor saturates.
+ */
+static void set_correction_limits(
+    pid_controller_t *pid,
+    float feed_forward,
+    uint8_t maximum)
+{
+    pid->output_min = -feed_forward;
+    pid->output_max = (float)maximum - feed_forward;
 }
 
 bool wheel_speed_control_init(
@@ -122,7 +175,30 @@ bool wheel_speed_control_init(
         return false;
     }
 
+    controller->left_target_cm_s = config->target_speed_cm_s;
+    controller->right_target_cm_s = config->target_speed_cm_s;
     controller->initialized = true;
+
+    return true;
+}
+
+bool wheel_speed_control_set_targets(
+    wheel_speed_control_t *controller,
+    float left_target_cm_s,
+    float right_target_cm_s)
+{
+    if ((controller == NULL) ||
+        (!controller->initialized) ||
+        !isfinite(left_target_cm_s) ||
+        !isfinite(right_target_cm_s) ||
+        (left_target_cm_s <= 0.0f) ||
+        (right_target_cm_s <= 0.0f))
+    {
+        return false;
+    }
+
+    controller->left_target_cm_s = left_target_cm_s;
+    controller->right_target_cm_s = right_target_cm_s;
 
     return true;
 }
@@ -170,21 +246,30 @@ bool wheel_speed_control_update(
         return false;
     }
 
-    float target =
-        controller->config.target_speed_cm_s;
-
     float left_correction;
     float right_correction;
 
+    uint8_t maximum =
+        controller->config.max_pwm_percent;
+
+    float left_base = feed_forward_pwm(
+        &controller->config, controller->left_target_cm_s);
+
+    float right_base = feed_forward_pwm(
+        &controller->config, controller->right_target_cm_s);
+
+    set_correction_limits(&controller->left_pid, left_base, maximum);
+    set_correction_limits(&controller->right_pid, right_base, maximum);
+
     if (!pid_update(
         &controller->left_pid,
-        target,
+        controller->left_target_cm_s,
         left_speed_cm_s,
         dt_seconds,
         &left_correction) ||
         !pid_update(
         &controller->right_pid,
-        target,
+        controller->right_target_cm_s,
         right_speed_cm_s,
         dt_seconds,
         &right_correction))
@@ -193,17 +278,11 @@ bool wheel_speed_control_update(
         return false;
     }
 
-    float base =
-        (float)controller->config.base_pwm_percent;
-
-    uint8_t maximum =
-        controller->config.max_pwm_percent;
-
     output->left_pwm_percent = calculate_pwm(
-        base, left_correction, maximum);
+        left_base, left_correction, maximum);
 
     output->right_pwm_percent = calculate_pwm(
-        base, right_correction, maximum);
+        right_base, right_correction, maximum);
 
     return true;
 }

@@ -11,6 +11,11 @@
 #include "subsystem2/motion/spin_heading_hwtest.h"
 #include "subsystem2/motion/motor_moves_hwtest.h"
 #include "subsystem2/motion/pid_tune_hwtest.h"
+#include "subsystem2/motion/spin_width_hwtest.h"
+#include "subsystem2/motion/diag_width_hwtest.h"
+#include "subsystem2/controller/line_follow_hwtest.h"
+#include "subsystem2/controller/junction_hwtest.h"
+#include "subsystem1/wifi/wifi_link_hwtest.h"
 #include "vehicle_buffers.h"
 #include "vehicle_messages.h"
 
@@ -121,7 +126,10 @@ static const line_barcode_task_config_t s_line_barcode_task_config = {
 	LINE_BARCODE_TEST_PERIOD_MS,
 	200U,
 	{LINE_BARCODE_TEST_COUNTS_PER_MODULE, 25U, 0U, 0U, 0U},
-	NULL, NULL, NULL
+	NULL, NULL, NULL,
+	/* Junction detection on, as in the vehicle: push the robot over a tape
+	 * laid across the line and a JUNCTION observation is reported. */
+	204.0f / 2500.0f
 };
 
 static const char *line_position_name(const line_observation_message_t *line)
@@ -1150,6 +1158,49 @@ static void sensor_test_task(INT stacd, void *exinf)
 	(void)stacd;
 	(void)exinf;
 	pid_tune_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 15
+/* Obstacle width by spin scan (DRIVES MOTORS); subsystem2/motion/spin_width_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	spin_width_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 16
+/* Obstacle width by a diagonal pass, then pull out (DRIVES MOTORS);
+ * subsystem2/motion/diag_width_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	diag_width_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 17
+/* Line following wiggle/curve test (DRIVES MOTORS);
+ * subsystem2/controller/line_follow_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	line_follow_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 18
+/* Junction detection + action (DRIVES MOTORS); subsystem2/controller/junction_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	junction_hwtest_run();
+}
+#elif APP_SENSOR_TEST == 19
+/* Wi-Fi, MQTT and dashboard link test (no motors);
+ * subsystem1/wifi/wifi_link_hwtest.c. */
+static void sensor_test_task(INT stacd, void *exinf)
+{
+	(void)stacd;
+	(void)exinf;
+	wifi_link_hwtest_run();
 }
 #else
 #error Unsupported APP_SENSOR_TEST diagnostic

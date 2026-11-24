@@ -4,7 +4,10 @@
 #include "wifi_mqtt_bridge.h"
 
 #define WIFI_SERVICE_PRIORITY 10
-#define WIFI_FAULT_RETRY_MS 1000U
+/* A communication problem is logged at most this often while it repeats. */
+#define WIFI_FAULT_LOG_INTERVAL_MS 5000U
+/* Equals the MQTT bridge queue depth; the bridge pushes back when full. */
+#define WIFI_SERVICE_MAX_PUBLISH_PER_CYCLE 4U
 
 typedef struct {
 	wifi_service_link_t link;
@@ -67,6 +70,14 @@ static uint16_t publish_status(wifi_service_state_t *state,
 	status.retry_count = link->retry_count;
 	status.error_code = link->error_code;
 	er = tk_snd_mbf(g_mbf_network_status, &status, (INT)sizeof(status), TMO_POL);
+	if (er == E_TMOUT) {
+		/* Keep-latest: link status is a snapshot, so when no consumer has
+		 * drained the queue the oldest entry is discarded, not reported as
+		 * a fault. This service is the only producer of this buffer. */
+		network_status_message_t oldest;
+		(void)tk_rcv_mbf(g_mbf_network_status, &oldest, TMO_POL);
+		er = tk_snd_mbf(g_mbf_network_status, &status, (INT)sizeof(status), TMO_POL);
+	}
 	if (er != E_OK) {
 		state->callback_error = er;
 		return VEHICLE_FAULT_CODE_WIFI_DELIVERY;
@@ -106,6 +117,7 @@ static uint16_t service_cycle(wifi_service_state_t *state,
 {
 	wifi_service_link_t link = {0};
 	uint32_t now;
+	uint32_t sent;
 	uint16_t fault;
 	ER er = config->poll(config->context, &link);
 
@@ -123,51 +135,51 @@ static uint16_t service_cycle(wifi_service_state_t *state,
 	    now - state->pending.header.timestamp_ms > config->telemetry_max_age_ms)
 		return VEHICLE_FAULT_CODE_WIFI_TELEMETRY;
 	if (!link.mqtt_ready) return 0U;
-	fault = receive_telemetry(state, config, now);
-	if (fault != 0U || !state->have_pending) return fault;
-	er = config->publish(config->context, &state->pending);
-	if (er == E_TMOUT) return 0U;
-	if (er != E_OK) {
-		state->callback_error = er;
-		return VEHICLE_FAULT_CODE_WIFI_BACKEND;
+	/* Forward several messages per cycle, in order, so a backlog left by an
+	 * outage drains instead of leaving the dashboard permanently behind
+	 * (the producer adds one snapshot per period). Stops at backpressure. */
+	for (sent = 0U; sent < WIFI_SERVICE_MAX_PUBLISH_PER_CYCLE; sent++) {
+		fault = receive_telemetry(state, config, now);
+		if (fault != 0U || !state->have_pending) return fault;
+		er = config->publish(config->context, &state->pending);
+		if (er == E_TMOUT) return 0U;
+		if (er != E_OK) {
+			state->callback_error = er;
+			return VEHICLE_FAULT_CODE_WIFI_BACKEND;
+		}
+		state->telemetry_sequence = state->pending.header.sequence;
+		state->telemetry_timestamp_ms = state->pending.header.timestamp_ms;
+		state->have_telemetry = true;
+		state->have_pending = false;
 	}
-	state->telemetry_sequence = state->pending.header.sequence;
-	state->telemetry_timestamp_ms = state->pending.header.timestamp_ms;
-	state->have_telemetry = true;
-	state->have_pending = false;
 	return 0U;
 }
 
-static void report_fault(uint16_t code, uint32_t now)
+/* Communication is best-effort: a Wi-Fi, MQTT or telemetry problem must
+ * never stop the car. The fault is logged (rate-limited), the message in
+ * hand is dropped and the service carries on, so telemetry resumes on its
+ * own when the link recovers. Nothing is sent to g_mbf_faults, because the
+ * vehicle controller latches a safe stop on any fault message. */
+static void recover_from_fault(wifi_service_state_t *state, uint16_t code)
 {
-	fault_message_t fault = {0};
-	bool sent = false;
-	ER stopped = s_config.stop(s_config.context);
+	static uint16_t s_last_code;
+	static uint32_t s_last_log_ms;
+	static uint32_t s_suppressed;
 
-	if (stopped != E_OK) tm_printf((UB*)"WiFi backend stop failed: %d\n", (int)stopped);
-	fault.header.type = VEHICLE_MESSAGE_FAULT;
-	fault.header.version = VEHICLE_MESSAGE_VERSION;
-	fault.header.sequence = 1U;
-	fault.header.timestamp_ms = now;
-	fault.source = VEHICLE_FAULT_COMMUNICATION;
-	fault.code = code;
-	fault.recoverable = 0U;
-	tm_printf((UB*)"WiFi service stopped; fault=%u error=%d\n",
-		  (unsigned)code, (int)s_state.callback_error);
-	for (;;) {
-		ER er;
-		if (!sent) {
-			er = tk_snd_mbf(g_mbf_faults, &fault, (INT)sizeof(fault), TMO_POL);
-			if (er == E_OK) sent = true;
-			else tm_printf((UB*)"WiFi fault delivery failed: %d\n", (int)er);
-		}
-		er = tk_dly_tsk(WIFI_FAULT_RETRY_MS);
-		if (er != E_OK) {
-			tm_printf((UB*)"WiFi fault delay failed: %d\n", (int)er);
-			er = tk_slp_tsk(TMO_FEVR);
-			tm_printf((UB*)"WiFi fault sleep returned: %d\n", (int)er);
-		}
+	state->have_pending = false;
+	state->have_telemetry = false;	/* accept any sequence after recovery */
+	if ((code != s_last_code) ||
+	    ((state->last_clock_ms - s_last_log_ms) >= WIFI_FAULT_LOG_INTERVAL_MS)) {
+		tm_printf((UB*)"WiFi service: communication fault %u (error %d), "
+			  "continuing; %u repeats suppressed\n",
+			  (unsigned)code, (int)state->callback_error, (unsigned)s_suppressed);
+		s_last_code = code;
+		s_last_log_ms = state->last_clock_ms;
+		s_suppressed = 0U;
+	} else {
+		s_suppressed++;
 	}
+	state->callback_error = E_OK;
 }
 
 static void wifi_service_task(INT stacd, void *exinf)
@@ -177,11 +189,11 @@ static void wifi_service_task(INT stacd, void *exinf)
 	for (;;) {
 		uint16_t fault = service_cycle(&s_state, &s_config);
 		ER er;
-		if (fault != 0U) report_fault(fault, s_state.last_clock_ms);
+		if (fault != 0U) recover_from_fault(&s_state, fault);
 		er = tk_dly_tsk(s_config.period_ms);
 		if (er != E_OK) {
 			s_state.callback_error = er;
-			report_fault(VEHICLE_FAULT_CODE_WIFI_SCHEDULE, s_state.last_clock_ms);
+			recover_from_fault(&s_state, VEHICLE_FAULT_CODE_WIFI_SCHEDULE);
 		}
 	}
 }
@@ -407,11 +419,18 @@ static BOOL wifi_fault_test(void)
 	ok = drain_test_buffers() && ok;
 	state = (wifi_service_state_t){0};
 	state.last_clock_ms = now.lo;
+	/* A full status queue with no consumer keeps the latest status instead
+	 * of faulting: the oldest entry is replaced. */
 	for (i = 0U; i < VEHICLE_MB_NETWORK_CAPACITY; i++)
 		ok = tk_snd_mbf(g_mbf_network_status, &status, (INT)sizeof(status), TMO_POL) ==
 		     E_OK && ok;
-	ok = service_cycle(&state, &config) == VEHICLE_FAULT_CODE_WIFI_DELIVERY &&
-	     state.callback_error == E_TMOUT && ok;
+	ok = service_cycle(&state, &config) == 0U && state.have_status &&
+	     state.status_sequence == 1U && ok;
+	for (i = 0U; i < VEHICLE_MB_NETWORK_CAPACITY; i++)
+		ok = tk_rcv_mbf(g_mbf_network_status, &status, TMO_POL) == (INT)sizeof(status) && ok;
+	ok = status.header.sequence == 1U && status.connected && status.mqtt_ready &&
+	     tk_rcv_mbf(g_mbf_network_status, &status, TMO_POL) == E_TMOUT && ok;
+	status = (network_status_message_t){0};
 	ok = drain_test_buffers() && ok;
 	state = (wifi_service_state_t){0};
 	state.last_clock_ms = now.lo;
@@ -615,7 +634,7 @@ BOOL wifi_service_test(void)
 	telemetry_ok = wifi_telemetry_test();
 	producer_ok = wifi_producer_test();
 	TEST_CHECK("WIFI-U01", flow_ok, "link status and telemetry backpressure");
-	TEST_CHECK("WIFI-U02", fault_ok, "invalid telemetry and link or delivery failures");
+	TEST_CHECK("WIFI-U02", fault_ok, "invalid telemetry and link failures; full status keeps latest");
 	TEST_CHECK("WIFI-U03", command_ok, "legacy command decode and malformed packets");
 	TEST_CHECK("WIFI-U06", telemetry_ok, "legacy telemetry encoding and validation");
 	TEST_CHECK("WIFI-U07", producer_ok, "telemetry producer and service queue");

@@ -26,6 +26,7 @@
 #include "subsystem6/odometry/encoder_source.h"
 #include "subsystem6/gpio/gpio_dispatcher.h"
 #include "subsystem3/line_barcode/line_observation_test.h"
+#include "subsystem3/line_barcode/junction_detector.h"
 #include "subsystem3/line_barcode/barcode_scanner_test.h"
 #include "subsystem3/line_barcode/line_barcode_task.h"
 #include "subsystem3/line_barcode/line_adc_reader.h"
@@ -33,16 +34,22 @@
 #include "subsystem4/imu/imu_task.h"
 #include "subsystem4/imu/lsm303dlhc_i2c.h"
 #include "subsystem5/obstacle/obs_profile_test.h"
+#include "subsystem5/obstacle/spin_scan_test.h"
+#include "subsystem5/obstacle/diag_pass_test.h"
 #include "subsystem5/obstacle/obs_task.h"
 #include "subsystem5/obstacle/obs_pico_port.h"
 #include "subsystem2/motion/wheel_speed_test.h"
 #include "subsystem2/motion/motion_task.h"
 #include "subsystem2/controller/car_gate_test.h"
 #include "subsystem2/controller/line_steering_test.h"
+#include "subsystem2/controller/line_steering.h"
 #include "subsystem2/controller/controller_monitor.h"
 #include "subsystem2/controller/vehicle_controller_task.h"
+#include "subsystem2/controller/vehicle_bypass.h"
 #include "subsystem1/wifi/wifi_service.h"
 #include "subsystem1/wifi/wifi_mqtt_bridge.h"
+#include "subsystem1/wifi/dashboard_link.h"
+#include "subsystem1/wifi/vehicle_telemetry.h"
 #include "subsystem6/gpio/gpio_irq_test.h"
 #include "hardware_sensor_test.h"
 
@@ -59,6 +66,7 @@ typedef struct {
 	bool candidate_pressed;
 	bool stable_pressed;
 	bool ready;
+	bool restart;		/* dashboard Start while GO was on: on next cycle */
 	unsigned stable_samples;
 } go_button_t;
 
@@ -130,10 +138,23 @@ static BOOL go_button_test(void)
 #define VEHICLE_ECHO_VERIFIED_3V3_SAFE	1	/* GP4 divider measured <= 3.3 V */
 #define VEHICLE_SERVO_LIMITS_VERIFIED	1	/* 1500/1700/1900 us; measured +/-20 deg */
 #define VEHICLE_GO_PIN			20U
+/* 1: the dashboard's Start / Stop buttons act on the GO toggle exactly like
+ * the GO button (Start = a press that turns GO on, Stop = GO off). Every
+ * safety check still has to pass before the robot moves. 0: local button only. */
+#define VEHICLE_DASHBOARD_RUN		1
 
 /* Odometry calibration, verified with ODO-H01 (encoder bring-up). */
 #define VEHICLE_COUNTS_PER_REV		2500U
 #define VEHICLE_WHEEL_CIRC_CM		20.4f
+/* Motion task speed limit for the faster wheel; the PID gains were verified
+ * up to this speed (MOT-H01). Line steering must stay inside it. */
+#define VEHICLE_MAX_SPEED_CM_S		20U
+_Static_assert(LINE_STEERING_SPEED_CM_S + LINE_STEERING_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S &&
+	       LINE_STEERING_TURN_CM_S < LINE_STEERING_SPEED_CM_S,
+	       "line steering speed + turn must fit the motion task speed limit");
+_Static_assert(LINE_STEERING_SLOPE_SPEED_CM_S + LINE_STEERING_SLOPE_TURN_CM_S <=
+	       VEHICLE_MAX_SPEED_CM_S,
+	       "ramp-mode (SLOPE) speed + turn must fit the motion task speed limit");
 /* Wheels are mirror-mounted: the left encoder counts down when driving
  * forward (verified with BAR-H02), so it is negated. */
 #define VEHICLE_LEFT_SIGN		(-1)
@@ -141,13 +162,87 @@ static BOOL go_button_test(void)
 
 static go_button_t s_go_button;
 
+/* Dashboard Start / Stop on the GO toggle. Start while GO is already on
+ * (e.g. stopped after a lost line, which needs a fresh press) turns it off
+ * for one cycle and back on, so the controller sees a rising edge. Reads one
+ * atomic word: no network access, never blocks. */
+static void vehicle_dashboard_run(go_button_t *button)
+{
+#if VEHICLE_DASHBOARD_RUN
+	dashboard_run_command_t command;
+
+	if (button->restart) {
+		button->restart = false;
+		button->go = true;
+		return;
+	}
+	if (!dashboard_take_run_command(&command)) return;
+	if (command == DASHBOARD_RUN_STOP) {
+		button->go = false;
+		tm_printf((UB*)"dashboard: STOP\n");
+	} else if (command == DASHBOARD_RUN_START) {
+		if (button->go) {
+			button->go = false;
+			button->restart = true;
+		} else {
+			button->go = true;
+		}
+		tm_printf((UB*)"dashboard: START\n");
+	}
+#else
+	(void)button;
+#endif
+}
+
 static bool vehicle_read_inputs(void *context, vehicle_controller_inputs_t *inputs)
 {
 	go_button_t *button = context;
 
-	inputs->go = go_button_sample(button, gpio_get_val(VEHICLE_GO_PIN) == 0U);
+	(void)go_button_sample(button, gpio_get_val(VEHICLE_GO_PIN) == 0U);
+	vehicle_dashboard_run(button);
+	inputs->go = button->go && button->ready;
 	inputs->emergency_stopped = false;
 	return true;
+}
+
+/* Junction turns come from the dashboard (barcode letter -> turn); without
+ * one, or before any barcode, dashboard_next_junction() returns LEFT. */
+_Static_assert(VEHICLE_JUNCTION_STRAIGHT == DASHBOARD_TURN_STRAIGHT &&
+	       VEHICLE_JUNCTION_LEFT == DASHBOARD_TURN_LEFT &&
+	       VEHICLE_JUNCTION_RIGHT == DASHBOARD_TURN_RIGHT &&
+	       VEHICLE_JUNCTION_UTURN == DASHBOARD_TURN_UTURN,
+	       "controller junction turns must match dashboard_turn_t");
+
+static uint8_t vehicle_junction_turn(void *context)
+{
+	(void)context;
+	return (uint8_t)dashboard_next_junction();
+}
+
+static void vehicle_junction_done(void *context, uint8_t turn)
+{
+	(void)context;
+	(void)dashboard_report_action_done((dashboard_turn_t)turn);	/* no-op without MQTT */
+}
+
+/* Each decoded barcode letter goes to the dashboard, which maps it to the
+ * next junction turn and sends that back (dashboard_next_junction()). */
+static void vehicle_barcode(void *context, const char *payload, uint8_t length)
+{
+	uint8_t i;
+
+	(void)context;
+	for (i = 0U; i < length; i++) {
+		tm_printf((UB*)"barcode decoded: %c\n", payload[i]);
+		(void)dashboard_report_barcode(payload[i]);	/* no-op without MQTT */
+	}
+}
+
+/* Line task: a barcode's start '*' has been read (letter not yet decoded). */
+static void vehicle_barcode_started(void *context)
+{
+	(void)context;
+	(void)dashboard_report_barcode_detected();	/* no-op without MQTT */
 }
 
 static void vehicle_start(void)
@@ -181,28 +276,40 @@ static void vehicle_start(void)
 	 * tuned with SENSOR_TEST=pid_tune on the mat at 15 and 20 cm/s: steady
 	 * error within 2.5 % per wheel forward and reverse, no oscillation
 	 * (MOT-H01). Base 22 % is the floor PWM at 15 cm/s; KI 4 makes up the
-	 * extra ~7 % needed at 20 cm/s within ~1 s. */
+	 * extra ~7 % needed at 20 cm/s within ~1 s.
+	 * Feed-forward {+1.4 %/(cm/s) around 15 cm/s}, from those two points:
+	 * each wheel starts at the PWM for its own target, so line-steering
+	 * turns land at once instead of waiting for KI (line_follow test:
+	 * 4/18 commanded reached only ~6/17 with the flat 22 % base). */
 	static motion_task_config_t motion_config = {
 		{{{0}, {0}, 150U, 250U},
-		 {2.0f, 4.0f, 0.0f, 10.0f, 22U, 60U}},
+		 {2.0f, 4.0f, 0.0f, 10.0f, 22U, 60U, 1.4f, 15.0f}},
 		10U,	/* period_ms */
 		100U,	/* command_max_age_ms */
 		500U,	/* max_duration_ms */
-		20U	/* max_linear_speed_cm_s */
+		VEHICLE_MAX_SPEED_CM_S	/* max_linear_speed_cm_s */
 	};
 	/* Sensor deadlines; producers below publish well inside them. */
 	static const vehicle_controller_task_config_t controller_config = {
 		{200U, 200U, 500U, 5000U, 500U, 300U},
 		50U,	/* period_ms, <= half the motion status period */
 		500U,	/* motion_status_max_age_ms */
-		vehicle_read_inputs, &s_go_button
+		vehicle_read_inputs, &s_go_button,
+		vehicle_junction_turn, vehicle_junction_done, NULL,
+		vehicle_barcode, NULL,
+		/* Obstacle at <= 300 mm while following: scan it, drive round it
+		 * and rejoin the line (vehicle_bypass, OBS-H03 manoeuvre). */
+		true
 	};
 	static const line_barcode_task_config_t line_config = {
 		20U,	/* period_ms */
 		200U,	/* odometry_max_age_ms */
 		/* Bench-calibrated for the tested printed code. */
 		{35U, 25U, 0U, 0U, 0U},
-		NULL, NULL, NULL	/* reader installed by the ADC helper */
+		NULL, NULL, NULL,	/* reader installed by the ADC helper */
+		/* Junction detection on: mm of wheel travel per odometry count. */
+		VEHICLE_WHEEL_CIRC_CM * 10.0f / (float)VEHICLE_COUNTS_PER_REV,
+		vehicle_barcode_started, NULL
 	};
 	static const imu_task_config_t imu_config = {
 		50U,	/* period_ms */
@@ -216,7 +323,10 @@ static void vehicle_start(void)
 		2500U,	/* scan_max_age_ms: 9 points x 3 polls x 50 ms ~ 1.3 s */
 		5000U,	/* scan_timeout_ms */
 		500U,	/* command_max_age_ms */
-		300U,	/* emergency_distance_mm */
+		/* A latched fault this close. Well under the 300 mm stop distance:
+		 * the robot stops at 300 mm and the bypass works 20-30 cm from the
+		 * obstacle (it looks across at its side from ~20 cm). */
+		120U,	/* emergency_distance_mm */
 		NULL, NULL, NULL, NULL	/* callbacks installed by the port */
 	};
 	/* Static: start functions may keep pointers past this task's exit. */
@@ -240,6 +350,13 @@ static void vehicle_start(void)
 	CHECK(encoder_source_register(), "encoder_source_register");
 	CHECK(obs_pico_port_register(), "obs_pico_port_register");
 	CHECK(gpio_dispatcher_start(), "gpio_dispatcher_start");
+	{
+		/* Obstacle bypass task (core 0: encoders), bench-tested defaults. */
+		static obstacle_bypass_config_t bypass_config;
+
+		bypass_config = obstacle_bypass_default_config();
+		CHECK(vehicle_bypass_start(&bypass_config), "vehicle_bypass_start");
+	}
 
 	/* Consumers before producers: motion drains commands and odometry,
 	   the controller drains every sensor stream. */
@@ -264,8 +381,12 @@ static void vehicle_start(void)
 	      "obs_pico_port_task_start");
 
 #if defined(TM_MQTT) && TM_MQTT
+	/* Before the MQTT service so early events are queued, not dropped. */
+	CHECK(dashboard_link_start(), "dashboard_link_start");
 	CHECK(wifi_service_start_mqtt(100U, 1000U, 1000U, 1000U),
 	      "wifi_service_start_mqtt");
+	/* The controller's per-cycle snapshot becomes robot/telemetry. */
+	CHECK(vehicle_telemetry_enable(), "vehicle_telemetry_enable");
 #endif
 
 	tm_printf((UB*)"vehicle tasks started; controller WAITING until GO\n\n");
@@ -435,6 +556,12 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+	if (!junction_detector_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] JN FAIL  junction detector; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
 	if (!barcode_scanner_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] BAR FAIL  barcode decoder; tasks not started\n");
@@ -468,6 +595,18 @@ EXPORT INT usermain(void)
 	if (!obs_profile_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] OBS FAIL  profiling; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!spin_scan_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] OBS FAIL  spin scan width; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!diag_pass_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] OBS FAIL  diagonal pass width; tasks not started\n");
 			tk_dly_tsk(1000);
 		}
 	}
@@ -531,6 +670,12 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+	if (!dashboard_link_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] DASHBOARD FAIL  dashboard link tests; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
 	if (!gpio_irq_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] GPIO FAIL  interrupt routing; tasks not started\n");
@@ -572,6 +717,7 @@ EXPORT INT usermain(void)
 	tm_printf((UB*)"[TEST] ODO-PRODUCER PASS  producer tests (repeated)\n");
 	tm_printf((UB*)"[TEST] ODO-TASK PASS  task tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LINE PASS  line classification tests (repeated)\n");
+	tm_printf((UB*)"[TEST] JN PASS  junction detector tests (repeated)\n");
 	tm_printf((UB*)"[TEST] BAR PASS  barcode decoder tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LB-TASK PASS  task tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LINE-ADC PASS  reader tests (repeated)\n");
@@ -592,6 +738,7 @@ EXPORT INT usermain(void)
 		tm_printf((UB*)"[TEST] ODO-PRODUCER PASS  producer tests (repeated)\n");
 		tm_printf((UB*)"[TEST] ODO-TASK PASS  task tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LINE PASS  line classification tests (repeated)\n");
+		tm_printf((UB*)"[TEST] JN PASS  junction detector tests (repeated)\n");
 		tm_printf((UB*)"[TEST] BAR PASS  barcode decoder tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LB-TASK PASS  task tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LINE-ADC PASS  reader tests (repeated)\n");

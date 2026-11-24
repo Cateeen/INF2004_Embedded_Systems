@@ -70,4 +70,11 @@ void car_safety_latch_fault(car_safety_t *safety);
 bool car_safety_follow(car_safety_t *safety, uint32_t now_ms,
 		       bool go, bool go_rising, bool emergency_stopped);
 
+/* Re-arm without a new GO press after an automatic manoeuvre the controller
+ * ran itself (the obstacle bypass), with exactly the checks a GO press gets:
+ * GO still on, no faults, line seen, IMU clear and ahead clear. Returns
+ * whether the robot is armed. */
+bool car_safety_resume(car_safety_t *safety, uint32_t now_ms,
+		       bool go, bool emergency_stopped);
+
 #endif

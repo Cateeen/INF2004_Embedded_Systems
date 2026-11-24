@@ -158,6 +158,9 @@ typedef struct {
     uint16_t confidence;
     uint8_t line_detected;
     uint8_t intersection_detected;
+    /* 1 while all three IR sensors have read black (no floor) for
+     * LINE_PICKUP_MS: the robot has been lifted. Appended. */
+    uint8_t picked_up;
 } line_observation_message_t;
 
 typedef struct {
@@ -230,6 +233,9 @@ typedef struct {
     uint8_t active;
     uint8_t faulted;
     uint16_t fault_code;
+    /* 1 while the motors are lent (motion_task_borrow_motors): motor_*_pwm
+     * are then the borrower's outputs. Appended. */
+    uint8_t lent;
 } motion_status_message_t;
 
 typedef struct {

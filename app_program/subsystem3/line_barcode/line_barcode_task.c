@@ -1,6 +1,7 @@
 #include "../../app.h"
 #include "../../vehicle_buffers.h"
 #include "line_barcode_task.h"
+#include "junction_detector.h"
 
 #define LINE_BARCODE_PRIORITY 10
 #define LINE_FAULT_RETRY_MS 1000U
@@ -17,6 +18,9 @@ typedef struct {
 	uint32_t last_right;
 	uint32_t mean_count;
 	int32_t half_count;
+	float count_rate;       /* mean counts per ms over the last odometry period */
+	float mm_per_count;     /* > 0 with junction.initialized: detector on */
+	junction_detector_t junction;
 	uint32_t line_sequence;
 	uint32_t barcode_sequence;
 	uint32_t last_sample_ms;
@@ -25,6 +29,9 @@ typedef struct {
 	bool have_odom;
 	bool scanner_ready;
 	bool have_sample;
+	bool was_in_frame;      /* scanner was inside a barcode frame last sample */
+	bool all_black;         /* all three sensors black ... */
+	uint32_t all_black_since_ms;    /* ... since this sample */
 } line_state_t;
 
 static line_barcode_task_config_t s_config;
@@ -56,6 +63,8 @@ static bool add_odometry(line_state_t *state, const wheel_odometry_message_t *me
 		    elapsed == 0U || elapsed > INT32_MAX ||
 		    ld == 0x80000000U || rd == 0x80000000U)
 			return false;
+		state->count_rate = (float)((int64_t)signed_bits(ld) + signed_bits(rd)) *
+				    0.5f / (float)elapsed;
 		sum = (int64_t)signed_bits(ld) + signed_bits(rd) + state->half_count;
 		whole = sum / 2;
 		remainder = (int32_t)(sum % 2);
@@ -116,6 +125,25 @@ static uint16_t receive_odometry(line_state_t *state, uint32_t timestamp_ms,
 	return 0U;
 }
 
+/*
+ * Wheel count at the sample time: the last odometry count plus the travel
+ * since it at the last measured rate. Odometry arrives every 50 ms but the
+ * sensors are sampled every 20 ms, so without this a barcode or junction
+ * edge between odometry updates would be placed up to 50 ms of travel late
+ * (it used to be a fault instead). The extrapolation is capped at the
+ * odometry age limit, which is enforced separately.
+ */
+static int32_t sample_count(const line_state_t *state, uint32_t timestamp_ms)
+{
+	uint32_t since = timestamp_ms - state->last_odom_ms;
+
+	if (!state->have_odom) return 0;
+	if (since > INT32_MAX) since = 0U;      /* odometry newer than the sample */
+	if (since > state->max_age_ms) since = state->max_age_ms;
+	return signed_bits(state->mean_count +
+			   (uint32_t)(int32_t)__builtin_lroundf(state->count_rate * (float)since));
+}
+
 static uint16_t process_readings(line_state_t *state, const ir_readings_t *readings,
 				 uint32_t timestamp_ms)
 {
@@ -123,6 +151,7 @@ static uint16_t process_readings(line_state_t *state, const ir_readings_t *readi
 	barcode_event_message_t barcode = {0};
 	uint8_t position;
 	bool odom_updated;
+	bool junction;
 	uint16_t fault;
 	ER er;
 
@@ -133,22 +162,29 @@ static uint16_t process_readings(line_state_t *state, const ir_readings_t *readi
 	}
 	fault = receive_odometry(state, timestamp_ms, &odom_updated);
 	if (fault != 0U) return fault;
+	(void)odom_updated;
+	junction = false;
 	if (state->have_odom) {
-		int32_t count = signed_bits(state->mean_count);
+		int32_t count = sample_count(state, timestamp_ms);
 		if (!state->scanner_ready) {
 			if (!barcode_scanner_init(&state->scanner, &state->barcode_config,
 						  readings->barcode.black, count))
 				return VEHICLE_FAULT_CODE_LINE_BARCODE;
 			state->scanner_ready = true;
-		} else {
-			if (readings->barcode.black != state->scanner.last_black) {
-				uint32_t since_sample = state->last_odom_ms - state->last_sample_ms;
-				if (!odom_updated || since_sample == 0U || since_sample > INT32_MAX)
-					return VEHICLE_FAULT_CODE_LINE_ODOMETRY;
-			}
-			if (!barcode_scanner_update(&state->scanner, readings->barcode.black, count))
-				return VEHICLE_FAULT_CODE_LINE_BARCODE;
+		} else if (!barcode_scanner_update(&state->scanner, readings->barcode.black,
+						   count)) {
+			return VEHICLE_FAULT_CODE_LINE_BARCODE;
 		}
+		if (state->scanner.in_frame && !state->was_in_frame &&
+		    s_config.barcode_started != NULL)
+			s_config.barcode_started(s_config.barcode_started_context);
+		state->was_in_frame = state->scanner.in_frame;
+		if (state->junction.initialized)
+			junction = junction_detector_update(
+				&state->junction, readings->barcode.black,
+				readings->center.black, readings->right.black,
+				(float)count * state->mm_per_count) ==
+				JUNCTION_DETECTED;
 	}
 	position = line_following_position(readings);
 	line.header.type = VEHICLE_MESSAGE_LINE_OBSERVATION;
@@ -158,7 +194,17 @@ static uint16_t process_readings(line_state_t *state, const ir_readings_t *readi
 	line.lateral_error = position == POS_LEFT ? -1 : position == POS_RIGHT ? 1 : 0;
 	line.confidence = position == POS_LOST ? 0U : 1000U;
 	line.line_detected = position != POS_LOST;
-	line.intersection_detected = position == POS_JUNCTION;
+	/* A confirmed junction (left sensor + line sensors), not "both line
+	 * sensors black", which is normal edge following. */
+	line.intersection_detected = junction ? 1U : 0U;
+	if (!(readings->barcode.black && readings->center.black && readings->right.black)) {
+		state->all_black = false;
+	} else if (!state->all_black) {
+		state->all_black = true;
+		state->all_black_since_ms = timestamp_ms;
+	}
+	line.picked_up = state->all_black &&
+			 timestamp_ms - state->all_black_since_ms >= LINE_PICKUP_MS ? 1U : 0U;
 	er = tk_snd_mbf(g_mbf_line_observations, &line, (INT)sizeof(line), TMO_POL);
 	if (er != E_OK) {
 		state->delivery_error = er;
@@ -278,6 +324,8 @@ ER line_barcode_task_start(const line_barcode_task_config_t *config)
 	if (config == NULL || config->read == NULL || config->period_ms == 0U ||
 	    config->period_ms > INT32_MAX || config->odometry_max_age_ms == 0U ||
 	    config->odometry_max_age_ms > INT32_MAX ||
+	    !__builtin_isfinite(config->junction_mm_per_count) ||
+	    config->junction_mm_per_count < 0.0f ||
 	    !barcode_scanner_init(&s_state.scanner, &config->barcode, false, 0))
 		return E_PAR;
 	if (g_mbf_line_odometry <= 0 || g_mbf_line_observations <= 0 ||
@@ -286,6 +334,12 @@ ER line_barcode_task_start(const line_barcode_task_config_t *config)
 	s_config = *config;
 	s_state.barcode_config = config->barcode;
 	s_state.max_age_ms = config->odometry_max_age_ms;
+	if (config->junction_mm_per_count > 0.0f) {
+		static const junction_config_t junction_config = JUNCTION_DEFAULT_CONFIG;
+
+		if (!junction_detector_init(&s_state.junction, &junction_config)) return E_PAR;
+		s_state.mm_per_count = config->junction_mm_per_count;
+	}
 	task.task = (FP)line_barcode_task;
 	task.tskatr = TA_HLNG | TA_RNG3;
 	task.itskpri = LINE_BARCODE_PRIORITY;
@@ -456,9 +510,12 @@ static BOOL task_fault_test(void)
 	ok = process_readings(&s_test_state, &readings, 110U) == 0U &&
 	     s_test_state.scanner_ready && !s_test_state.have_pending && ok;
 	ok = tk_rcv_mbf(g_mbf_line_observations, &line, TMO_POL) == (INT)sizeof(line) && ok;
+	/* A barcode edge between odometry updates is placed at the estimated
+	 * count (it used to fault). */
 	readings.barcode.black = true;
-	ok = process_readings(&s_test_state, &readings, 111U) ==
-	     VEHICLE_FAULT_CODE_LINE_ODOMETRY && ok;
+	ok = process_readings(&s_test_state, &readings, 111U) == 0U &&
+	     s_test_state.scanner.last_black && ok;
+	ok = tk_rcv_mbf(g_mbf_line_observations, &line, TMO_POL) == (INT)sizeof(line) && ok;
 
 	s_test_state = (line_state_t){0};
 	s_test_state.barcode_config = (barcode_scanner_config_t){10U, 0U, 0U, 0U, 0U};
@@ -491,24 +548,169 @@ static BOOL task_fault_test(void)
 	return ok;
 }
 
+/* Count at a sample between odometry updates: extrapolated at the last rate,
+ * capped at the odometry age limit, never before the last odometry. */
+static BOOL task_estimate_test(void)
+{
+	s_test_state = (line_state_t){0};
+	s_test_state.have_odom = true;
+	s_test_state.mean_count = 1000U;
+	s_test_state.count_rate = 2.0f;
+	s_test_state.last_odom_ms = 100U;
+	s_test_state.max_age_ms = 50U;
+	return sample_count(&s_test_state, 100U) == 1000 &&
+	       sample_count(&s_test_state, 120U) == 1040 &&
+	       sample_count(&s_test_state, 200U) == 1100 &&
+	       sample_count(&s_test_state, 90U) == 1000;
+}
+
+static BOOL test_sample_line(line_state_t *state, const ir_readings_t *readings,
+			     uint32_t count, uint32_t sequence, uint32_t timestamp,
+			     line_observation_message_t *line)
+{
+	wheel_odometry_message_t odometry = {0};
+
+	odometry.header.type = VEHICLE_MESSAGE_WHEEL_ODOMETRY;
+	odometry.header.version = VEHICLE_MESSAGE_VERSION;
+	odometry.header.sequence = sequence;
+	odometry.header.timestamp_ms = timestamp;
+	odometry.left_count = signed_bits(count);
+	odometry.right_count = signed_bits(count);
+	odometry.valid = 1U;
+	return tk_snd_mbf(g_mbf_line_odometry, &odometry, (INT)sizeof(odometry), TMO_POL) == E_OK &&
+	       process_readings(state, readings, timestamp) == 0U &&
+	       tk_rcv_mbf(g_mbf_line_observations, line, TMO_POL) == (INT)sizeof(*line);
+}
+
+/* With the detector on (1 mm per count), a tape across the path -- left
+ * sensor black 20-30 mm, centre+right black 28-38 mm -- sets
+ * intersection_detected in exactly one observation; both line sensors black
+ * on their own (normal edge following) never does. */
+static BOOL task_junction_test(void)
+{
+	static const junction_config_t config = JUNCTION_DEFAULT_CONFIG;
+	ir_readings_t readings = {0};
+	line_observation_message_t line;
+	unsigned junctions = 0U, centred = 0U, d;
+	uint32_t sequence = 1U, timestamp = 100U;
+	BOOL ok = TRUE;
+
+	s_test_state = (line_state_t){0};
+	s_test_state.barcode_config = (barcode_scanner_config_t){10U, 0U, 0U, 0U, 0U};
+	s_test_state.max_age_ms = 50U;
+	s_test_state.mm_per_count = 1.0f;
+	if (!junction_detector_init(&s_test_state.junction, &config)) return FALSE;
+	readings.center.black = true;
+	for (d = 0U; d <= 80U; d += 2U) {
+		readings.barcode.black = d >= 20U && d < 32U;
+		readings.right.black = d >= 27U && d < 39U;
+		if (!test_sample_line(&s_test_state, &readings, d, sequence++, timestamp, &line))
+			ok = FALSE;
+		timestamp += 20U;
+		if (line.intersection_detected != 0U) junctions++;
+	}
+	ok = junctions == 1U && ok;
+	/* Riding the edge with both line sensors black, left sensor white. */
+	for (; d <= 160U; d += 2U) {
+		readings.barcode.black = false;
+		readings.right.black = (d / 10U) % 2U == 0U;
+		if (!test_sample_line(&s_test_state, &readings, d, sequence++, timestamp, &line))
+			ok = FALSE;
+		timestamp += 20U;
+		if (line.intersection_detected != 0U) junctions++;
+		if (line.lateral_error == 0 && line.line_detected) centred++;
+	}
+	ok = junctions == 1U && centred > 0U && ok;
+	ok = test_drain(g_mbf_line_odometry) && ok;
+	ok = test_drain(g_mbf_line_observations) && ok;
+	return test_drain(g_mbf_barcode_events) && ok;
+}
+
+/* All three sensors black for LINE_PICKUP_MS reports picked_up; one sample
+ * with floor under any sensor clears it and restarts the wait. */
+static BOOL task_pickup_test(void)
+{
+	ir_readings_t readings = {0};
+	line_observation_message_t line;
+	uint32_t timestamp = 1000U;
+	uint32_t sequence = 1U;
+	uint32_t t;
+	BOOL ok = TRUE;
+
+	s_test_state = (line_state_t){0};
+	s_test_state.barcode_config = (barcode_scanner_config_t){10U, 0U, 0U, 0U, 0U};
+	s_test_state.max_age_ms = 50U;
+	readings.barcode.black = readings.center.black = readings.right.black = true;
+	for (t = 0U; t <= LINE_PICKUP_MS + 40U; t += 20U) {
+		if (!test_sample_line(&s_test_state, &readings, 0U, sequence++, timestamp + t, &line))
+			ok = FALSE;
+		if (line.picked_up != (t >= LINE_PICKUP_MS ? 1U : 0U)) ok = FALSE;
+	}
+	timestamp += t;
+	readings.right.black = false;
+	ok = test_sample_line(&s_test_state, &readings, 0U, sequence++, timestamp, &line) &&
+	     line.picked_up == 0U && ok;
+	readings.right.black = true;
+	ok = test_sample_line(&s_test_state, &readings, 0U, sequence++, timestamp + 20U, &line) &&
+	     line.picked_up == 0U && ok;
+	ok = test_drain(g_mbf_line_odometry) && ok;
+	ok = test_drain(g_mbf_line_observations) && ok;
+	return test_drain(g_mbf_barcode_events) && ok;
+}
+
+static unsigned s_test_started;
+
+static void test_barcode_started(void *context)
+{
+	(void)context;
+	s_test_started++;
+}
+
+/* The barcode_started hook runs once per frame (at the start '*'). */
+static BOOL task_started_test(void)
+{
+	line_barcode_task_config_t saved = s_config;
+	BOOL ok;
+
+	s_test_started = 0U;
+	s_config.barcode_started = test_barcode_started;
+	s_config.barcode_started_context = NULL;
+	ok = task_frame_test(1);
+	s_config = saved;
+	return ok && s_test_started == 1U;
+}
+
 BOOL line_barcode_task_test(void)
 {
+	BOOL pickup_ok;
+	BOOL started_ok;
 	BOOL frame_ok;
 	BOOL mean_ok;
 	BOOL fault_ok;
+	BOOL estimate_ok;
+	BOOL junction_ok;
 	TEST_INIT();
 
 	frame_ok = task_frame_test(1);
 	frame_ok = task_frame_test(-1) && frame_ok;
 	mean_ok = task_mean_test();
 	fault_ok = task_fault_test();
+	estimate_ok = task_estimate_test();
+	junction_ok = task_junction_test();
 	frame_ok = test_drain(g_mbf_line_odometry) && frame_ok;
 	frame_ok = test_drain(g_mbf_line_observations) && frame_ok;
 	frame_ok = test_drain(g_mbf_barcode_events) && frame_ok;
 	TEST_CHECK("LB-U01", frame_ok, "simulated line and barcode messages");
 	TEST_CHECK("LB-U02", mean_ok, "wheel-count and sequence wrap");
 	TEST_CHECK("LB-U03", fault_ok, "odometry synchronization and full queues");
+	TEST_CHECK("LB-U04", estimate_ok, "wheel count estimated between odometry updates");
+	TEST_CHECK("LB-U05", junction_ok, "a tape across the path flags one junction; both line sensors black alone does not");
+	pickup_ok = task_pickup_test();
+	started_ok = task_started_test();
+	TEST_CHECK("LB-U06", pickup_ok, "all three sensors black for LINE_PICKUP_MS reports picked_up; floor clears it");
+	TEST_CHECK("LB-U07", started_ok, "barcode_started hook runs once per barcode frame");
 	TEST_SUMMARY("line/barcode task");
-	return frame_ok && mean_ok && fault_ok;
+	return frame_ok && mean_ok && fault_ok && estimate_ok && junction_ok &&
+	       pickup_ok && started_ok;
 }
 #endif

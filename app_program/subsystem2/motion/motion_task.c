@@ -6,7 +6,7 @@
 #include <tk/smp.h>
 #endif
 
-#define MOTION_TASK_PRIORITY 10
+#define MOTION_TASK_PRIORITY 8   /* above the other core-1 tasks: wheel PID */
 #define MOTION_FAULT_RETRY_MS 1000U
 
 /* Motor lending (motion_task_borrow_motors). One word, atomic access only:
@@ -537,6 +537,12 @@ static ER motion_task_start_internal(const motion_task_config_t *config,
 	task.tskatr = TA_HLNG | TA_RNG3;
 	task.itskpri = MOTION_TASK_PRIORITY;
 	task.stksz = TASK_STACK_SIZE;
+#if TK_SUPPORT_SMP
+	/* Core 1 (TP_PRC2): core 0 runs the radio (priority 4) and USB console
+	 * (3), which pre-empt any task there for milliseconds at a time. */
+	task.tskatr |= TA_ASSPRC;
+	task.assprc = TP_PRC2;
+#endif
 	id = tk_cre_tsk(&task);
 	if (id < E_OK) {
 		s_hardware_enabled = false;

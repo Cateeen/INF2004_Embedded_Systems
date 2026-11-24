@@ -60,6 +60,30 @@ static BOOL safety_test(void)
 	       !imu_processor_init(NULL);
 }
 
+/* With a confirmation time, a brief tilt (an acceleration spike) is not a
+ * hump; one held for hump_confirm_ms is, starting where it began. */
+static BOOL hump_confirm_test(void)
+{
+	imu_state_t state;
+	const accel_data_t flat = {.az = GRAVITY_MS2};
+	const accel_data_t ramp = {.ax = -1.4f, .az = 9.70f};
+	BOOL ok;
+
+	ok = imu_processor_init(&state);
+	state.hump_confirm_ms = 400U;
+	ok = imu_processor_update(&state, &flat, 0.00f, 0U) && ok;
+	ok = imu_processor_update(&state, &ramp, 0.01f, 50U) && !state.hump_active && ok;
+	ok = imu_processor_update(&state, &ramp, 0.02f, 300U) && !state.hump_active && ok;
+	ok = imu_processor_update(&state, &flat, 0.03f, 350U) && !state.hump_active &&
+	     !state.hump_candidate && ok;       /* a 300 ms spike: no hump */
+	ok = imu_processor_update(&state, &ramp, 0.04f, 400U) && !state.hump_active && ok;
+	ok = imu_processor_update(&state, &ramp, 0.05f, 799U) && !state.hump_active && ok;
+	ok = imu_processor_update(&state, &ramp, 0.06f, 800U) && state.hump_active &&
+	     state.fsm_state == IMU_STATE_HUMP_RISING &&
+	     state.hump_start_distance_m == 0.04f && ok;
+	return ok;
+}
+
 static BOOL pickup_tilt_test(void)
 {
 	imu_state_t state;
@@ -78,6 +102,12 @@ static BOOL pickup_tilt_test(void)
 	       !state.hump_active &&
 	       imu_processor_update(&state, &flat, 0.0f, 40U) &&
 	       state.fsm_state == IMU_STATE_MONITORING && state.tilt_detected &&
+	       /* Level again: the tilt clears IMU_TILT_CLEAR_MS after the last
+	        * tilted sample (30 ms), not before. */
+	       imu_processor_update(&state, &flat, 0.0f, 30U + IMU_TILT_CLEAR_MS - 1U) &&
+	       state.tilt_detected &&
+	       imu_processor_update(&state, &flat, 0.0f, 30U + IMU_TILT_CLEAR_MS) &&
+	       !state.tilt_detected &&
 	       imu_processor_init(&state) &&
 	       imu_processor_update(&state, &low_az, 0.0f, 50U) &&
 	       state.fsm_state == IMU_STATE_TILT && state.tilt_detected;
@@ -526,6 +556,7 @@ BOOL imu_processor_test(void)
 	BOOL accel_ok;
 	BOOL reader_ok;
 	BOOL level_filter_ok;
+	BOOL hump_confirm_ok;
 	TEST_INIT();
 
 	terrain_ok = terrain_test();
@@ -537,17 +568,20 @@ BOOL imu_processor_test(void)
 	accel_ok = accel_decode_test();
 	reader_ok = accel_reader_test();
 	level_filter_ok = level_filter_test();
+	hump_confirm_ok = hump_confirm_test();
 	TEST_CHECK("IMU-U01", terrain_ok, "flat, ramp and hump transitions");
 	TEST_CHECK("IMU-U02", safety_ok, "tilt and invalid samples");
-	TEST_CHECK("IMU-U09", pickup_tilt_ok, "pickup roll, low vertical acceleration and tilt latch");
+	TEST_CHECK("IMU-U09", pickup_tilt_ok, "pickup roll, low vertical acceleration; tilt clears after IMU_TILT_CLEAR_MS level");
 	TEST_CHECK("IMU-U10", hump_height_ok, "known ramp height, telemetry quantization and timeout");
 	TEST_CHECK("IMU-U03", clock_ok, "independent timeouts and clock wrap");
 	TEST_CHECK("IMU-U04", producer_ok, "typed estimates and odometry validation");
 	TEST_CHECK("IMU-U07", accel_ok, "LSM303DLHC acceleration decoding");
 	TEST_CHECK("IMU-U08", reader_ok, "fresh accelerometer transfer and fault latch");
 	TEST_CHECK("IMU-U11", level_filter_ok, "level calibration offset and terrain pitch filter");
+	TEST_CHECK("IMU-U13", hump_confirm_ok, "a brief tilt is not a hump; one held for hump_confirm_ms is");
 	TEST_SUMMARY("imu");
 	return terrain_ok && safety_ok && pickup_tilt_ok && hump_height_ok &&
-	       clock_ok && producer_ok && accel_ok && reader_ok && level_filter_ok;
+	       clock_ok && producer_ok && accel_ok && reader_ok && level_filter_ok &&
+	       hump_confirm_ok;
 }
 #endif

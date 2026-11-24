@@ -137,8 +137,31 @@ static ER read_channel(line_adc_reader_t *reader, const line_adc_channel_t *chan
 	return E_OK;
 }
 
+/* A sample whose span is over budget was interrupted (another task or an
+ * interrupt ran in the middle of it): it is discarded and re-read, up to
+ * this many attempts in all, before the reader faults. */
+#define LINE_ADC_SAMPLE_ATTEMPTS 3U
+
+static ER read_sample_once(line_adc_reader_t *reader, ir_readings_t *readings,
+			   uint32_t *timestamp_ms, bool line, bool barcode, bool last);
+
 static ER read_sample(line_adc_reader_t *reader, ir_readings_t *readings,
 		      uint32_t *timestamp_ms, bool line, bool barcode)
+{
+	unsigned attempt;
+	ER er = E_TMOUT;
+
+	for (attempt = 1U; attempt <= LINE_ADC_SAMPLE_ATTEMPTS; attempt++) {
+		er = read_sample_once(reader, readings, timestamp_ms, line, barcode,
+				      attempt == LINE_ADC_SAMPLE_ATTEMPTS);
+		if (er != E_BUSY) break;
+	}
+	return er;
+}
+
+/* E_BUSY: over the span budget and not the last attempt (retry). */
+static ER read_sample_once(line_adc_reader_t *reader, ir_readings_t *readings,
+			   uint32_t *timestamp_ms, bool line, bool barcode, bool last)
 {
 	ir_readings_t result = {0};
 	SYSTIM start, barcode_start, end;
@@ -175,7 +198,9 @@ static ER read_sample(line_adc_reader_t *reader, ir_readings_t *readings,
 		goto fault;
 	}
 	if (end_ms - start_ms > reader->config.max_sample_span_ms) {
-		tm_printf((UB*)"line ADC sample span exceeded budget: limit=%u ms\n",
+		if (!last) return E_BUSY;
+		tm_printf((UB*)"line ADC sample span exceeded budget %u times: limit=%u ms\n",
+			  (unsigned)LINE_ADC_SAMPLE_ATTEMPTS,
 			  (unsigned)reader->config.max_sample_span_ms);
 		er = E_TMOUT;
 		goto fault;

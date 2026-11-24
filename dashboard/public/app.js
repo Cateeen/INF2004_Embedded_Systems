@@ -18,11 +18,6 @@ function fmtDuration(ms) {
   const m = Math.floor(ms / 60000), s = (ms % 60000) / 1000;
   return String(m).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
 }
-function runTime(s) {
-  const r = s && s.run;
-  if (!r || !r.startedAt) return null;
-  return (r.endedAt || (Date.now() + clockSkew)) - r.startedAt;
-}
 function sinceRunStart(s, at) {
   return s.run && s.run.startedAt ? '+' + fmtDuration(at - s.run.startedAt) : clock(at);
 }
@@ -150,12 +145,17 @@ function render(s) {
   $('preview-banner').classList.toggle('hidden', !s.preview);
   $('stale-banner').classList.toggle('hidden', !s.stale || s.preview);
   $('pickup-banner').classList.toggle('hidden', !s.run.pickedUp);
-  if (s.run.pickedUp) set('pickup-detail', 'End of demo · run time ' + fmtDuration(runTime(s)));
+  const [runLabel, runTone] = s.run.pickedUp ? ['Robot stopped · picked up', 'stopped']
+    : s.run.endedAt ? ['Robot stopped', 'stopped']
+    : s.run.startedAt ? ['Robot running', 'running']
+    : ['Robot idle · not started', 'idle'];
+  set('run-text', runLabel);
+  $('run-pill').className = 'pill runpill ' + runTone;
+  $('run-dot').className = 'signal ' + (runTone === 'running' ? 'ok' : runTone === 'stopped' ? 'bad' : '');
+  if (s.run.pickedUp) set('pickup-detail', 'End of demo');
   set('link-tag', s.preview ? 'PREVIEW' : 'LIVE MQTT');
   set('footer-mode', s.preview ? 'Preview mode · simulated data' : 'Local dashboard · real MQTT data only');
   ['robot-start', 'robot-stop', 'save-mapping'].forEach(id => { $(id).disabled = !s.brokerConnected; });
-  set('timer-label', s.run.endedAt ? 'FINAL RUN TIME' : s.run.startedAt ? 'RUN TIME' : 'RUN TIME · NOT STARTED');
-  $('run-timer').classList.toggle('frozen', !!s.run.endedAt);
 
   if (d) {
     const [state, tone] = currentState(d, s);
@@ -183,7 +183,7 @@ async function post(url, obj) {
 $('robot-start').addEventListener('click', () => post('/api/command', {type: 'start'}));
 $('robot-stop').addEventListener('click', () => post('/api/command', {type: 'stop'}));
 $('save-mapping').addEventListener('click', () => post('/api/mapping', {letter: letterSelect.value, movement: $('mapping-movement').value}));
-$('reset-run').addEventListener('click', () => { if (confirm('Clear the run timer and barcode history? Next junction returns to Turn left.')) post('/api/run/reset', {}); });
+$('reset-run').addEventListener('click', () => { if (confirm('Clear the run, barcode history and barcode mapping? Next junction returns to Turn left.')) post('/api/run/reset', {}); });
 $('clear-log').addEventListener('click', () => { if (confirm('Clear the event timeline?')) post('/api/events/clear', {}); });
 $('download-log').addEventListener('click', () => {
   const rows = [['Time', 'Type', 'Event'], ...(latest?.events || []).map(e => [new Date(e.at).toISOString(), e.kind, e.message])];
@@ -192,7 +192,6 @@ $('download-log').addEventListener('click', () => {
   a.href = url; a.download = 'picocar-run.csv'; a.click(); URL.revokeObjectURL(url);
 });
 
-setInterval(() => set('run-timer', fmtDuration(runTime(latest))), 100);
 const feed = new EventSource('/api/events');
 feed.onmessage = e => { try { render(JSON.parse(e.data)); } catch (err) { console.warn('Invalid dashboard event', err); } };
 feed.onerror = () => set('connection-text', 'Dashboard reconnecting…');

@@ -18,8 +18,15 @@ const topics = ['robot/telemetry', 'robot/telemetry/detail', 'robot/heartbeat',
 const MOVEMENTS = ['forward', 'left', 'right', 'uturn'];
 const DEFAULT_JUNCTION = 'left'; /* used until the first barcode is decoded */
 
-/* Barcode letter -> movement. Editable live from the dashboard. */
-const mappings = Object.fromEntries('ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map(l => [l, 'forward']));
+/* Barcode letter -> movement. Editable live from the dashboard; cleared back
+ * to forward when a run ends (Stop, car picked up, Reset run), so each run
+ * starts from a fresh mapping. Only ever mutated in place: preview.js holds it. */
+const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+const mappings = Object.fromEntries(LETTERS.map(l => [l, 'forward']));
+
+function resetMappings() {
+  LETTERS.forEach(l => { mappings[l] = 'forward'; });
+}
 const clients = new Set();
 let connection = null;
 let commandSequence = 0;
@@ -50,6 +57,8 @@ function startRunIfNeeded() {
 
 function endRun() {
   if (run.startedAt && !run.endedAt) run.endedAt = Date.now();
+  resetMappings();
+  log('INFO', 'Run ended — barcode mapping cleared');
 }
 
 function cm(mm) { return mm == null ? null : Math.round(mm / 10 * 10) / 10; }
@@ -309,7 +318,8 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/state') { sendJson(res, 200, snapshot()); return; }
   if (pathname === '/api/events/clear' && req.method === 'POST') { events = []; push(); sendJson(res, 200, {ok: true}); return; }
   if (pathname === '/api/run/reset' && req.method === 'POST') {
-    run = newRun(); log('INFO', 'Run reset — checklist cleared'); push(); sendJson(res, 200, {ok: true}); return;
+    run = newRun(); resetMappings();
+    log('INFO', 'Run reset — checklist and barcode mapping cleared'); push(); sendJson(res, 200, {ok: true}); return;
   }
   if (pathname === '/api/command' && req.method === 'POST') {
     readBody(req, body => {

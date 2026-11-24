@@ -10,6 +10,13 @@
 #define CAR_SAFETY_FAULT_EXTERNAL  0x10U
 #define CAR_SAFETY_FAULT_EMERGENCY 0x20U
 
+/* Obstacle emergency readings (closer than the obstacle task's emergency
+ * distance) stop the robot at once (disarm) but do not latch a fault: each is
+ * one raw ultrasonic ping, the HC-SR04 gives the odd spurious short echo, and
+ * a hand reaching for the robot is one too. Re-arming still needs the space
+ * ahead clear (> obstacle_stop_mm) and a fresh GO. CAR_SAFETY_FAULT_EMERGENCY
+ * remains for the local emergency-stop input. */
+
 typedef struct {
 	uint32_t line_max_age_ms;
 	uint32_t imu_max_age_ms;
@@ -17,6 +24,12 @@ typedef struct {
 	uint32_t scan_timeout_ms;
 	uint16_t min_line_confidence;
 	uint16_t obstacle_stop_mm;
+	/* Deadline for each stream's FIRST message, measured from init, when
+	 * longer than its normal max age (0 = the normal max age). The sensor
+	 * tasks start after the controller and need a few polls for a first
+	 * reading; arming needs every stream anyway, so this only avoids a
+	 * start-up fault. Appended: 0 in older initializers. */
+	uint32_t startup_grace_ms;
 } car_safety_config_t;
 
 typedef struct {
@@ -36,6 +49,8 @@ typedef struct {
 	uint32_t ahead_wait_ms;
 	uint32_t scan_start_ms;
 	uint32_t faults;
+	/* Why the first fault latched (a constant string), NULL before any. */
+	const char *fault_reason;
 	bool initialized;
 	bool line_clear;
 	bool imu_clear;

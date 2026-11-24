@@ -65,6 +65,20 @@
 #define TCP_SND_BUF                 (8 * TCP_MSS)
 #define TCP_SND_QUEUELEN            ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 
+/* MQTT client output buffer (lwIP default 256 bytes). Telemetry (10 Hz),
+ * dashboard events and the heartbeat share it; 256 bytes filled whenever
+ * the laptop's ACKs were slow, mqtt_publish() returned ERR_MEM, and
+ * telemetry went stale and was dropped. 1 KB rides out ~1 s of stall. It is
+ * allocated once with the client from the MEM_SIZE heap. */
+#define MQTT_OUTPUT_RINGBUF_SIZE    1024
+/* Every mqtt_publish() -- QoS 0 too, because a completion callback is given
+ * -- holds one of these request slots until TCP has ACKed its bytes. The
+ * default 4 ran out within one delayed laptop ACK at 10 Hz telemetry plus
+ * the heartbeats and dashboard events, and publish returned ERR_MEM with
+ * the ring buffer still mostly empty. Each slot is a few bytes of the
+ * client structure. */
+#define MQTT_REQ_MAX_IN_FLIGHT      32
+
 #define LWIP_NETIF_STATUS_CALLBACK  1
 #define LWIP_NETIF_LINK_CALLBACK    1
 #define LWIP_NETIF_HOSTNAME         1

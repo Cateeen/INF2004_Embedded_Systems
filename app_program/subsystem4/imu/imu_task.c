@@ -109,15 +109,35 @@ static uint16_t process_sample(imu_task_state_t *state, const accel_data_t *samp
 	    !__builtin_isfinite(sample->ay) || !__builtin_isfinite(sample->az))
 		return VEHICLE_FAULT_CODE_IMU_SENSOR;
 	elapsed = sample_ms - (state->have_sample ? state->last_sample_ms : state->start_ms);
-	if (elapsed > INT32_MAX || (state->have_sample && elapsed == 0U))
+	if (elapsed > INT32_MAX) {
+		tm_printf((UB*)"IMU sample time went backwards: %u -> %u ms\n",
+			  (unsigned)(state->have_sample ? state->last_sample_ms : state->start_ms),
+			  (unsigned)sample_ms);
 		return VEHICLE_FAULT_CODE_IMU_CLOCK;
+	}
+	/* The reader stamps each sample with the time the previous read saw
+	 * data ready, so two reads in one millisecond (e.g. the first after
+	 * start-up) repeat a timestamp. Nothing new to process: skip it. */
+	if (state->have_sample && elapsed == 0U) return 0U;
 	fault = receive_odometry(state, sample_ms);
 	if (fault != 0U) return fault;
 	if (state->producer.have_odometry) {
 		bool calibrating = state->level_pending;
+		const imu_state_t *p = &state->producer.processor;
+		bool was_hump = p->hump_active;
 
 		if (!imu_producer_update(&state->producer, sample, NULL, sample_ms, &estimate))
 			return VEHICLE_FAULT_CODE_IMU_PROCESSING;
+		/* Log each hump, with the angles that started it, for tuning
+		 * IMU_HUMP_START_M / IMU_HUMP_CONFIRM_MS on the robot. */
+		if (p->hump_active && !was_hump)
+			tm_printf((UB*)"IMU: hump start, pitch %d, roll %d (0.1 deg), height %d mm\n",
+				  (int)(p->terrain_pitch_deg * 10.0f),
+				  (int)(p->terrain_roll_deg * 10.0f),
+				  (int)(p->current_hump_m * 1000.0f + 0.5f));
+		else if (!p->hump_active && was_hump)
+			tm_printf((UB*)"IMU: hump end, peak %d mm\n",
+				  (int)(p->hump_peak_m * 1000.0f + 0.5f));
 		if (calibrating) {
 			estimate.tilt_detected = 1U; /* not safe to arm yet */
 			fault = update_level(state, sample);
@@ -239,6 +259,12 @@ ER imu_task_start(const imu_task_config_t *config)
 	task.tskatr = TA_HLNG | TA_RNG3;
 	task.itskpri = IMU_TASK_PRIORITY;
 	task.stksz = TASK_STACK_SIZE;
+#if TK_SUPPORT_SMP
+	/* Core 1 (TP_PRC2): core 0 runs the radio (priority 4) and USB console
+	 * (3), which pre-empt any task there for milliseconds at a time. */
+	task.tskatr |= TA_ASSPRC;
+	task.assprc = TP_PRC2;
+#endif
 	id = tk_cre_tsk(&task);
 	if (id < E_OK) return id;
 	s_started = true;
@@ -345,7 +371,8 @@ static BOOL task_fault_test(void)
 	sample.i2c_ok = true;
 	ok = tk_snd_mbf(g_mbf_imu_odometry, &odometry, (INT)sizeof(odometry), TMO_POL) == E_OK && ok;
 	ok = process_sample(&state, &sample, 100U) == 0U && ok;
-	ok = process_sample(&state, &sample, 100U) == VEHICLE_FAULT_CODE_IMU_CLOCK && ok;
+	ok = process_sample(&state, &sample, 100U) == 0U && ok;	/* repeat: skipped */
+	ok = process_sample(&state, &sample, 99U) == VEHICLE_FAULT_CODE_IMU_CLOCK && ok;
 	ok = process_sample(&state, &sample, 101U) == 0U && ok;
 	ok = process_sample(&state, &sample, 102U) == VEHICLE_FAULT_CODE_IMU_DELIVERY &&
 	     state.delivery_error == E_TMOUT && ok;

@@ -3,7 +3,7 @@
 #include "wifi_service.h"
 #include "wifi_mqtt_bridge.h"
 
-#define WIFI_SERVICE_PRIORITY 10
+#define WIFI_SERVICE_PRIORITY 12   /* below every vehicle task */
 /* A communication problem is logged at most this often while it repeats. */
 #define WIFI_FAULT_LOG_INTERVAL_MS 5000U
 /* Equals the MQTT bridge queue depth; the bridge pushes back when full. */

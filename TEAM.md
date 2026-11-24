@@ -69,7 +69,7 @@ fixed.
 | GP17 | odometry bring-up | left encoder B |
 | GP18 | odometry bring-up | right encoder A |
 | GP19 | odometry bring-up | right encoder B |
-| GP20 | vehicle controller | active-low GO toggle button to GND; internal pull-up |
+| GP20 | vehicle controller | active-low GO toggle button to GND; internal pull-up (the dashboard Start / Stop act on the same toggle, IF-12) |
 | GP21 | | |
 | GP22 | | |
 | GP26 | line/barcode | right IR sensor, ADC0 |
@@ -123,20 +123,29 @@ the drivers have no locking to stop it.
 |---|---|---|---|
 | UART1 | | | |
 | I2C0 | | | |
-| I2C1 | IMU | IMU task (planned) | GP2, GP3 |
+| I2C1 | IMU | IMU task | GP2, GP3 |
 | SPI0 | | | |
 | SPI1 | | | |
-| ADC | line/barcode | line/barcode task (planned) | GP26–GP28 |
-| PWM slices 4, 5 | motion control | motion task (planned) | GP8–GP11 |
-| PWM slice 7 | obstacle detection | obstacle task (planned) | GP15 |
+| ADC | line/barcode | line/barcode task | GP26–GP28 |
+| PWM slices 4, 5 | motion control | motion task; **lent** to the vehicle bypass task while it drives round an obstacle (below) | GP8–GP11 |
+| PWM slice 7 | obstacle detection | obstacle task | GP15 |
 | WiFi radio, TCP/IP, MQTT | *kernel* | `cyw43_utk_task` (built in) | GP23–25, GP29 |
 
 I2C1 sharing with other devices is not yet confirmed. The kernel I2C driver
-remains disabled; when enabled, startup initializes only I2C1 on GP2/GP3 as
+is enabled (`DEVCNF_USE_IIC`); startup initializes only I2C1 on GP2/GP3 as
 `iicb`. I2C0 still has GP8/GP9 configured and must not be initialized without
-reassigning its motor pins. Confirm bus ownership before enabling I2C. PWM
-ownership covers the entire slice, including any unused channel on the same
-slice.
+reassigning its motor pins. PWM ownership covers the entire slice, including
+any unused channel on the same slice.
+
+**Motor lending.** The motion task initializes the motor driver and is its
+owner; the driver refuses calls from any other task. The obstacle bypass
+must drive the motors directly, so `vehicle_bypass` borrows them with
+`motion_task_borrow_motors()`: the motion task lends only while it is stopped
+and armed, and does not touch the motors meanwhile; the bypass gives them
+back (`motion_task_return_motors()`) before it reports DONE. A STOP or
+emergency stop sent to the motion task while they are lent revokes them (the
+borrower brakes at its next driver call). Exactly one task writes the motors
+at any moment. Never call `motor_driver_*` from any other task.
 
 ### WiFi and MQTT are special
 
@@ -165,19 +174,31 @@ What students *can* do:
 
 ## 4. Task priorities
 
-1 is the highest. 1–4 are used by the kernel (USB console 3, WiFi 4).
-The vehicle tasks below currently use priority 10.
+1 is the highest. 1–4 are used by the kernel: the USB console (3) and the
+WiFi radio (4) both run on core 0 and pre-empt every vehicle task there,
+sometimes for several milliseconds. The control loop therefore runs on
+core 1, and only the tasks that must read core-0 hardware stay on core 0.
 
-| Subsystem | Priority | Tasks |
-|---|---|---|
-| 1 | 10 | WiFi service |
-| 2 | 10 | motion, vehicle controller, controller monitor |
-| 3 | 10 | line/barcode |
-| 4 | 10 | IMU |
-| 5 | 10 | obstacle |
-| 6 | 10 | odometry, encoder bring-up |
+| Subsystem | Task | Priority | Core | Why |
+|---|---|---|---|---|
+| *kernel* | USB console | 3 | 0 | built in |
+| *kernel* | WiFi radio, lwIP, MQTT (`cyw43_utk_task`) | 4 | 0 | built in |
+| 2 | motion | 8 | 1 | wheel PID: highest of the control loop |
+| 2 | vehicle controller | 9 | 1 | |
+| 3 | line/barcode | 9 | 1 | a sample interrupted for > 10 ms is re-read, up to 3 times, before it faults |
+| 4 | IMU | 10 | 1 | |
+| 2 | vehicle bypass | 10 | 0 | reads the encoders directly |
+| 5 | obstacle | 10 | 0 | ultrasonic/servo GPIO registration needs core 0 |
+| 6 | odometry, encoder bring-up | 10 | 0 | encoder GPIO interrupts need core 0 |
+| 2 | vehicle startup (one-shot) | 11 | 0 | GPIO registrations need core 0 |
+| 1 | WiFi service | 12 | any | only moves telemetry between buffers |
+| 2 | controller monitor (not in `VEHICLE=1`) | 10 | any | |
 
-Core: `TP_PRC1` = core 0, `TP_PRC2` = core 1, or "any".
+Core: `TP_PRC1` = core 0, `TP_PRC2` = core 1, or "any". Do not move a
+core-1 task to core 0 or "any", or give a vehicle task a priority of 4 or
+below, without re-running the vehicle with the network on: the line and IMU
+tasks fault on timing (`line ADC sample span exceeded budget`, IMU fault
+code 17) when the radio pre-empts them.
 
 ## 5. Interfaces between subsystems
 
@@ -191,9 +212,12 @@ sends to it or waits on it. Agree on the data format before coding.
 | IF-07 | application WiFi service → built-in network owner | copied message buffer, nonblocking | bridge-owned, private | legacy five-byte telemetry on `robot/telemetry`, QoS 0; opt-in, no delivery guarantee | team and instructor agreement confirmed |
 | IF-08 | built-in network owner → application WiFi service | atomic link snapshot | bridge-owned, private | link and MQTT readiness with operating-clock timestamp; stale snapshots fault the service | team and instructor agreement confirmed |
 | IF-09 | telemetry producer → application WiFi service | copied message buffer, nonblocking | `g_mbf_telemetry` | ordered telemetry messages; producer handles full-buffer and other errors | pending |
-| IF-10 | motion task → controller | copied message buffer | `g_mbf_motion_status` | sequenced 100 ms commanded-PWM, active-command and latched-fault state; start/stop and faults published at once, PWM changes while running only at the 100 ms period; controller period ≤50 ms; moving status accepted only while a VELOCITY is live (+1 status period after STOP); no ARM acknowledgement or physical feedback | implementation draft; hardware validation pending (VC-H01) |
-| IF-11 | vehicle controller → motion task | copied message buffer, nonblocking | `g_mbf_motion_commands` | ARM/STOP/emergency-stop; VELOCITY while following the line: `linear_velocity` v and `angular_velocity` w in cm/s, wheel targets left = v − w, right = v + w, \|w\| < \|v\|, \|v\| + \|w\| ≤ 20; one per controller cycle, 200 ms lifetime | implemented, unit-tested (MOT-U13, VC-U22); hardware validation pending (VC-H01) |
-| IF-12 | local input provider → vehicle controller | task-context callback | configured callback/context | GP20 button toggles GO; emergency-stop input is not wired | hardware validation pending |
+| IF-10 | motion task → controller | copied message buffer | `g_mbf_motion_status` | sequenced 100 ms commanded-PWM, active-command and latched-fault state; start/stop and faults published at once, PWM changes while running only at the 100 ms period; controller period ≤50 ms; moving status accepted only while a VELOCITY or TURN is live (+1 status period after STOP); `lent` = 1 while the motors are lent to the bypass (PWM fields are then the bypass's outputs; lend and return published at once), accepted only while a bypass runs; no ARM acknowledgement or physical feedback | implemented, unit-tested (VC-U22, VC-U28); hardware validation pending (VC-H01, OBS-H04) |
+| IF-11 | vehicle controller → motion task | copied message buffer, nonblocking | `g_mbf_motion_commands` | ARM/STOP/emergency-stop; VELOCITY while following the line: `linear_velocity` v and `angular_velocity` w in cm/s, wheel targets left = v − w, right = v + w, \|w\| < \|v\|, \|v\| + \|w\| ≤ 20; TURN (junction spin): linear 0, angular = each wheel's speed, + = left; one per controller cycle, 200 ms lifetime; switching VELOCITY ↔ TURN needs STOP | implemented, unit-tested (MOT-U13, MOT-U15, VC-U22, VC-U26); hardware validation pending (VC-H01) |
+| IF-12 | local input provider → vehicle controller | task-context callback | configured callback/context | GP20 button toggles GO; with `VEHICLE_DASHBOARD_RUN 1` (`app_main.c`) the dashboard's Start / Stop act on the same toggle (Start = a press that turns GO on, re-pressing if already on; Stop = GO off), read through `dashboard_take_run_command()` (one atomic word, no network access); emergency-stop input is not wired | hardware validation pending (WIFI-H04) |
+| IF-13 | line/barcode task → vehicle controller | copied message buffer, nonblocking | `g_mbf_line_observations` | per sample: line position, `intersection_detected` (a confirmed junction: left sensor, then both line sensors), `picked_up` = 1 while all three IR sensors have read black (no floor) for `LINE_PICKUP_MS` = 500 ms; the controller stops on a pick-up while running; GO turns itself off, so one press starts it again | implemented, unit-tested (LB-U05, LB-U06, VC-U26, VC-U28); hardware validation pending (VC-H03) |
+| IF-14 | motion task ↔ vehicle bypass task | function calls + one atomic word (`motion_task_borrow_motors` / `motion_task_return_motors`) | motion-task private | motor lending (section 3): requested by the bypass, granted by the motion task only while stopped and armed, withdrawn safely on timeout or abort; revoked by STOP / emergency stop | implemented; hardware validation pending (OBS-H04) |
+| IF-15 | any vehicle task → network owner (dashboard) | copied message buffer, nonblocking (`dashboard_report_*`) + atomic words from the dashboard | `dashboard_link` private | events to `robot/barcode`, `robot/event`, `robot/telemetry/detail`: barcode detected and decoded, junction action done, obstacle distance and profile, avoidance phase, line rejoined, hump height (≤ 5 Hz) and peak, pick-up; from `robot/command`: next junction turn, Start / Stop. The next junction turn resets to LEFT on Start, Stop and pick-up | implemented; hardware validation pending (WIFI-H03–H05) |
 
 Each interface is tested by at least one integration test
 (`testing/integration/TEST_LOG.md`).

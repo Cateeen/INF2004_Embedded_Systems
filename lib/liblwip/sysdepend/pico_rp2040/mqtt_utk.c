@@ -16,6 +16,8 @@
  */
 
 #include "lwip/apps/mqtt.h"
+#include "lwip/apps/mqtt_priv.h"	/* client->conn, to turn Nagle off */
+#include "lwip/altcp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/timeouts.h"
 #include "wifi_secrets.h"
@@ -191,11 +193,19 @@ static void heartbeat_timeout(void *arg)
 					   (u16_t)sizeof(dashboard_hb), 0, 0,
 					   publish_done_cb, NULL);
 		}
+		err_t	err;
+
 		len = tm_sprintf(payload, (const UB*)"hb %u", count++);
-		tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\"\n", payload);
-		(void)mqtt_publish(client, MQTT_TOPIC, payload, (u16_t)len,
+		err = mqtt_publish(client, MQTT_TOPIC, payload, (u16_t)len,
 				   0 /* qos */, 0 /* retain */,
 				   publish_done_cb, NULL);
+		if(err == ERR_OK) {
+			tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\"\n", payload);
+		} else {
+			tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\" NOT SENT, err=%d%s\n",
+				  payload, (int)err,
+				  err == ERR_MEM ? " (output buffer or request slots full)" : "");
+		}
 	}
 
 	/* Re-arms itself every call -- mqtt.c's connection callback (below)
@@ -226,6 +236,12 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t 
 		connecting = 0;
 
 		tm_printf((UB*)"mqtt: connected to " MQTT_BROKER_IP "\n");
+
+		/* Send each small publish at once. With Nagle on, TCP holds a
+		 * small segment until the previous one is ACKed, and Windows
+		 * delays ACKs by up to 200 ms: telemetry queued up behind that
+		 * and went stale. */
+		if(c != NULL && c->conn != NULL) altcp_nagle_disable(c->conn);
 
 		/* Subscribe to the same topic this client publishes to, so every
 		 * heartbeat comes back from the broker and is printed by

@@ -26,6 +26,11 @@ typedef void (*vehicle_controller_junction_done_t)(void *context, uint8_t turn);
 /* Called for each valid decoded barcode (payload is not NUL-terminated). */
 typedef void (*vehicle_controller_barcode_t)(void *context, const char *payload,
 					     uint8_t length);
+/* Called (with input_context) when the robot has stopped by itself while GO
+ * is still on -- lost line, pick-up, tilt, an obstacle it will not bypass,
+ * a bypass that could not resume. A toggle GO input should turn itself off
+ * here, so the next single press is the fresh GO edge that re-arms. */
+typedef void (*vehicle_controller_go_reset_t)(void *context);
 
 /*
  * Junction manoeuvre, measured with SENSOR_TEST=junction: after the
@@ -66,6 +71,8 @@ typedef struct {
 	 * well below obstacle_stop_mm (the bypass works ~20-30 cm from it).
 	 * false: stop and wait for GO, as before. */
 	bool obstacle_bypass;
+	/* May be NULL (then two presses of a toggle GO restart the robot). */
+	vehicle_controller_go_reset_t go_reset;
 } vehicle_controller_task_config_t;
 
 /* Opt-in safety/arming task. The callback supplies trusted local GO and

@@ -289,6 +289,8 @@ void dashboard_link_owner_on_message(const char *topic, const uint8_t *data,
 		record_run_command((uint8_t)DASHBOARD_RUN_START);
 		break;
 	case WIFI_COMMAND_STOP:
+		/* The run is over: the last barcode's turn does not carry over. */
+		dashboard_junction_reset();
 		record_run_command((uint8_t)DASHBOARD_RUN_STOP);
 		break;
 	default:

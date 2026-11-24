@@ -8,7 +8,7 @@
 #include "../../subsystem3/line_barcode/line_observation.h"
 #include "../../subsystem4/imu/imu_types.h"
 
-#define VEHICLE_CONTROLLER_PRIORITY 10
+#define VEHICLE_CONTROLLER_PRIORITY 9
 /* Each line-following VELOCITY command lasts this long, so the motors stop by
  * themselves within it if the controller stops sending (period is 50 ms). */
 #define VEHICLE_CONTROLLER_DRIVE_MS 200U
@@ -64,6 +64,7 @@ typedef struct {
 	 * up to when its end was seen (they may still be queued). */
 	uint32_t bypass_done_ms;
 	bool have_bypass_done;
+	bool previous_go;               /* inputs->go last cycle */
 } vehicle_controller_context_t;
 
 enum {
@@ -71,6 +72,10 @@ enum {
 	BYPASS_STOPPING,        /* STOP sent: wait for the motion task to report idle */
 	BYPASS_RUNNING          /* the vehicle_bypass task drives the motors */
 };
+/* An obstacle first seen closer than this is not bypassed (the bypass needs
+ * 20-30 cm of room; something this close appeared suddenly, e.g. a hand):
+ * the robot just stops. */
+#define VEHICLE_BYPASS_MIN_MM      150U
 /* Wheels stopped this long, and idle reported, before the bypass starts. */
 #define VEHICLE_BYPASS_SETTLE_MS   500U
 #define VEHICLE_BYPASS_IDLE_MAX_MS 2000U
@@ -456,6 +461,27 @@ static void latch_controller_fault(vehicle_controller_context_t *context,
 	(void)controller_state_step(&context->controller, now, false, false);
 }
 
+/* The robot stopped by itself with GO still on: turn a toggle GO off. */
+static void go_reset(void)
+{
+	if (s_config.go_reset != NULL) s_config.go_reset(s_config.input_context);
+}
+
+/* Why a GO press did not arm (the first failing check). */
+static const char *arm_refusal(const car_safety_t *safety)
+{
+	if (safety->faults != 0U)
+		return "a fault is latched -- restart the robot";
+	if (safety->scanning) return "an obstacle scan is running";
+	if (!safety->line.have_message || !safety->imu.have_message || !safety->have_ahead)
+		return "still waiting for sensor data";
+	if (!safety->imu_clear)
+		return "IMU: tilted, or still calibrating -- put it down flat and keep it still ~1 s";
+	if (!safety->ahead_clear) return "something ahead within the stop distance";
+	if (!safety->line_clear) return "the line is not under the sensors";
+	return "a safety check";
+}
+
 static void junction_reset(vehicle_controller_context_t *context)
 {
 	context->junction_phase = JUNCTION_IDLE;
@@ -595,7 +621,8 @@ static void bypass_step(vehicle_controller_context_t *context,
 	switch (context->bypass_phase) {
 	case BYPASS_IDLE:
 		if (state == CONTROLLER_BLOCKED && context->last_state == CONTROLLER_FOLLOWING &&
-		    obstacle_blocked(safety) && context->junction_phase == JUNCTION_IDLE) {
+		    obstacle_blocked(safety) && context->junction_phase == JUNCTION_IDLE &&
+		    context->ahead_mm > VEHICLE_BYPASS_MIN_MM) {
 			context->bypass_phase = BYPASS_STOPPING;
 			context->bypass_ms = now;
 			tm_printf((UB*)"obstacle ahead: stopping to scan it\n");
@@ -613,7 +640,8 @@ static void bypass_step(vehicle_controller_context_t *context,
 		    context->motion_status.motor_2_pwm != 0) {
 			if ((uint32_t)(now - context->bypass_ms) > VEHICLE_BYPASS_IDLE_MAX_MS) {
 				context->bypass_phase = BYPASS_IDLE;
-				tm_printf((UB*)"obstacle bypass: motion task not idle; stopped (GO to retry)\n");
+				tm_printf((UB*)"obstacle bypass: motion task not idle; stopped (press GO to retry)\n");
+				go_reset();
 			}
 			break;
 		}
@@ -621,7 +649,8 @@ static void bypass_step(vehicle_controller_context_t *context,
 			context->bypass_phase = BYPASS_RUNNING;
 		} else {
 			context->bypass_phase = BYPASS_IDLE;
-			tm_printf((UB*)"obstacle bypass unavailable; stopped (GO to retry)\n");
+			tm_printf((UB*)"obstacle bypass unavailable; stopped (press GO to retry)\n");
+			go_reset();
 		}
 		break;
 	case BYPASS_RUNNING: {
@@ -637,14 +666,16 @@ static void bypass_step(vehicle_controller_context_t *context,
 		/* The rejoin crosses the tape: not a junction. */
 		junction_reset(context);
 		if (result != OBSTACLE_BYPASS_OK || state != CONTROLLER_BLOCKED) {
-			tm_printf((UB*)"obstacle bypass ended: %s; stopped (GO twice to resume)\n",
+			tm_printf((UB*)"obstacle bypass ended: %s; stopped (press GO to resume)\n",
 				  obstacle_bypass_status_text(result));
+			go_reset();
 		} else if (car_safety_resume(safety, now, inputs->go, inputs->emergency_stopped)) {
 			tm_printf((UB*)"obstacle bypassed: back on the line, following\n");
 		} else {
-			tm_printf((UB*)"obstacle bypassed, but cannot resume (%s); GO twice to resume\n",
+			tm_printf((UB*)"obstacle bypassed, but cannot resume (%s); press GO to resume\n",
 				  !safety->line_clear ? "line not under the sensors" :
 				  (!safety->ahead_clear ? "something ahead" : "a safety check"));
+			go_reset();
 		}
 		break;
 	}
@@ -656,7 +687,7 @@ static void bypass_step(vehicle_controller_context_t *context,
 
 /*
  * Lifted while running (following, turning at a junction or bypassing):
- * stop as for a lost line (latched: GO off and on to start again; it stops
+ * stop as for a lost line (latched: press GO to start again; it stops
  * again at once while still lifted), end any bypass, and tell the dashboard
  * once per lift (it ends the run timer).
  */
@@ -678,7 +709,9 @@ static void pickup_step(vehicle_controller_context_t *context,
 	}
 	if (!context->pickup_reported) {
 		context->pickup_reported = true;
-		tm_printf((UB*)"picked up: motors stopped (GO off and on to start again)\n");
+		tm_printf((UB*)"picked up: motors stopped (press GO to start again)\n");
+		/* End of the run: the last barcode's turn does not carry over. */
+		dashboard_junction_reset();
 		(void)dashboard_report_pickup();
 	}
 }
@@ -711,10 +744,40 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 	    obstacle_blocked(&context->controller.safety))
 		(void)dashboard_report_obstacle(context->ahead_mm);
 	pickup_step(context, state);
+	/* A GO press that did not arm: say why and turn a toggle GO back off,
+	 * so the next press is another real attempt (not a press that only
+	 * switches GO off). */
+	if (inputs->go && !context->previous_go && state != CONTROLLER_FOLLOWING &&
+	    state != CONTROLLER_FAULTED) {
+		tm_printf((UB*)"GO refused: %s\n", arm_refusal(&context->controller.safety));
+		go_reset();
+	}
+	context->previous_go = inputs->go;
 	bypass_step(context, state, now, inputs);
+	/* Stopped by itself with GO still on (not handed to the bypass): a
+	 * toggle GO turns off, so one press -- not two -- starts it again. */
+	if (inputs->go && context->bypass_phase == BYPASS_IDLE &&
+	    ((context->last_state == CONTROLLER_FOLLOWING && state != CONTROLLER_FOLLOWING) ||
+	     (state == CONTROLLER_FOLLOWING && context->steering.stop_latched)))
+		go_reset();
 	context->last_state = state;
 	report_telemetry(context, state, now);
 	if (state == CONTROLLER_FAULTED) {
+		if (!context->emergency_sent) {
+			/* Say why: a missed sensor deadline latches silently. */
+			uint32_t f = context->controller.safety.faults;
+
+			tm_printf((UB*)"vehicle controller FAULTED (0x%02x):%s%s%s%s%s%s -- first cause: %s\n",
+				  (unsigned)f,
+				  (f & CAR_SAFETY_FAULT_LINE) ? " line" : "",
+				  (f & CAR_SAFETY_FAULT_IMU) ? " imu" : "",
+				  (f & CAR_SAFETY_FAULT_OBSTACLE) ? " obstacle" : "",
+				  (f & CAR_SAFETY_FAULT_CLOCK) ? " clock" : "",
+				  (f & CAR_SAFETY_FAULT_EXTERNAL) ? " subsystem/message" : "",
+				  (f & CAR_SAFETY_FAULT_EMERGENCY) ? " emergency" : "",
+				  context->controller.safety.fault_reason != NULL ?
+				  context->controller.safety.fault_reason : "unknown");
+		}
 		if (!context->emergency_sent &&
 		    publish_motion_command(context, VEHICLE_MOTION_EMERGENCY_STOP,
 					   (uint8_t)context->controller.safety.faults,
@@ -886,6 +949,12 @@ ER vehicle_controller_task_start(const vehicle_controller_task_config_t *config)
 	task.tskatr = TA_HLNG | TA_RNG3;
 	task.itskpri = VEHICLE_CONTROLLER_PRIORITY;
 	task.stksz = TASK_STACK_SIZE;
+#if TK_SUPPORT_SMP
+	/* Core 1 (TP_PRC2): core 0 runs the radio (priority 4) and USB console
+	 * (3), which pre-empt any task there for milliseconds at a time. */
+	task.tskatr |= TA_ASSPRC;
+	task.assprc = TP_PRC2;
+#endif
 	id = tk_cre_tsk(&task);
 	if (id < E_OK) return id;
 	s_started = true;

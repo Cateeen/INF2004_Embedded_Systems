@@ -53,7 +53,8 @@ bool imu_processor_init(imu_state_t *state) {
     state->current_hump_m        = 0.0f;
     state->hump_active           = false;
     state->shock_detected        = false; /* Collision detection removed per Prof */
-    state->tilt_detected         = false; /* Latches true when lifted or overturned */
+    state->tilt_detected         = false; /* true when lifted or overturned, until level for IMU_TILT_CLEAR_MS */
+    state->last_tilt_ms          = 0U;
     state->last_distance_m       = 0.0f;
     state->hump_start_distance_m = 0.0f;
     state->current_pitch_deg     = 0.0f;
@@ -66,6 +67,10 @@ bool imu_processor_init(imu_state_t *state) {
     state->mount_yaw_sin         = 0.0f;
     state->terrain_filter_alpha  = 1.0f;
     state->terrain_valid         = false;
+    state->hump_confirm_ms       = 0U;
+    state->hump_candidate        = false;
+    state->hump_candidate_ms     = 0U;
+    state->hump_candidate_distance_m = 0.0f;
     state->wheel_left_m          = 0.0f;
     state->wheel_right_m         = 0.0f;
     state->ball_m                = 0.0f;
@@ -78,9 +83,11 @@ bool imu_processor_init(imu_state_t *state) {
 }
 
 bool imu_processor_init_vehicle(imu_state_t *state) {
-    return imu_processor_init(state) &&
-           imu_processor_set_terrain_filter(state, IMU_TERRAIN_FILTER_ALPHA) &&
-           imu_processor_set_mount_yaw(state, IMU_MOUNT_YAW_DEG);
+    if (!imu_processor_init(state) ||
+        !imu_processor_set_terrain_filter(state, IMU_TERRAIN_FILTER_ALPHA) ||
+        !imu_processor_set_mount_yaw(state, IMU_MOUNT_YAW_DEG)) return false;
+    state->hump_confirm_ms = IMU_HUMP_CONFIRM_MS;
+    return true;
 }
 
 void imu_level_calibrator_reset(imu_level_calibrator_t *calibrator) {
@@ -230,9 +237,15 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
     /* 1. Global Safety Watchdog: Lifted or Overturned (immediately disarms motors) */
     if (check_lifted_or_overturned(accel, state->current_pitch_deg, state->current_roll_deg)) {
         state->tilt_detected = true;
+        state->last_tilt_ms  = now_ms;
+        state->hump_candidate = false;
         state->hump_active   = false;
         state->fsm_state     = IMU_STATE_TILT;
         goto pack_telemetry;
+    }
+    if (state->tilt_detected &&
+        (uint32_t)(now_ms - state->last_tilt_ms) >= IMU_TILT_CLEAR_MS) {
+        state->tilt_detected = false;   /* put down and level again */
     }
 
     /* 2. Terrain FSM */
@@ -240,8 +253,19 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
     case IMU_STATE_MONITORING:
         state->motion_event = (fabsf(accel->ax) > 2.0f) ? IMU_EVENT_ACCEL : IMU_EVENT_STATIONARY;
 
-        if (hump_m > IMU_HUMP_START_M) {
-            state->hump_start_distance_m = current_distance_m;
+        if (hump_m <= IMU_HUMP_START_M) {
+            state->hump_candidate = false;
+            break;
+        }
+        if (!state->hump_candidate) {
+            state->hump_candidate            = true;
+            state->hump_candidate_ms         = now_ms;
+            state->hump_candidate_distance_m = current_distance_m;
+        }
+        if ((uint32_t)(now_ms - state->hump_candidate_ms) >= state->hump_confirm_ms) {
+            /* Held long enough: a hump, from where the climb began. */
+            state->hump_candidate        = false;
+            state->hump_start_distance_m = state->hump_candidate_distance_m;
             state->last_distance_m       = current_distance_m;
             state->hump_active           = true;
             state->hump_start_ms         = now_ms;

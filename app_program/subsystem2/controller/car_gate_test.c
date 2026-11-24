@@ -150,11 +150,28 @@ static BOOL safety_fault_test(void)
 	     (safety.faults & CAR_SAFETY_FAULT_LINE) != 0U && ok;
 	ok = car_safety_init(&safety, &config, 100U) &&
 	     safety_inputs(&safety, 1U, 100U) && ok;
+	/* Emergency while not armed: no fault, just not clear ahead. */
 	obstacle = safety_obstacle(2U, 101U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
 	obstacle.emergency = 1U;
-	ok = !car_safety_obstacle(&safety, &obstacle, 101U) &&
-	     (safety.faults & CAR_SAFETY_FAULT_EMERGENCY) != 0U &&
+	ok = car_safety_obstacle(&safety, &obstacle, 101U) && safety.faults == 0U &&
 	     !car_safety_follow(&safety, 101U, true, true, false) && ok;
+	/* While armed: stops at once, never latches; re-arms only once clear
+	 * ahead and with a fresh GO edge. */
+	ok = car_safety_init(&safety, &config, 100U) &&
+	     safety_inputs(&safety, 1U, 100U) &&
+	     car_safety_follow(&safety, 100U, true, true, false) && ok;
+	obstacle = safety_obstacle(2U, 101U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
+	obstacle.emergency = 1U;
+	ok = car_safety_obstacle(&safety, &obstacle, 101U) && safety.faults == 0U &&
+	     !safety.armed && ok;
+	obstacle = safety_obstacle(3U, 102U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
+	obstacle.emergency = 1U;
+	ok = car_safety_obstacle(&safety, &obstacle, 102U) && safety.faults == 0U &&
+	     !car_safety_follow(&safety, 102U, true, true, false) && ok;
+	obstacle = safety_obstacle(4U, 103U, VEHICLE_OBSTACLE_AHEAD_READING, OBS_DIST_NONE);
+	ok = car_safety_obstacle(&safety, &obstacle, 103U) &&
+	     !car_safety_follow(&safety, 103U, true, false, false) &&
+	     car_safety_follow(&safety, 103U, true, true, false) && ok;
 	config.line_max_age_ms = 1000U;
 	config.imu_max_age_ms = 1000U;
 	ok = car_safety_init(&safety, &config, 100U) &&
@@ -346,7 +363,7 @@ BOOL car_gate_test(void)
 	TEST_CHECK("VC-U03", rearm_ok, "line following requires a fresh go edge");
 	TEST_CHECK("VC-U04", safety_ok, "sensor vetoes require a fresh go edge");
 	TEST_CHECK("VC-U05", scan_ok, "scan requires fresh ahead data before rearming");
-	TEST_CHECK("VC-U06", fault_ok, "invalid, late and emergency inputs latch faults");
+	TEST_CHECK("VC-U06", fault_ok, "invalid and late inputs latch faults; obstacle emergency readings stop the robot without latching");
 	TEST_CHECK("VC-U07", wrap_ok, "sensor and clock wrap with backward clock rejection");
 	TEST_CHECK("VC-U10", state_flow_ok, "state transitions and fresh go edges");
 	TEST_CHECK("VC-U11", state_fault_ok, "state faults, emergency latch and clock wrap");

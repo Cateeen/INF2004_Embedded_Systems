@@ -3,7 +3,7 @@
 #include "line_barcode_task.h"
 #include "junction_detector.h"
 
-#define LINE_BARCODE_PRIORITY 10
+#define LINE_BARCODE_PRIORITY 9
 #define LINE_FAULT_RETRY_MS 1000U
 
 typedef struct {
@@ -344,6 +344,12 @@ ER line_barcode_task_start(const line_barcode_task_config_t *config)
 	task.tskatr = TA_HLNG | TA_RNG3;
 	task.itskpri = LINE_BARCODE_PRIORITY;
 	task.stksz = TASK_STACK_SIZE;
+#if TK_SUPPORT_SMP
+	/* Core 1 (TP_PRC2): core 0 runs the radio (priority 4) and USB console
+	 * (3), which pre-empt any task there for milliseconds at a time. */
+	task.tskatr |= TA_ASSPRC;
+	task.assprc = TP_PRC2;
+#endif
 	id = tk_cre_tsk(&task);
 	if (id < E_OK) return id;
 	s_started = true;

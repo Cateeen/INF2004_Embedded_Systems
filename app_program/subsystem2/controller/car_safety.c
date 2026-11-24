@@ -9,8 +9,9 @@ static bool interval_valid(uint32_t value)
 	return value != 0U && value <= INT32_MAX;
 }
 
-static bool fail(car_safety_t *safety, uint32_t fault)
+static bool fail(car_safety_t *safety, uint32_t fault, const char *why)
 {
+	if (safety->fault_reason == NULL) safety->fault_reason = why;
 	safety->faults |= fault;
 	safety->armed = false;
 	return false;
@@ -19,25 +20,43 @@ static bool fail(car_safety_t *safety, uint32_t fault)
 static bool clock_valid(car_safety_t *safety, uint32_t now)
 {
 	if (now - safety->last_clock_ms > INT32_MAX)
-		return fail(safety, CAR_SAFETY_FAULT_CLOCK);
+		return fail(safety, CAR_SAFETY_FAULT_CLOCK, "clock went backwards");
 	safety->last_clock_ms = now;
 	return true;
+}
+
+/* Before a stream's first message, its deadline is the start-up grace. */
+static uint32_t first_deadline(const car_safety_t *safety, bool have_message,
+			       uint32_t max_age)
+{
+	if (have_message || safety->config.startup_grace_ms <= max_age) return max_age;
+	return safety->config.startup_grace_ms;
 }
 
 static bool check_deadlines(car_safety_t *safety, uint32_t now)
 {
 	if (now - (safety->line.have_message ? safety->line.timestamp_ms :
-		   safety->line_wait_ms) > safety->config.line_max_age_ms)
-		(void)fail(safety, CAR_SAFETY_FAULT_LINE);
+		   safety->line_wait_ms) >
+	    first_deadline(safety, safety->line.have_message, safety->config.line_max_age_ms))
+		(void)fail(safety, CAR_SAFETY_FAULT_LINE,
+			   safety->line.have_message ? "line: observations stopped (deadline)" :
+			   "line: no first observation in time");
 	if (now - (safety->imu.have_message ? safety->imu.timestamp_ms :
-		   safety->imu_wait_ms) > safety->config.imu_max_age_ms)
-		(void)fail(safety, CAR_SAFETY_FAULT_IMU);
+		   safety->imu_wait_ms) >
+	    first_deadline(safety, safety->imu.have_message, safety->config.imu_max_age_ms))
+		(void)fail(safety, CAR_SAFETY_FAULT_IMU,
+			   safety->imu.have_message ? "imu: estimates stopped (deadline)" :
+			   "imu: no first estimate in time");
 	if (safety->scanning) {
 		if (now - safety->scan_start_ms > safety->config.scan_timeout_ms)
-			(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+			(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE, "obstacle: scan timed out");
 	} else if (now - (safety->have_ahead ? safety->obstacle.timestamp_ms :
-			  safety->ahead_wait_ms) > safety->config.ahead_max_age_ms) {
-		(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+			  safety->ahead_wait_ms) >
+		   first_deadline(safety, safety->obstacle.have_message,
+				  safety->config.ahead_max_age_ms)) {
+		(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE,
+			   safety->obstacle.have_message ? "obstacle: ahead readings stopped (deadline)" :
+			   "obstacle: no first ahead reading in time");
 	}
 	return safety->faults == 0U;
 }
@@ -47,13 +66,24 @@ static bool accept(car_safety_t *safety, car_safety_stream_t *stream,
 		   uint32_t now, uint32_t max_age, uint32_t not_before, uint32_t fault)
 {
 	if (header == NULL || header->type != type ||
-	    header->version != VEHICLE_MESSAGE_VERSION ||
-	    now - header->timestamp_ms > max_age ||
-	    (!stream->have_message && header->timestamp_ms - not_before > INT32_MAX) ||
-	    (stream->have_message &&
-	     (header->sequence - stream->sequence != 1U ||
-	      header->timestamp_ms - stream->timestamp_ms > INT32_MAX)))
-		return fail(safety, fault);
+	    header->version != VEHICLE_MESSAGE_VERSION)
+		return fail(safety, fault, fault == CAR_SAFETY_FAULT_LINE ? "line: wrong message type" :
+			    fault == CAR_SAFETY_FAULT_IMU ? "imu: wrong message type" :
+			    "obstacle: wrong message type");
+	if (now - header->timestamp_ms > max_age)
+		return fail(safety, fault, fault == CAR_SAFETY_FAULT_LINE ? "line: message too old" :
+			    fault == CAR_SAFETY_FAULT_IMU ? "imu: message too old" :
+			    "obstacle: message too old");
+	if (!stream->have_message && header->timestamp_ms - not_before > INT32_MAX)
+		return fail(safety, fault, fault == CAR_SAFETY_FAULT_LINE ? "line: first message from before start" :
+			    fault == CAR_SAFETY_FAULT_IMU ? "imu: first message from before start" :
+			    "obstacle: first message from before start");
+	if (stream->have_message &&
+	    (header->sequence - stream->sequence != 1U ||
+	     header->timestamp_ms - stream->timestamp_ms > INT32_MAX))
+		return fail(safety, fault, fault == CAR_SAFETY_FAULT_LINE ? "line: message out of sequence" :
+			    fault == CAR_SAFETY_FAULT_IMU ? "imu: message out of sequence" :
+			    "obstacle: message out of sequence");
 	stream->sequence = header->sequence;
 	stream->timestamp_ms = header->timestamp_ms;
 	stream->have_message = true;
@@ -73,7 +103,8 @@ bool car_safety_init(car_safety_t *safety, const car_safety_config_t *config,
 	    !interval_valid(config->scan_timeout_ms) ||
 	    config->min_line_confidence > 1000U ||
 	    config->obstacle_stop_mm < OBS_MIN_RANGE_MM ||
-	    config->obstacle_stop_mm > OBS_MAX_RANGE_MM) {
+	    config->obstacle_stop_mm > OBS_MAX_RANGE_MM ||
+	    config->startup_grace_ms > INT32_MAX) {
 		*safety = (car_safety_t){.faults = CAR_SAFETY_FAULT_EXTERNAL};
 		return false;
 	}
@@ -95,7 +126,7 @@ bool car_safety_line(car_safety_t *safety, const line_observation_message_t *mes
 	if (message == NULL || message->line_detected > 1U ||
 	    message->intersection_detected > 1U || message->picked_up > 1U ||
 	    message->confidence > 1000U)
-		return fail(safety, CAR_SAFETY_FAULT_LINE);
+		return fail(safety, CAR_SAFETY_FAULT_LINE, "line: invalid field");
 	if (!accept(safety, &safety->line, &message->header, VEHICLE_MESSAGE_LINE_OBSERVATION,
 		    now_ms, safety->config.line_max_age_ms, safety->line_wait_ms,
 		    CAR_SAFETY_FAULT_LINE))
@@ -115,7 +146,7 @@ bool car_safety_imu(car_safety_t *safety, const imu_estimate_message_t *message,
 	if (!clock_valid(safety, now_ms) || !check_deadlines(safety, now_ms)) return false;
 	if (message == NULL || !(message->validity & VEHICLE_IMU_VALID_ROLL_PITCH) ||
 	    message->shock_detected > 1U || message->tilt_detected > 1U)
-		return fail(safety, CAR_SAFETY_FAULT_IMU);
+		return fail(safety, CAR_SAFETY_FAULT_IMU, "imu: invalid estimate or flags");
 	if (!accept(safety, &safety->imu, &message->header, VEHICLE_MESSAGE_IMU_ESTIMATE,
 		    now_ms, safety->config.imu_max_age_ms, safety->imu_wait_ms,
 		    CAR_SAFETY_FAULT_IMU))
@@ -135,17 +166,18 @@ bool car_safety_obstacle(car_safety_t *safety, const obstacle_event_message_t *m
 	if (message == NULL || message->emergency > 1U ||
 	    (message->distance_mm != OBS_DIST_NONE &&
 	     (message->distance_mm < OBS_MIN_RANGE_MM || message->distance_mm > OBS_MAX_RANGE_MM)))
-		return fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+		return fail(safety, CAR_SAFETY_FAULT_OBSTACLE, "obstacle: invalid distance or flag");
 	max_age = safety->scanning ? safety->config.scan_timeout_ms :
 				    safety->config.ahead_max_age_ms;
 	if (!accept(safety, &safety->obstacle, &message->header, VEHICLE_MESSAGE_OBSTACLE_EVENT,
 		    now_ms, max_age, safety->ahead_wait_ms, CAR_SAFETY_FAULT_OBSTACLE))
 		return false;
-	if (message->emergency) return fail(safety, CAR_SAFETY_FAULT_EMERGENCY);
+	if (message->emergency) safety->armed = false;      /* stop at once; no latch */
 	if (message->obstacle_class == VEHICLE_OBSTACLE_AHEAD_READING && !safety->scanning) {
 		if (!safety->have_ahead &&
 		    message->header.timestamp_ms - safety->ahead_wait_ms > INT32_MAX)
-			return fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+			return fail(safety, CAR_SAFETY_FAULT_OBSTACLE,
+				    "obstacle: ahead reading from before the wait began");
 		safety->have_ahead = true;
 		safety->ahead_clear = message->distance_mm == OBS_DIST_NONE ||
 				      message->distance_mm > safety->config.obstacle_stop_mm;
@@ -156,7 +188,8 @@ bool car_safety_obstacle(car_safety_t *safety, const obstacle_event_message_t *m
 	    (message->obstacle_class == VEHICLE_OBSTACLE_SCAN_CLEAR ||
 	     message->obstacle_class == VEHICLE_OBSTACLE_SCAN_FOUND)) {
 		if (message->header.timestamp_ms - safety->scan_start_ms > INT32_MAX)
-			return fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+			return fail(safety, CAR_SAFETY_FAULT_OBSTACLE,
+				    "obstacle: scan result from before the scan");
 		safety->scanning = false;
 		safety->have_ahead = false;
 		safety->ahead_clear = false;
@@ -164,7 +197,7 @@ bool car_safety_obstacle(car_safety_t *safety, const obstacle_event_message_t *m
 		safety->armed = false;
 		return true;
 	}
-	return fail(safety, CAR_SAFETY_FAULT_OBSTACLE);
+	return fail(safety, CAR_SAFETY_FAULT_OBSTACLE, "obstacle: unexpected message class");
 }
 
 bool car_safety_begin_scan(car_safety_t *safety, uint32_t now_ms)
@@ -185,7 +218,8 @@ bool car_safety_begin_scan(car_safety_t *safety, uint32_t now_ms)
 void car_safety_latch_fault(car_safety_t *safety)
 {
 	if (safety == NULL || !safety->initialized) return;
-	(void)fail(safety, CAR_SAFETY_FAULT_EXTERNAL);
+	(void)fail(safety, CAR_SAFETY_FAULT_EXTERNAL,
+		   "latched by the controller (subsystem fault, bad message or deadline)");
 }
 
 bool car_safety_follow(car_safety_t *safety, uint32_t now_ms,
@@ -197,7 +231,8 @@ bool car_safety_follow(car_safety_t *safety, uint32_t now_ms,
 	if (safety == NULL || !safety->initialized) return false;
 	if (!clock_valid(safety, now_ms)) return false;
 	(void)check_deadlines(safety, now_ms);
-	if (emergency_stopped) (void)fail(safety, CAR_SAFETY_FAULT_EMERGENCY);
+	if (emergency_stopped)
+		(void)fail(safety, CAR_SAFETY_FAULT_EMERGENCY, "emergency-stop input");
 	/* Hazards stop a following robot at once. The line must be seen to
 	 * (re)arm, but losing it while following is the steering's job. */
 	blocked = safety->scanning || !safety->line.have_message ||

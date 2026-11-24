@@ -55,6 +55,9 @@
 
 #include <sys/sysdef.h>
 #include <tk/syslib.h>
+#if defined(TM_WIFI_CYW43) && TM_WIFI_CYW43
+#include "cyw43_utk.h"
+#endif
 
 #ifndef APP_VEHICLE
 #define APP_VEHICLE 0		/* only the Pico makefile defines this */
@@ -194,6 +197,19 @@ static void vehicle_dashboard_run(go_button_t *button)
 #endif
 }
 
+/* The controller stopped the robot by itself with GO still on: turn the
+ * toggle off, so the next single press (or dashboard Start) starts it. Runs
+ * in the controller task, like vehicle_read_inputs. */
+static void vehicle_go_reset(void *context)
+{
+	go_button_t *button = context;
+
+	if (!button->go && !button->restart) return;
+	button->go = false;
+	button->restart = false;
+	tm_printf((UB*)"stopped: press GO once to start again\n");
+}
+
 static bool vehicle_read_inputs(void *context, vehicle_controller_inputs_t *inputs)
 {
 	go_button_t *button = context;
@@ -236,6 +252,41 @@ static void vehicle_barcode(void *context, const char *payload, uint8_t length)
 		tm_printf((UB*)"barcode decoded: %c\n", payload[i]);
 		(void)dashboard_report_barcode(payload[i]);	/* no-op without MQTT */
 	}
+}
+
+/*
+ * The radio task starts at boot on core 0 at priority 4 (above every vehicle
+ * task) and downloads the CYW43 firmware in cyw43_init(), which keeps core 0
+ * busy for a long stretch. Starting the vehicle meanwhile starves the core-0
+ * startup, odometry and obstacle tasks, the sensor streams miss the
+ * controller's deadlines and it faults at once. So wait for that phase
+ * (init_complete) first; joining the network and MQTT come later in the
+ * radio's light 2 ms poll loop. A radio that never finishes does not block
+ * the vehicle for longer than VEHICLE_RADIO_WAIT_MS.
+ */
+#define VEHICLE_RADIO_WAIT_MS	15000U
+
+static void vehicle_wait_for_radio(void)
+{
+#if defined(TM_WIFI_CYW43) && TM_WIFI_CYW43
+	T_CYW43_UTK_STATUS st;
+	UW waited = 0U;
+
+	for (;;) {
+		cyw43_utk_get_status(&st);
+		if (st.init_complete) break;
+		if (waited >= VEHICLE_RADIO_WAIT_MS) {
+			tm_printf((UB*)"Wi-Fi radio still starting after %u ms; starting the vehicle anyway\n",
+				  (unsigned)VEHICLE_RADIO_WAIT_MS);
+			return;
+		}
+		tk_dly_tsk(50);
+		waited += 50U;
+	}
+	tm_printf((UB*)"Wi-Fi radio started (%s) after %u ms; starting the vehicle\n",
+		  st.ready ? "ok" : "FAILED", (unsigned)waited);
+	tk_dly_tsk(200);	/* let the post-init burst settle */
+#endif
 }
 
 /* Line task: a barcode's start '*' has been read (letter not yet decoded). */
@@ -291,7 +342,9 @@ static void vehicle_start(void)
 	};
 	/* Sensor deadlines; producers below publish well inside them. */
 	static const vehicle_controller_task_config_t controller_config = {
-		{200U, 200U, 500U, 5000U, 500U, 300U},
+		/* line, IMU, ahead max age; scan timeout; min line confidence;
+		 * obstacle stop mm; 3 s for each stream's first message. */
+		{200U, 200U, 500U, 5000U, 500U, 300U, 3000U},
 		50U,	/* period_ms, <= half the motion status period */
 		500U,	/* motion_status_max_age_ms */
 		vehicle_read_inputs, &s_go_button,
@@ -299,7 +352,9 @@ static void vehicle_start(void)
 		vehicle_barcode, NULL,
 		/* Obstacle at <= 300 mm while following: scan it, drive round it
 		 * and rejoin the line (vehicle_bypass, OBS-H03 manoeuvre). */
-		true
+		true,
+		/* Stopped by itself: GO toggles off, one press restarts. */
+		vehicle_go_reset
 	};
 	static const line_barcode_task_config_t line_config = {
 		20U,	/* period_ms */
@@ -334,6 +389,7 @@ static void vehicle_start(void)
 	static obs_pico_port_config_t obstacle_hardware;
 	ER er;
 
+	vehicle_wait_for_radio();
 	motion_config.control.feedback.left = wheel_calibration;
 	motion_config.control.feedback.right = wheel_calibration;
 
@@ -407,13 +463,13 @@ LOCAL void vehicle_startup_task(INT stacd, void *exinf)
 }
 #endif /* APP_VEHICLE */
 
-#if (APP_TEST || APP_VEHICLE || APP_SENSOR_TEST) && \
+#if (APP_TEST || APP_SENSOR_TEST) && \
 	defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
 /* usb_console.c: 0 not started, 1 started, 2 enumerated, 3 host asserted DTR */
 IMPORT UW tm_usb_state(void);
 
 /*
- * Hold the test run or vehicle startup until a serial monitor opens the
+ * Hold the test run or sensor test until a serial monitor opens the
  * port, so no boot message is printed before anyone can read it.  DTR
  * (state 3) is how a terminal announces itself, but some terminal programs
  * never assert it, so once the USB link is enumerated (state 2) a timeout
@@ -695,9 +751,8 @@ EXPORT INT usermain(void)
 	}
 	tm_printf((UB*)"encoder bring-up task started\n\n");
 #elif APP_VEHICLE
-#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
-	wait_for_serial_monitor();
-#endif
+	/* No wait for a serial monitor: the vehicle runs on battery without
+	 * one. Boot messages printed before a terminal opens are lost. */
 	/* Pinned to core 0: the GPIO IRQ registrations reject other cores. */
 	if (app_start_task((FP)vehicle_startup_task, 11, TP_PRC1,
 			   "vehicle_startup") < E_OK) {

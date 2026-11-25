@@ -121,6 +121,56 @@ static BOOL safety_straddle_test(void)
 	return ok;
 }
 
+/* NO_ULTRASONIC fallback (obstacle_optional): an ultrasonic that never gives
+ * a first reading turns obstacle detection off instead of faulting; once a
+ * reading has arrived, it cannot be turned off and faults latch as usual. */
+static BOOL safety_optional_obstacle_test(void)
+{
+	car_safety_config_t config = safety_config;
+	car_safety_t safety = {0};
+	line_observation_message_t line;
+	imu_estimate_message_t imu;
+	obstacle_event_message_t obstacle;
+	BOOL ok;
+
+	/* Not optional: no first ahead reading by its deadline is a fault. */
+	ok = car_safety_init(&safety, &config, 100U);
+	line = safety_line(1U, 150U, 1U);
+	imu = safety_imu(1U, 150U);
+	ok = car_safety_line(&safety, &line, 150U) && car_safety_imu(&safety, &imu, 150U) && ok;
+	line = safety_line(2U, 201U, 1U);
+	ok = !car_safety_line(&safety, &line, 201U) &&
+	     (safety.faults & CAR_SAFETY_FAULT_OBSTACLE) != 0U && !safety.obstacle_disabled &&
+	     !car_safety_disable_obstacle(&safety) && ok;
+
+	/* Optional: the same deadline turns detection off, no fault; the robot
+	 * arms with ahead clear and ignores obstacle messages from then on. */
+	config.obstacle_optional = true;
+	ok = car_safety_init(&safety, &config, 100U) && ok;
+	line = safety_line(1U, 150U, 1U);
+	imu = safety_imu(1U, 150U);
+	ok = car_safety_line(&safety, &line, 150U) && car_safety_imu(&safety, &imu, 150U) && ok;
+	line = safety_line(2U, 201U, 1U);
+	imu = safety_imu(2U, 201U);
+	ok = car_safety_line(&safety, &line, 201U) && car_safety_imu(&safety, &imu, 201U) &&
+	     safety.faults == 0U && safety.obstacle_disabled && safety.have_ahead &&
+	     safety.ahead_clear && car_safety_follow(&safety, 201U, true, true, false) && ok;
+	obstacle = safety_obstacle(1U, 202U, VEHICLE_OBSTACLE_AHEAD_READING, 50U);
+	ok = car_safety_obstacle(&safety, &obstacle, 202U) &&
+	     car_safety_follow(&safety, 202U, true, false, false) &&
+	     !car_safety_begin_scan(&safety, 202U) && ok;
+
+	/* Optional, obstacle task fault before the first reading: off at once. */
+	ok = car_safety_init(&safety, &config, 100U) &&
+	     car_safety_disable_obstacle(&safety) && safety.obstacle_disabled &&
+	     safety.faults == 0U && ok;
+
+	/* Optional, but a reading already arrived: cannot be turned off. */
+	ok = car_safety_init(&safety, &config, 100U) && safety_inputs(&safety, 1U, 150U) &&
+	     !car_safety_disable_obstacle(&safety) && !safety.obstacle_disabled && ok;
+	return ok;
+}
+
 static BOOL safety_scan_test(void)
 {
 	car_safety_t safety = {0};
@@ -353,6 +403,7 @@ BOOL car_gate_test(void)
 	BOOL state_fault_ok;
 	BOOL state_scan_ok;
 	BOOL straddle_ok;
+	BOOL optional_ok;
 	TEST_INIT();
 
 	motion_ok = car_gate_motion(true, false, 0U) &&
@@ -381,6 +432,7 @@ BOOL car_gate_test(void)
 	state_fault_ok = controller_state_fault_test();
 	state_scan_ok = controller_state_scan_test();
 	straddle_ok = safety_straddle_test();
+	optional_ok = safety_optional_obstacle_test();
 
 	TEST_CHECK("VC-U01", motion_ok, "stop, emergency and fault veto motion");
 	TEST_CHECK("VC-U02", follow_ok, "obstacle vetoes line following");
@@ -393,8 +445,10 @@ BOOL car_gate_test(void)
 	TEST_CHECK("VC-U11", state_fault_ok, "state faults, emergency latch and clock wrap");
 	TEST_CHECK("VC-U12", state_scan_ok, "scan state and ahead reacquisition");
 	TEST_CHECK("VC-U35", straddle_ok, "straddle line sensors: arming needs the floor (not lifted), not the tape under a sensor");
+	TEST_CHECK("VC-U37", optional_ok, "NO_ULTRASONIC: no first ultrasonic reading turns obstacle detection off instead of faulting; after a reading it faults as usual");
 	TEST_SUMMARY("controller gate");
 	return motion_ok && follow_ok && rearm_ok && safety_ok && scan_ok && fault_ok &&
-	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok && straddle_ok;
+	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok && straddle_ok &&
+	       optional_ok;
 }
 #endif

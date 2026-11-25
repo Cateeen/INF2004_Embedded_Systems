@@ -47,16 +47,20 @@ static bool check_deadlines(car_safety_t *safety, uint32_t now)
 		(void)fail(safety, CAR_SAFETY_FAULT_IMU,
 			   safety->imu.have_message ? "imu: estimates stopped (deadline)" :
 			   "imu: no first estimate in time");
-	if (safety->scanning) {
+	if (safety->obstacle_disabled) {
+		/* No ultrasonic: no obstacle deadlines. */
+	} else if (safety->scanning) {
 		if (now - safety->scan_start_ms > safety->config.scan_timeout_ms)
 			(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE, "obstacle: scan timed out");
 	} else if (now - (safety->have_ahead ? safety->obstacle.timestamp_ms :
 			  safety->ahead_wait_ms) >
 		   first_deadline(safety, safety->obstacle.have_message,
 				  safety->config.ahead_max_age_ms)) {
-		(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE,
-			   safety->obstacle.have_message ? "obstacle: ahead readings stopped (deadline)" :
-			   "obstacle: no first ahead reading in time");
+		if (!car_safety_disable_obstacle(safety))
+			(void)fail(safety, CAR_SAFETY_FAULT_OBSTACLE,
+				   safety->obstacle.have_message ?
+				   "obstacle: ahead readings stopped (deadline)" :
+				   "obstacle: no first ahead reading in time");
 	}
 	return safety->faults == 0U;
 }
@@ -165,6 +169,7 @@ bool car_safety_obstacle(car_safety_t *safety, const obstacle_event_message_t *m
 
 	if (safety == NULL || !safety->initialized) return false;
 	if (!clock_valid(safety, now_ms) || !check_deadlines(safety, now_ms)) return false;
+	if (safety->obstacle_disabled) return true;     /* switched off: ignored */
 	if (message == NULL || message->emergency > 1U ||
 	    (message->distance_mm != OBS_DIST_NONE &&
 	     (message->distance_mm < OBS_MIN_RANGE_MM || message->distance_mm > OBS_MAX_RANGE_MM)))
@@ -207,13 +212,26 @@ bool car_safety_begin_scan(car_safety_t *safety, uint32_t now_ms)
 	if (safety == NULL || !safety->initialized) return false;
 	if (!clock_valid(safety, now_ms) || !check_deadlines(safety, now_ms)) return false;
 	safety->armed = false;
-	if (safety->faults != 0U || safety->scanning || !safety->have_ahead ||
+	if (safety->faults != 0U || safety->obstacle_disabled ||
+	    safety->scanning || !safety->have_ahead ||
 	    now_ms - safety->obstacle.timestamp_ms > safety->config.ahead_max_age_ms)
 		return false;
 	safety->scanning = true;
 	safety->scan_start_ms = now_ms;
 	safety->have_ahead = false;
 	safety->ahead_clear = false;
+	return true;
+}
+
+bool car_safety_disable_obstacle(car_safety_t *safety)
+{
+	if (safety == NULL || !safety->initialized || !safety->config.obstacle_optional ||
+	    safety->obstacle.have_message)
+		return false;
+	safety->obstacle_disabled = true;
+	safety->scanning = false;
+	safety->have_ahead = true;      /* ahead counts as clear from now on */
+	safety->ahead_clear = true;
 	return true;
 }
 

@@ -65,6 +65,7 @@ typedef struct {
 	uint32_t bypass_done_ms;
 	bool have_bypass_done;
 	bool previous_go;               /* inputs->go last cycle */
+	bool obstacle_off_reported;     /* NO_ULTRASONIC fallback warning printed */
 } vehicle_controller_context_t;
 
 enum {
@@ -392,7 +393,8 @@ static void report_telemetry(const vehicle_controller_context_t *context,
 		data.line_state = safety->line_clear ? WIFI_TELEMETRY_LINE_FOUND
 						     : WIFI_TELEMETRY_LINE_LOST;
 	}
-	if (!safety->have_ahead) {
+	if (!safety->have_ahead || safety->obstacle_disabled) {
+		/* No ultrasonic (NO_ULTRASONIC fallback): never claim "clear". */
 		data.obstacle_state = WIFI_TELEMETRY_OBSTACLE_UNKNOWN;
 	} else {
 		data.obstacle_state = safety->ahead_clear ? WIFI_TELEMETRY_OBSTACLE_CLEAR
@@ -464,6 +466,15 @@ static bool receive_faults(vehicle_controller_context_t *context)
 			tm_printf((UB*)"vehicle controller invalid fault message: %d\n",
 				  (int)received);
 		} else {
+			/* NO_ULTRASONIC build: an obstacle task that failed before
+			 * its first reading switches obstacle detection off. */
+			if (message.code >= VEHICLE_FAULT_CODE_OBSTACLE_SENSOR &&
+			    message.code <= VEHICLE_FAULT_CODE_OBSTACLE_SCAN_TIMEOUT &&
+			    car_safety_disable_obstacle(&context->controller.safety)) {
+				tm_printf((UB*)"vehicle controller: ultrasonic failed before its first "
+					  "reading (code %u)\n", (unsigned)message.code);
+				continue;
+			}
 			tm_printf((UB*)"vehicle controller subsystem fault: source=%u code=%u\n",
 				  (unsigned)message.source, (unsigned)message.code);
 		}
@@ -866,6 +877,11 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 		messages_valid = false;
 	}
 	if (!messages_valid) car_safety_latch_fault(&context->controller.safety);
+	if (context->controller.safety.obstacle_disabled && !context->obstacle_off_reported) {
+		context->obstacle_off_reported = true;
+		tm_printf((UB*)"WARNING: no ultrasonic sensor -- obstacle detection and bypass "
+			  "are OFF (NO_ULTRASONIC build); the robot will NOT stop for obstacles\n");
+	}
 
 	state = controller_state_step(&context->controller, now,
 				      inputs->go, inputs->emergency_stopped);
@@ -971,7 +987,8 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 		 * covers the climb, top and descent; falling holds 300 ms of level
 		 * ground after it): over the crest the tape is often out of sight
 		 * and straight on is right. */
-		straddle_set_hump(&context->steering, on_hump(context->imu_fsm_state));
+		straddle_set_hump(&context->steering, VEHICLE_LINE_HUMP_NO_SEARCH &&
+				  on_hump(context->imu_fsm_state));
 		junction = junction_step(context, now);
 		if (junction > 0) return true;
 		if (junction < 0) {
@@ -1508,8 +1525,8 @@ static BOOL spin_cycles(junction_test_t *t, uint8_t detected, int16_t lateral, u
  * settle, spin (+ left) until the new line is reached (a U-turn: the
  * second), stop, settle, then follow again. Spinning, the branch straight
  * ahead leaves through the trailing sensor first (ignored); a line counts at
- * the leading sensor -- left spins once it has passed into the gap, right
- * spins as soon as the sensor sees it. start_on_lead: a tape is already
+ * the leading sensor -- as soon as the sensor sees it, or (gap seek,
+ * VEHICLE_JUNCTION_SEEK_GAP_*) once it has passed into the gap. start_on_lead: a tape is already
  * under the leading sensor when the spin starts (the branch being left):
  * it passes without counting.
  */
@@ -1577,11 +1594,17 @@ static BOOL junction_turn_test(uint8_t turn, bool start_on_lead)
 			ok = spin_cycles(&t, SEEN_RIGHT, 3U, spin) && ok;
 			ok = spin_cycles(&t, SEEN_GAP, 5U, spin) && ok;
 		}
+#if VEHICLE_JUNCTION_SEEK_GAP_LEFT
 		/* The new line at the leading (centre) sensor: not yet ... */
 		ok = spin_cycles(&t, SEEN_CENTRE, 3U, spin) && ok;
 		/* ... it stops once the line has passed into the gap. */
 		ok = junction_cycle(&t, SEEN_GAP, 0U) && t.command.mode == VEHICLE_MOTION_STOP &&
 		     s_test_done_count == 0U && ok;
+#else
+		/* The new line at the leading (centre) sensor: stop at once. */
+		ok = junction_cycle(&t, SEEN_CENTRE, 0U) && t.command.mode == VEHICLE_MOTION_STOP &&
+		     s_test_done_count == 0U && ok;
+#endif
 	}
 	stopped_at = t.now;
 	while (t.now + 10U - stopped_at < VEHICLE_JUNCTION_SETTLE_MS && ok)
@@ -1647,6 +1670,23 @@ static BOOL controller_hump_test(void)
 	uint32_t from;
 	BOOL ok;
 
+#if !VEHICLE_LINE_HUMP_NO_SEARCH
+	/* Hump search inhibit off (as the bench test): a hump changes nothing,
+	 * the robot still searches after VEHICLE_LINE_BLIND_MS. */
+	s_config.junction_turn = NULL;
+	ok = junction_arm(&t);
+	t.terrain = (uint8_t)IMU_STATE_HUMP_RISING;
+	from = t.now;
+	while (t.now - from <= VEHICLE_LINE_BLIND_MS + 20U && ok &&
+	       !is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_PIVOT_SPEED_CM_S,
+			  VEHICLE_LINE_PIVOT_TURN_CM_S))
+		ok = junction_cycle(&t, SEEN_GAP, 0U);
+	ok = is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_PIVOT_SPEED_CM_S,
+		       VEHICLE_LINE_PIVOT_TURN_CM_S) &&
+	     t.now - from >= VEHICLE_LINE_BLIND_MS - 20U && ok;
+	s_config = test_config;
+	return drain_controller_test_buffers() && ok;
+#endif
 	s_config.junction_turn = NULL;
 	ok = junction_arm(&t);                  /* tape last seen: centre (left) */
 	t.terrain = (uint8_t)IMU_STATE_HUMP_RISING;
@@ -1828,7 +1868,9 @@ BOOL vehicle_controller_task_test(void)
 	TEST_CHECK("VC-U16", status_ok, "nonzero commanded output status blocks arming and requests emergency stop");
 	TEST_CHECK("VC-U17", stale_status_ok, "stale motion status faults despite fresh sensor observations");
 	TEST_CHECK("VC-U22", drive_ok, "line following sends steering VELOCITY, accepts commanded motion, stops and faults on unexpected motion");
-	TEST_CHECK("VC-U24", hump_ok, "no blind search while the IMU reports a hump; level again, it searches towards the last-seen side");
+	TEST_CHECK("VC-U24", hump_ok, VEHICLE_LINE_HUMP_NO_SEARCH ?
+		   "no blind search while the IMU reports a hump; level again, it searches towards the last-seen side" :
+		   "hump search inhibit off: on a hump it still searches towards the last-seen side after the blind time");
 	TEST_CHECK("VC-U26", junction_ok, "junction: approach, stop, spin until the new line reaches the leading sensor (left: into the gap; U-turn: second line), stop, resume; straight, timeout, no callback");
 	TEST_CHECK("VC-U27", barcode_ok, "decoded barcodes are passed to the barcode hook in order and always drained");
 	TEST_CHECK("VC-U28", lent_ok, "lent motors accepted only during a bypass; pick-up while following stops once per lift");

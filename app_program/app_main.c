@@ -61,6 +61,9 @@
 #include "cyw43_utk.h"
 #endif
 
+#ifndef APP_NO_ULTRASONIC
+#define APP_NO_ULTRASONIC 0	/* make NO_ULTRASONIC=1 */
+#endif
 #ifndef APP_VEHICLE
 #define APP_VEHICLE 0		/* only the Pico makefile defines this */
 #endif
@@ -369,7 +372,10 @@ static void vehicle_start(void)
 		 * obstacle stop mm; 3 s for each stream's first message;
 		 * straddle line sensors (arming needs the floor, not the tape
 		 * under a sensor: centred reads both white). */
-		{200U, 200U, 500U, 5000U, 500U, 200U, 3000U, true},
+		{200U, 200U, 500U, 5000U, 500U, 200U, 3000U, true,
+		 /* NO_ULTRASONIC=1: an ultrasonic that never answers turns
+		  * obstacle detection off instead of faulting. */
+		 APP_NO_ULTRASONIC != 0},
 		50U,	/* period_ms, <= half the motion status period */
 		500U,	/* motion_status_max_age_ms */
 		vehicle_read_inputs, &s_go_button,

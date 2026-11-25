@@ -127,6 +127,22 @@ endif
 VEHICLE_SUFFIX := _vehicle
 endif
 
+# NO_ULTRASONIC=1 (with VEHICLE=1): if the HC-SR04 never gives a first reading
+# (e.g. it is powered from USB VBUS and the robot runs on battery), the
+# vehicle switches obstacle detection and bypass OFF instead of faulting, and
+# follows the line without stopping for obstacles. A sensor that answers is
+# used as normal. Default 0: no ultrasonic is a fault, as before.
+NO_ULTRASONIC ?= 0
+ifneq ($(filter $(NO_ULTRASONIC),0 1),$(NO_ULTRASONIC))
+$(error Unknown NO_ULTRASONIC '$(NO_ULTRASONIC)'; use 0 or 1)
+endif
+ifeq ($(NO_ULTRASONIC),1)
+ifneq ($(VEHICLE),1)
+$(error NO_ULTRASONIC=1 requires VEHICLE=1)
+endif
+VEHICLE_SUFFIX := _vehicle_noultra
+endif
+
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
 SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves pid_tune spin_width diag_width line_follow junction wifi servo encoder line_barcode line barcode
@@ -476,6 +492,7 @@ endif
 CFLAGS  += -DAPP_TEST=$(TEST)
 CFLAGS  += -DAPP_ODOMETRY_TEST=$(ODOMETRY_TEST)
 CFLAGS  += -DAPP_VEHICLE=$(VEHICLE)
+CFLAGS  += -DAPP_NO_ULTRASONIC=$(NO_ULTRASONIC)
 CFLAGS  += -DAPP_SENSOR_TEST=$(SENSOR_TEST_VALUE)
 ifeq ($(SENSOR_TEST),barcode)
 CFLAGS  += -DBARCODE_TEST_MODULE_COUNTS=$(BARCODE_TEST_MODULE_COUNTS)
@@ -603,7 +620,7 @@ endif
 # before any recipe executes.
 ################################################################################
 
-PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
+PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-noultra$(NO_ULTRASONIC)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
 ifeq ($(SENSOR_TEST),barcode)
 PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BARCODE_TEST_WHITE_ADC)-$(BARCODE_TEST_BLACK_ADC)-debounce$(BARCODE_TEST_DEBOUNCE_COUNTS)-expect$(BARCODE_TEST_EXPECT)-drive$(BARCODE_TEST_DRIVE)-$(BARCODE_TEST_DRIVE_MM)
 endif

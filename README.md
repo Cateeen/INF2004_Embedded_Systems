@@ -922,6 +922,7 @@ make TEST=1 ODOMETRY_TEST=1 -j8  # live encoder bring-up, no motors
 make SMP=0 SENSOR_TEST=encoder -j8 # encoder-only diagnostic, skips startup tests
 make SENSOR_TEST=line_barcode -j8  # live line/barcode diagnostic, no motors
 make VEHICLE=1 -j8                # start the vehicle tasks at boot (needs verified hardware, see app_main.c)
+make VEHICLE=1 NO_ULTRASONIC=1 -j8  # vehicle that runs on without obstacle detection if the HC-SR04 never answers
 make CRASH_REPORT=1 -j8           # also see crash reports, on GP0/GP1 (uses those pins)
 ```
 
@@ -946,6 +947,7 @@ the next plain `make` goes back to the defaults.
 | `ODOMETRY_TEST` | **`0`**, `1` | `1` starts live encoder bring-up on GP16–19; requires `TEST=1` | `_odometry` / *(nothing)* | `APP_ODOMETRY_TEST` (1 or 0) |
 | `SENSOR_TEST` | **`none`**, `ir`, `imu`, `imu_tilt`, `imu_hump`, `ultrasonic`, `obstacle_width`, `spin_heading`, `motor_moves`, `pid_tune`, `spin_width`, `diag_width`, `servo`, `encoder`, `line_barcode`, `line`, `barcode` | Starts one hardware diagnostic without startup tests; `line`, `barcode`, `imu_hump`, and `obstacle_width` are motor-free modes | `_sensor_<name>` / *(nothing)* | `APP_SENSOR_TEST` |
 | `VEHICLE` | **`0`**, `1` | `1` starts every vehicle task at boot: GPIO dispatcher, odometry, line/barcode ADC, IMU, obstacle, hardware motion and the arming controller. Startup refuses to run until the hardware verification flags in `app_program/app_main.c` are set after measuring on the robot. Requires `TEST=0`. | `_vehicle` / *(nothing)* | `APP_VEHICLE` (1 or 0) |
+| `NO_ULTRASONIC` | **`0`**, `1` | With `VEHICLE=1`: if the HC-SR04 never gives a first reading (e.g. powered from USB VBUS while running on battery), obstacle detection and bypass are switched OFF instead of faulting, with a serial warning and obstacle UNKNOWN on the dashboard; the robot will not stop for obstacles. A sensor that answers is used as normal, and once it has given a reading its faults latch as usual. | `_vehicle_noultra` / `_vehicle` | `APP_NO_ULTRASONIC` (1 or 0) |
 | `CRASH_REPORT` | **`0`**, `1` | `1` also copies the console to UART0 on **GP0 (TX) / GP1 (RX)**, 115200 baud, so you can see the last messages and the kernel's crash report (see below). **Uses GP0/GP1.** `CONSOLE=uart` always does this. | `_crash` / *(nothing)* | `TM_CONSOLE_UART` (1 or 0) |
 
 Encoder bring-up prints signed counts and individual wheel distances every

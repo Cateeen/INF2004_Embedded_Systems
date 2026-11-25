@@ -37,6 +37,13 @@ typedef struct {
 	 * with min_line_confidence, as before. Appended: false in older
 	 * initializers. */
 	bool straddle_line;
+	/* true (build NO_ULTRASONIC=1): an ultrasonic sensor that never gives a
+	 * first reading -- no ahead reading by its first deadline, or an
+	 * obstacle-task fault before one (car_safety_disable_obstacle) --
+	 * switches obstacle detection OFF instead of faulting: ahead counts as
+	 * clear and nothing stops for obstacles. Once a reading has arrived,
+	 * obstacle faults latch as usual. Appended: false in older initializers. */
+	bool obstacle_optional;
 } car_safety_config_t;
 
 typedef struct {
@@ -65,6 +72,9 @@ typedef struct {
 	bool have_ahead;
 	bool scanning;
 	bool armed;
+	/* Obstacle detection switched off (config.obstacle_optional); until
+	 * restart. Ahead is then clear and obstacle messages are ignored. */
+	bool obstacle_disabled;
 } car_safety_t;
 
 /* Single controller owner only. Configuration and thresholds must be verified
@@ -85,6 +95,12 @@ bool car_safety_begin_scan(car_safety_t *safety, uint32_t now_ms);
 
 /* Latch a received subsystem fault or an independently detected stop fault. */
 void car_safety_latch_fault(car_safety_t *safety);
+
+/* config.obstacle_optional only: switch obstacle detection off because the
+ * obstacle task failed before its first reading. Returns true if it is now
+ * off; false (nothing changed) when not optional or a reading already
+ * arrived -- the caller then latches the fault as usual. */
+bool car_safety_disable_obstacle(car_safety_t *safety);
 
 /* Call periodically even when no messages arrive. A fresh go edge is needed
  * after any stop or unsafe observation. This is only an advisory predicate:

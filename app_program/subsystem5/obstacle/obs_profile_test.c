@@ -255,7 +255,7 @@ BOOL obs_profile_test(void)
 	TEST_CHECK("OBS-U03", invalid_ok, "invalid scan rejected");
 	TEST_CHECK("OBS-U04", producer_ok, "typed ahead and scan events");
 	TEST_CHECK("OBS-U07", hcsr04_ok, "ultrasonic echo width to distance conversion");
-	TEST_CHECK("OBS-U08", extent_ok, "obstacle left/right extents sum to width");
+	TEST_CHECK("OBS-U17", extent_ok, "obstacle left/right extents sum to width");
 	TEST_CHECK("OBS-U09", side_ok, "object side from bench sweeps; smeared width flagged");
 	TEST_SUMMARY("obstacle profile");
 	return centre_ok && edges_ok && invalid_ok && producer_ok && hcsr04_ok &&

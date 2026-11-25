@@ -31,6 +31,8 @@ Each subsystem reports to the Mission Control dashboard (`dashboard/`) with one 
 
 Line state in telemetry (straddle sensors, the tape runs between them): while following it is FOUND, including pivots and searches, and LOST only once the car has given up; when not following, both sensors white is UNKNOWN (shown as "Between sensors?"), since the tape may be between them or absent; lifted is UNKNOWN.
 
+Obstacle state in telemetry: with a `NO_ULTRASONIC=1` build, if the HC-SR04 never gave a first reading and obstacle detection was switched off, the obstacle state is always UNKNOWN. The car does not stop for obstacles in that case.
+
 ## Junction turn (from the dashboard)
 
 The dashboard maps each decoded letter to a turn and sends that turn back to the car. Read it at the junction:

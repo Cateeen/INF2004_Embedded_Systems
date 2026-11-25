@@ -5,6 +5,17 @@
 #include "line_barcode_task.h"
 #include "line_observation.h"
 
+/* Default black thresholds (raw ADC, black reads above). White reads ~170-270
+ * and a sensor fully over the tape ~2300-3500. The two line sensors use 1200:
+ * at 1000 each one passed the threshold while only partly over the tape edge,
+ * so both read black ("CENTRE") with the tape between them (1137/1401,
+ * 1309/1077 parked on a straight); at 1500 the same position read neither,
+ * "LOST", and the robot lost the line. 1200 sits between: one sensor black
+ * there, and a partly covered sensor still counts. The barcode sensor keeps
+ * 1000, the value its decoding was tuned with. */
+#define LINE_ADC_LINE_BLACK_THRESHOLD    1200U
+#define LINE_ADC_BARCODE_BLACK_THRESHOLD 1000U
+
 typedef struct {
 	uint8_t channel;
 	uint16_t threshold;

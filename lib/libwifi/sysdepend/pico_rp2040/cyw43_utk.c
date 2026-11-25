@@ -291,9 +291,19 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
             prev_link_status = radio_status.link_status;
             if(radio_status.link_status == CYW43_LINK_UP) {
                 uint32_t ip = radio_status.ip_addr;
+                int pm_err;
+
                 tm_printf((UB*)"wifi: link up, ip=%d.%d.%d.%d\n",
                           (int)(ip & 0xff), (int)((ip >> 8) & 0xff),
                           (int)((ip >> 16) & 0xff), (int)((ip >> 24) & 0xff));
+                /* The driver default (CYW43_PERFORMANCE_PM) lets the radio
+                 * sleep up to 200 ms between beacons, which stalls MQTT in
+                 * bursts: telemetry waits past its 1 s age limit and is
+                 * dropped. The robot is always powered, so keep it awake. */
+                pm_err = cyw43_wifi_pm(&cyw43_state, CYW43_NONE_PM);
+                if(pm_err != 0) {
+                    tm_printf((UB*)"wifi: power-save off failed, err=%d\n", pm_err);
+                }
             } else {
                 tm_printf((UB*)"wifi: link status -> %s (%d)\n",
                           link_status_str(radio_status.link_status),

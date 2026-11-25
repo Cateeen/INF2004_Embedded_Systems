@@ -26,6 +26,8 @@
 #include "subsystem6/odometry/encoder_source.h"
 #include "subsystem6/gpio/gpio_dispatcher.h"
 #include "subsystem3/line_barcode/line_observation_test.h"
+#include "subsystem3/line_barcode/junction_detector.h"
+#include "subsystem3/line_barcode/straddle_junction.h"
 #include "subsystem3/line_barcode/barcode_scanner_test.h"
 #include "subsystem3/line_barcode/line_barcode_task.h"
 #include "subsystem3/line_barcode/line_adc_reader.h"
@@ -33,22 +35,35 @@
 #include "subsystem4/imu/imu_task.h"
 #include "subsystem4/imu/lsm303dlhc_i2c.h"
 #include "subsystem5/obstacle/obs_profile_test.h"
+#include "subsystem5/obstacle/spin_scan_test.h"
+#include "subsystem5/obstacle/diag_pass_test.h"
 #include "subsystem5/obstacle/obs_task.h"
 #include "subsystem5/obstacle/obs_pico_port.h"
 #include "subsystem2/motion/wheel_speed_test.h"
 #include "subsystem2/motion/motion_task.h"
 #include "subsystem2/controller/car_gate_test.h"
 #include "subsystem2/controller/line_steering_test.h"
+#include "subsystem2/controller/line_steering.h"
+#include "subsystem2/controller/straddle_steering.h"
 #include "subsystem2/controller/controller_monitor.h"
 #include "subsystem2/controller/vehicle_controller_task.h"
+#include "subsystem2/controller/vehicle_bypass.h"
 #include "subsystem1/wifi/wifi_service.h"
 #include "subsystem1/wifi/wifi_mqtt_bridge.h"
+#include "subsystem1/wifi/dashboard_link.h"
+#include "subsystem1/wifi/vehicle_telemetry.h"
 #include "subsystem6/gpio/gpio_irq_test.h"
 #include "hardware_sensor_test.h"
 
 #include <sys/sysdef.h>
 #include <tk/syslib.h>
+#if defined(TM_WIFI_CYW43) && TM_WIFI_CYW43
+#include "cyw43_utk.h"
+#endif
 
+#ifndef APP_NO_ULTRASONIC
+#define APP_NO_ULTRASONIC 0	/* make NO_ULTRASONIC=1 */
+#endif
 #ifndef APP_VEHICLE
 #define APP_VEHICLE 0		/* only the Pico makefile defines this */
 #endif
@@ -59,6 +74,7 @@ typedef struct {
 	bool candidate_pressed;
 	bool stable_pressed;
 	bool ready;
+	bool restart;		/* dashboard Start while GO was on: on next cycle */
 	unsigned stable_samples;
 } go_button_t;
 
@@ -130,10 +146,20 @@ static BOOL go_button_test(void)
 #define VEHICLE_ECHO_VERIFIED_3V3_SAFE	1	/* GP4 divider measured <= 3.3 V */
 #define VEHICLE_SERVO_LIMITS_VERIFIED	1	/* 1500/1700/1900 us; measured +/-20 deg */
 #define VEHICLE_GO_PIN			20U
+/* 1: the dashboard's Start / Stop buttons act on the GO toggle exactly like
+ * the GO button (Start = a press that turns GO on, Stop = GO off). Every
+ * safety check still has to pass before the robot moves. 0: local button only. */
+#define VEHICLE_DASHBOARD_RUN		1
 
 /* Odometry calibration, verified with ODO-H01 (encoder bring-up). */
 #define VEHICLE_COUNTS_PER_REV		2500U
 #define VEHICLE_WHEEL_CIRC_CM		20.4f
+/* Motion task speed limit for the faster wheel; the PID gains were verified
+ * up to this speed (MOT-H01). Line steering must stay inside it. */
+#define VEHICLE_MAX_SPEED_CM_S		20U
+_Static_assert(VEHICLE_LINE_SPEED_CM_S + VEHICLE_LINE_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S &&
+	       VEHICLE_LINE_PIVOT_SPEED_CM_S + VEHICLE_LINE_PIVOT_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S,
+	       "straddle line following speed + turn must fit the motion task speed limit");
 /* Wheels are mirror-mounted: the left encoder counts down when driving
  * forward (verified with BAR-H02), so it is negated. */
 #define VEHICLE_LEFT_SIGN		(-1)
@@ -141,13 +167,159 @@ static BOOL go_button_test(void)
 
 static go_button_t s_go_button;
 
+/* Dashboard Start / Stop on the GO toggle. Start while GO is already on
+ * (e.g. stopped after a lost line, which needs a fresh press) turns it off
+ * for one cycle and back on, so the controller sees a rising edge. Reads one
+ * atomic word: no network access, never blocks. */
+static void vehicle_dashboard_run(go_button_t *button)
+{
+#if VEHICLE_DASHBOARD_RUN
+	dashboard_run_command_t command;
+
+	if (button->restart) {
+		button->restart = false;
+		button->go = true;
+		return;
+	}
+	if (!dashboard_take_run_command(&command)) return;
+	if (command == DASHBOARD_RUN_STOP) {
+		button->go = false;
+		tm_printf((UB*)"dashboard: STOP\n");
+	} else if (command == DASHBOARD_RUN_START) {
+		if (button->go) {
+			button->go = false;
+			button->restart = true;
+		} else {
+			button->go = true;
+		}
+		tm_printf((UB*)"dashboard: START\n");
+	}
+#else
+	(void)button;
+#endif
+}
+
+/* The controller stopped the robot by itself with GO still on: turn the
+ * toggle off, so the next single press (or dashboard Start) starts it. Runs
+ * in the controller task, like vehicle_read_inputs. */
+static void vehicle_go_reset(void *context)
+{
+	go_button_t *button = context;
+
+	if (!button->go && !button->restart) return;
+	button->go = false;
+	button->restart = false;
+	tm_printf((UB*)"GO is off: press GO once to start\n");
+}
+
+/* GO pressed while faulted: reboot the whole system, as the Pico SDK's
+ * watchdog_reboot() does -- the watchdog resets everything except the
+ * oscillators, and scratch[4] = 0 so the boot ROM starts the flash image
+ * normally. A latched fault has already sent the motors an emergency stop.
+ * Note: the HC-SR04 stays powered, so a stuck ultrasonic sensor still
+ * needs a full power-off. */
+#define VEHICLE_PSM_WDSEL      (0x40010000U + 0x08U)
+#define VEHICLE_PSM_WDSEL_ALL  0x0001fffcU	/* all but ROSC and XOSC */
+#define VEHICLE_WATCHDOG_CTRL  (0x40058000U + 0x00U)
+#define VEHICLE_WATCHDOG_SCRATCH4 (0x40058000U + 0x1cU)
+#define VEHICLE_WATCHDOG_TRIGGER 0x80000000U
+
+static void vehicle_restart(void *context)
+{
+	(void)context;
+	tk_dly_tsk(100);	/* let the console send the last lines */
+	out_w(VEHICLE_WATCHDOG_SCRATCH4, 0U);
+	out_w(VEHICLE_PSM_WDSEL, VEHICLE_PSM_WDSEL_ALL);
+	out_w(VEHICLE_WATCHDOG_CTRL, VEHICLE_WATCHDOG_TRIGGER);
+	for (;;) {
+		/* The reset takes effect at once. */
+	}
+}
+
 static bool vehicle_read_inputs(void *context, vehicle_controller_inputs_t *inputs)
 {
 	go_button_t *button = context;
 
-	inputs->go = go_button_sample(button, gpio_get_val(VEHICLE_GO_PIN) == 0U);
+	(void)go_button_sample(button, gpio_get_val(VEHICLE_GO_PIN) == 0U);
+	vehicle_dashboard_run(button);
+	inputs->go = button->go && button->ready;
 	inputs->emergency_stopped = false;
 	return true;
+}
+
+/* Junction turns come from the dashboard (barcode letter -> turn); without
+ * one, or before any barcode, dashboard_next_junction() returns LEFT. */
+_Static_assert(VEHICLE_JUNCTION_STRAIGHT == DASHBOARD_TURN_STRAIGHT &&
+	       VEHICLE_JUNCTION_LEFT == DASHBOARD_TURN_LEFT &&
+	       VEHICLE_JUNCTION_RIGHT == DASHBOARD_TURN_RIGHT &&
+	       VEHICLE_JUNCTION_UTURN == DASHBOARD_TURN_UTURN,
+	       "controller junction turns must match dashboard_turn_t");
+
+static uint8_t vehicle_junction_turn(void *context)
+{
+	(void)context;
+	return (uint8_t)dashboard_next_junction();
+}
+
+static void vehicle_junction_done(void *context, uint8_t turn)
+{
+	(void)context;
+	(void)dashboard_report_action_done((dashboard_turn_t)turn);	/* no-op without MQTT */
+}
+
+/* Each decoded barcode letter goes to the dashboard, which maps it to the
+ * next junction turn and sends that back (dashboard_next_junction()). */
+static void vehicle_barcode(void *context, const char *payload, uint8_t length)
+{
+	uint8_t i;
+
+	(void)context;
+	for (i = 0U; i < length; i++) {
+		tm_printf((UB*)"barcode decoded: %c\n", payload[i]);
+		(void)dashboard_report_barcode(payload[i]);	/* no-op without MQTT */
+	}
+}
+
+/*
+ * The radio task starts at boot on core 0 at priority 4 (above every vehicle
+ * task) and downloads the CYW43 firmware in cyw43_init(), which keeps core 0
+ * busy for a long stretch. Starting the vehicle meanwhile starves the core-0
+ * startup, odometry and obstacle tasks, the sensor streams miss the
+ * controller's deadlines and it faults at once. So wait for that phase
+ * (init_complete) first; joining the network and MQTT come later in the
+ * radio's light 2 ms poll loop. A radio that never finishes does not block
+ * the vehicle for longer than VEHICLE_RADIO_WAIT_MS.
+ */
+#define VEHICLE_RADIO_WAIT_MS	15000U
+
+static void vehicle_wait_for_radio(void)
+{
+#if defined(TM_WIFI_CYW43) && TM_WIFI_CYW43
+	T_CYW43_UTK_STATUS st;
+	UW waited = 0U;
+
+	for (;;) {
+		cyw43_utk_get_status(&st);
+		if (st.init_complete) break;
+		if (waited >= VEHICLE_RADIO_WAIT_MS) {
+			tm_printf((UB*)"Wi-Fi radio still starting after %u ms; starting the vehicle anyway\n",
+				  (unsigned)VEHICLE_RADIO_WAIT_MS);
+			return;
+		}
+		tk_dly_tsk(50);
+		waited += 50U;
+	}
+	tm_printf((UB*)"Wi-Fi radio started (%s) after %u ms; starting the vehicle\n",
+		  st.ready ? "ok" : "FAILED", (unsigned)waited);
+	tk_dly_tsk(200);	/* let the post-init burst settle */
+#endif
+}
+
+/* Line task: a barcode's start '*' has been read (letter not yet decoded). */
+static void vehicle_barcode_started(void *context)
+{
+	(void)context;
+	(void)dashboard_report_barcode_detected();	/* no-op without MQTT */
 }
 
 static void vehicle_start(void)
@@ -177,28 +349,62 @@ static void vehicle_start(void)
 		{VEHICLE_COUNTS_PER_REV, VEHICLE_WHEEL_CIRC_CM},
 		VEHICLE_LEFT_SIGN, VEHICLE_RIGHT_SIGN
 	};
-	/* PID gains and base/max PWM are S5 placeholders: tune on blocks. */
+	/* Wheel speed PID {kp, ki, kd, target (set per command), base %, max %},
+	 * tuned with SENSOR_TEST=pid_tune on the mat at 15 and 20 cm/s: steady
+	 * error within 2.5 % per wheel forward and reverse, no oscillation
+	 * (MOT-H01). Base 22 % is the floor PWM at 15 cm/s; KI 4 makes up the
+	 * extra ~7 % needed at 20 cm/s within ~1 s.
+	 * Feed-forward {+1.4 %/(cm/s) around 15 cm/s}, from those two points:
+	 * each wheel starts at the PWM for its own target, so line-steering
+	 * turns land at once instead of waiting for KI (line_follow test:
+	 * 4/18 commanded reached only ~6/17 with the flat 22 % base). */
 	static motion_task_config_t motion_config = {
 		{{{0}, {0}, 150U, 250U},
-		 {2.0f, 0.0f, 0.0f, 10.0f, 20U, 60U}},
+		 {2.0f, 4.0f, 0.0f, 10.0f, 22U, 60U, 1.4f, 15.0f}},
 		10U,	/* period_ms */
 		100U,	/* command_max_age_ms */
 		500U,	/* max_duration_ms */
-		20U	/* max_linear_speed_cm_s */
+		VEHICLE_MAX_SPEED_CM_S	/* max_linear_speed_cm_s */
 	};
 	/* Sensor deadlines; producers below publish well inside them. */
 	static const vehicle_controller_task_config_t controller_config = {
-		{200U, 200U, 500U, 5000U, 500U, 300U},
+		/* line, IMU, ahead max age; scan timeout; min line confidence;
+		 * obstacle stop mm; 3 s for each stream's first message;
+		 * straddle line sensors (arming needs the floor, not the tape
+		 * under a sensor: centred reads both white). */
+		{200U, 200U, 500U, 5000U, 500U, 200U, 3000U, true,
+		 /* NO_ULTRASONIC=1: an ultrasonic that never answers turns
+		  * obstacle detection off instead of faulting. */
+		 APP_NO_ULTRASONIC != 0},
 		50U,	/* period_ms, <= half the motion status period */
 		500U,	/* motion_status_max_age_ms */
-		vehicle_read_inputs, &s_go_button
+		vehicle_read_inputs, &s_go_button,
+		vehicle_junction_turn, vehicle_junction_done, NULL,
+		vehicle_barcode, NULL,
+		/* Obstacle at <= 200 mm while following: scan it, drive round it
+		 * and rejoin the line (vehicle_bypass, OBS-H03 manoeuvre). */
+		true,
+		/* Stopped by itself: GO toggles off, one press restarts. */
+		vehicle_go_reset,
+		/* Faulted: GO (or dashboard Start) reboots the robot. */
+		vehicle_restart
 	};
 	static const line_barcode_task_config_t line_config = {
-		20U,	/* period_ms */
+		10U,	/* period_ms: as the line_follow and barcode bench tests */
 		200U,	/* odometry_max_age_ms */
-		/* Bench-calibrated for the tested printed code. */
+		/* 35 counts = smallest narrow module expected (bench-calibrated
+		 * code); bigger labels adapt, as the module is learned per frame. */
 		{35U, 25U, 0U, 0U, 0U},
-		NULL, NULL, NULL	/* reader installed by the ADC helper */
+		NULL, NULL, NULL,	/* reader installed by the ADC helper */
+		/* Junction detection on: mm of wheel travel per odometry count. */
+		VEHICLE_WHEEL_CIRC_CM * 10.0f / (float)VEHICLE_COUNTS_PER_REV,
+		vehicle_barcode_started, NULL,
+		/* Barcode colour as SENSOR_TEST=barcode: hysteresis black >= 1000,
+		 * white <= 600; a change counts after 4 counts (0.3 mm) of travel. */
+		1000U, 600U, 4U,
+		/* Line sensors as SENSOR_TEST=line_follow LF_STRADDLE=1: black >=
+		 * 1500, white <= 900 (tape ~2300-3900, floor ~170-300). */
+		1500U, 900U
 	};
 	static const imu_task_config_t imu_config = {
 		50U,	/* period_ms */
@@ -212,7 +418,11 @@ static void vehicle_start(void)
 		2500U,	/* scan_max_age_ms: 9 points x 3 polls x 50 ms ~ 1.3 s */
 		5000U,	/* scan_timeout_ms */
 		500U,	/* command_max_age_ms */
-		300U,	/* emergency_distance_mm */
+		/* An "emergency" reading this close (stops at once, no latch).
+		 * Under the 200 mm stop distance: the robot stops at ~200 mm and
+		 * the bypass works from there (it looks across at the obstacle's
+		 * side from ~20 cm). */
+		120U,	/* emergency_distance_mm */
 		NULL, NULL, NULL, NULL	/* callbacks installed by the port */
 	};
 	/* Static: start functions may keep pointers past this task's exit. */
@@ -220,6 +430,7 @@ static void vehicle_start(void)
 	static obs_pico_port_config_t obstacle_hardware;
 	ER er;
 
+	vehicle_wait_for_radio();
 	motion_config.control.feedback.left = wheel_calibration;
 	motion_config.control.feedback.right = wheel_calibration;
 
@@ -236,6 +447,13 @@ static void vehicle_start(void)
 	CHECK(encoder_source_register(), "encoder_source_register");
 	CHECK(obs_pico_port_register(), "obs_pico_port_register");
 	CHECK(gpio_dispatcher_start(), "gpio_dispatcher_start");
+	{
+		/* Obstacle bypass task (core 0: encoders), bench-tested defaults. */
+		static obstacle_bypass_config_t bypass_config;
+
+		bypass_config = obstacle_bypass_default_config();
+		CHECK(vehicle_bypass_start(&bypass_config), "vehicle_bypass_start");
+	}
 
 	/* Consumers before producers: motion drains commands and odometry,
 	   the controller drains every sensor stream. */
@@ -260,8 +478,12 @@ static void vehicle_start(void)
 	      "obs_pico_port_task_start");
 
 #if defined(TM_MQTT) && TM_MQTT
+	/* Before the MQTT service so early events are queued, not dropped. */
+	CHECK(dashboard_link_start(), "dashboard_link_start");
 	CHECK(wifi_service_start_mqtt(100U, 1000U, 1000U, 1000U),
 	      "wifi_service_start_mqtt");
+	/* The controller's per-cycle snapshot becomes robot/telemetry. */
+	CHECK(vehicle_telemetry_enable(), "vehicle_telemetry_enable");
 #endif
 
 	tm_printf((UB*)"vehicle tasks started; controller WAITING until GO\n\n");
@@ -282,27 +504,34 @@ LOCAL void vehicle_startup_task(INT stacd, void *exinf)
 }
 #endif /* APP_VEHICLE */
 
-#if (APP_TEST || APP_VEHICLE || APP_SENSOR_TEST) && \
+#if (APP_TEST || APP_SENSOR_TEST) && \
 	defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
 /* usb_console.c: 0 not started, 1 started, 2 enumerated, 3 host asserted DTR */
 IMPORT UW tm_usb_state(void);
 
 /*
- * Hold the test run or vehicle startup until a serial monitor opens the
+ * Hold the test run or sensor test until a serial monitor opens the
  * port, so no boot message is printed before anyone can read it.  DTR
  * (state 3) is how a terminal announces itself, but some terminal programs
  * never assert it, so once the USB link is enumerated (state 2) a timeout
- * lets the run proceed anyway.
+ * lets the run proceed anyway.  With no USB host at all (running on
+ * battery, or rebooted after the cable was pulled) the link never
+ * enumerates, so after a short wait the run starts without a monitor;
+ * output stays queued in the console ring until a host connects.
  */
 LOCAL void wait_for_serial_monitor(void)
 {
 	UW	enumerated_ms = 0;
+	UW	no_host_ms = 0;
 
 	tm_printf((UB*)"waiting for serial monitor...\n");
 	while (tm_usb_state() < 3U) {
 		if (tm_usb_state() == 2U) {
 			enumerated_ms += 100U;
 			if (enumerated_ms >= 60000U) break;	/* DTR-less terminal */
+		} else {
+			no_host_ms += 100U;
+			if (no_host_ms >= 5000U) break;		/* no USB host */
 		}
 		tk_dly_tsk(100);
 	}
@@ -374,7 +603,10 @@ EXPORT INT usermain(void)
 	}
 #endif
 #if APP_SENSOR_TEST
-#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
+	/* The Wi-Fi test (19) starts at once, like the vehicle build, so the
+	 * dashboard link comes up with or without a serial monitor; its output
+	 * stays queued in the USB console ring until a monitor opens. */
+#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC && APP_SENSOR_TEST != 19
 	wait_for_serial_monitor();
 #endif
 #if APP_SENSOR_TEST == 5
@@ -431,6 +663,18 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+	if (!junction_detector_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] JN FAIL  junction detector; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!straddle_junction_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] JN FAIL  straddle junction detector; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
 	if (!barcode_scanner_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] BAR FAIL  barcode decoder; tasks not started\n");
@@ -467,6 +711,18 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+	if (!spin_scan_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] OBS FAIL  spin scan width; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!diag_pass_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] OBS FAIL  diagonal pass width; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
 	if (!obs_task_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] OBS-TASK FAIL  task tests; tasks not started\n");
@@ -496,11 +752,17 @@ EXPORT INT usermain(void)
 			tm_printf((UB*)"[TEST] VC FAIL  line steering; tasks not started\n");
 			tk_dly_tsk(1000);
 		}
-		if (!go_button_test()) {
-			for (;;) {
-				tm_printf((UB*)"[TEST] GO FAIL  button tests; tasks not started\n");
-				tk_dly_tsk(1000);
-			}
+	}
+	if (!go_button_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] GO FAIL  button tests; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!straddle_steering_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] VC FAIL  straddle steering; tasks not started\n");
+			tk_dly_tsk(1000);
 		}
 	}
 	if (!controller_monitor_test()) {
@@ -527,6 +789,12 @@ EXPORT INT usermain(void)
 			tk_dly_tsk(1000);
 		}
 	}
+	if (!dashboard_link_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] DASHBOARD FAIL  dashboard link tests; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
 	if (!gpio_irq_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] GPIO FAIL  interrupt routing; tasks not started\n");
@@ -546,9 +814,8 @@ EXPORT INT usermain(void)
 	}
 	tm_printf((UB*)"encoder bring-up task started\n\n");
 #elif APP_VEHICLE
-#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
-	wait_for_serial_monitor();
-#endif
+	/* No wait for a serial monitor: the vehicle runs on battery without
+	 * one. Boot messages printed before a terminal opens are lost. */
 	/* Pinned to core 0: the GPIO IRQ registrations reject other cores. */
 	if (app_start_task((FP)vehicle_startup_task, 11, TP_PRC1,
 			   "vehicle_startup") < E_OK) {
@@ -568,6 +835,7 @@ EXPORT INT usermain(void)
 	tm_printf((UB*)"[TEST] ODO-PRODUCER PASS  producer tests (repeated)\n");
 	tm_printf((UB*)"[TEST] ODO-TASK PASS  task tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LINE PASS  line classification tests (repeated)\n");
+	tm_printf((UB*)"[TEST] JN PASS  junction detector tests (repeated)\n");
 	tm_printf((UB*)"[TEST] BAR PASS  barcode decoder tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LB-TASK PASS  task tests (repeated)\n");
 	tm_printf((UB*)"[TEST] LINE-ADC PASS  reader tests (repeated)\n");
@@ -588,6 +856,7 @@ EXPORT INT usermain(void)
 		tm_printf((UB*)"[TEST] ODO-PRODUCER PASS  producer tests (repeated)\n");
 		tm_printf((UB*)"[TEST] ODO-TASK PASS  task tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LINE PASS  line classification tests (repeated)\n");
+		tm_printf((UB*)"[TEST] JN PASS  junction detector tests (repeated)\n");
 		tm_printf((UB*)"[TEST] BAR PASS  barcode decoder tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LB-TASK PASS  task tests (repeated)\n");
 		tm_printf((UB*)"[TEST] LINE-ADC PASS  reader tests (repeated)\n");

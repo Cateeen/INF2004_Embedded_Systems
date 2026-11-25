@@ -5,6 +5,12 @@
 
 #define OBS_TASK_PRIORITY 10
 #define OBS_FAULT_RETRY_MS 1000U
+/* Deadline for the very first ahead reading after the task starts, when
+ * longer than ahead_max_age_ms. The servo's position is unknown at boot, so
+ * the port waits a full 180-degree sweep (~380 ms) before the first ping, and
+ * the radio is busy joining Wi-Fi on the same core: 500 ms was too tight and
+ * faulted at random. Inside the controller's 3 s first-message window. */
+#define OBS_FIRST_READING_MS 2500U
 
 typedef struct {
 	obs_producer_t producer;
@@ -17,6 +23,12 @@ typedef struct {
 	ER delivery_error;
 	bool have_ahead_in_mode;
 	bool have_command;
+	/* Set by the task at start: no ahead reading yet since boot, so the
+	 * first one gets OBS_FIRST_READING_MS, and sensor errors before it are
+	 * retried (a reset Pico finds the still-powered HC-SR04 mid-ping, echo
+	 * high). Cleared by the first reading. */
+	bool awaiting_first;
+	ER startup_error;       /* last sensor error while awaiting_first */
 } obs_task_state_t;
 
 static obs_task_config_t s_config;
@@ -79,11 +91,25 @@ static uint16_t check_timeout(const obs_task_state_t *state,
 {
 	uint32_t since = state->mode == OBS_TASK_AHEAD && state->have_ahead_in_mode ?
 			 state->last_ahead_ms : state->mode_start_ms;
+	uint32_t limit = config->ahead_max_age_ms;
+
 	if (state->mode == OBS_TASK_SCAN)
 		return now - since > config->scan_timeout_ms ?
 		       VEHICLE_FAULT_CODE_OBSTACLE_SCAN_TIMEOUT : 0U;
-	return now - since > config->ahead_max_age_ms ?
-	       VEHICLE_FAULT_CODE_OBSTACLE_SENSOR : 0U;
+	if (state->awaiting_first && limit < OBS_FIRST_READING_MS)
+		limit = OBS_FIRST_READING_MS;
+	if (now - since > limit) {
+		if (state->awaiting_first)
+			tm_printf((UB*)"obstacle: no first ultrasonic reading within %u ms, last "
+				  "sensor error %d (sensor unpowered, wiring, or echo stuck: "
+				  "switch the robot off and on)\n", (unsigned)limit,
+				  (int)state->startup_error);
+		else
+			tm_printf((UB*)"obstacle: no ultrasonic reading for %u ms (limit %u)\n",
+				  (unsigned)(now - since), (unsigned)limit);
+		return VEHICLE_FAULT_CODE_OBSTACLE_SENSOR;
+	}
+	return 0U;
 }
 
 static uint16_t process_poll(obs_task_state_t *state, const obs_task_config_t *config,
@@ -118,6 +144,7 @@ static uint16_t process_poll(obs_task_state_t *state, const obs_task_config_t *c
 	if (state->mode == OBS_TASK_AHEAD) {
 		state->last_ahead_ms = sample->timestamp_ms;
 		state->have_ahead_in_mode = true;
+		state->awaiting_first = false;
 	} else {
 		state->mode = OBS_TASK_AHEAD;
 		state->mode_start_ms = now;
@@ -186,6 +213,7 @@ static void obs_task(INT stacd, void *exinf)
 	timestamp_ms = now.lo;
 	s_state.mode_start_ms = timestamp_ms;
 	s_state.last_clock_ms = timestamp_ms;
+	s_state.awaiting_first = true;
 	for (;;) {
 		obs_task_sample_t sample = {0};
 		uint16_t fault;
@@ -200,7 +228,15 @@ static void obs_task(INT stacd, void *exinf)
 		fault = receive_commands(&s_state, &s_config, timestamp_ms);
 		if (fault != 0U) report_obstacle_fault(fault, timestamp_ms);
 		er = s_config.poll(s_config.context, s_state.mode, &sample);
-		if (er != E_OK) {
+		if (er != E_OK && s_state.awaiting_first) {
+			/* Before the first reading: retry until OBS_FIRST_READING_MS
+			 * (check_timeout). The robot cannot arm without that reading. */
+			if (s_state.startup_error == E_OK)
+				tm_printf((UB*)"obstacle: ultrasonic not ready yet (%d), retrying\n",
+					  (int)er);
+			s_state.startup_error = er;
+			sample.ready = false;
+		} else if (er != E_OK) {
 			tm_printf((UB*)"obstacle sensor poll failed: %d\n", (int)er);
 			report_obstacle_fault(VEHICLE_FAULT_CODE_OBSTACLE_SENSOR, timestamp_ms);
 		}

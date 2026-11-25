@@ -14,12 +14,17 @@ typedef struct {
 /* These callbacks run in the application task and must return
  * promptly. They must not call MQTT, lwIP, CYW43 or other network APIs: the
  * template's built-in cyw43_utk_task owns the network stack. poll reports link
- * state and any non-E_OK result stops the service. publish must copy any data
- * needed beyond the call;
+ * state; a non-E_OK result is logged and retried next period. publish must
+ * copy any data needed beyond the call;
  * E_OK means it accepted the whole message, E_TMOUT means nothing was accepted
- * and the service should retry. Other results are failures. stop requests that
- * the backend stop promptly. Context and callbacks must remain valid for the
- * task's entire lifetime. */
+ * and the service should retry. Other results drop that message. stop is kept
+ * for startup clean-up by the caller; the running service never stops itself.
+ * Context and callbacks must remain valid for the task's entire lifetime.
+ *
+ * Communication is best-effort: faults are logged (rate-limited) and the
+ * service keeps running. It never sends to g_mbf_faults, because the vehicle
+ * controller latches a safe stop on any fault and telemetry loss must not
+ * stop the car. Link status in g_mbf_network_status is keep-latest. */
 typedef ER (*wifi_service_poll_t)(void *context, wifi_service_link_t *link);
 typedef ER (*wifi_service_publish_t)(void *context, const telemetry_message_t *message);
 typedef ER (*wifi_service_stop_t)(void *context);
@@ -34,9 +39,9 @@ typedef struct {
 	void *context;
 } wifi_service_config_t;
 
-/* Opt-in service. The controller must consume status and faults and handle
- * queue-full errors. Remote commands are not implemented. Callback stalls
- * require independent supervision. */
+/* Opt-in service. Telemetry comes from vehicle_telemetry_report() (called by
+ * the vehicle controller). Dashboard events and robot/command are handled by
+ * dashboard_link. Callback stalls require independent supervision. */
 ER wifi_service_start(const wifi_service_config_t *config);
 
 /* Starts the outbound MQTT bridge and service after buffers and tests. The

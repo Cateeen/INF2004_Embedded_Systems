@@ -19,6 +19,10 @@ typedef struct {
 	uint32_t last_timestamp_ms;
 	bool initialized;
 	bool have_baseline;
+	/* Why the last update returned INVALID (diagnostics): a constant
+	 * string, NULL before any rejection. */
+	const char *reject_reason;
+	uint32_t reject_value;  /* age or interval in ms, where relevant */
 } motion_feedback_t;
 
 typedef struct {

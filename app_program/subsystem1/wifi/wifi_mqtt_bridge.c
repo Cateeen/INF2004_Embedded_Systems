@@ -5,6 +5,7 @@
 #include "wifi_telemetry.h"
 
 #define BRIDGE_CAPACITY 4U
+#define BRIDGE_LOG_INTERVAL_MS 5000U
 #define BRIDGE_WORDS (BRIDGE_CAPACITY * \
 	(1U + ((sizeof(telemetry_message_t) + sizeof(INT) - 1U) / sizeof(INT))))
 
@@ -32,8 +33,12 @@ static int s_stop_requested;
 static uint32_t s_started_at;
 /* One network-owner writer; the sequence prevents mixed cross-core snapshots. */
 static bridge_snapshot_t s_snapshot;
-static bool s_fault_sent;
-static bool s_fault_delivery_reported;
+/* Drop accounting. Network owner only: the lwIP publish-complete callback
+ * that calls wifi_mqtt_bridge_publish_failed() runs on that same task. */
+static uint32_t s_async_failures;
+static uint32_t s_last_drop_log_ms;
+static uint32_t s_drops_since_log;
+static uint8_t s_drops_logged;
 
 static bool valid_packet(const telemetry_message_t *message)
 {
@@ -166,53 +171,48 @@ ER wifi_mqtt_bridge_stop(void)
 	return E_OK;
 }
 
-void wifi_mqtt_bridge_publish_failed(void)
+/* Logs a dropped message at most once per BRIDGE_LOG_INTERVAL_MS. */
+static void note_drop(uint32_t now, const char *reason)
 {
-	if (__atomic_load_n(&s_status, __ATOMIC_ACQUIRE) == 1) {
-		__atomic_store_n(&s_status, -1, __ATOMIC_RELEASE);
-		tm_printf((UB*)"MQTT telemetry bridge stopped: publish failure\n");
+	if ((s_drops_logged == 0U) || ((now - s_last_drop_log_ms) >= BRIDGE_LOG_INTERVAL_MS)) {
+		tm_printf((UB*)"MQTT telemetry bridge: dropped message (%s); %u since last report\n",
+			  reason, (unsigned)s_drops_since_log);
+		s_last_drop_log_ms = now;
+		s_drops_since_log = 0U;
+		s_drops_logged = 1U;
+	} else {
+		s_drops_since_log++;
 	}
 }
 
+/* Called from the publish-complete callback. Best-effort: the message is
+ * already gone, so the failure is only counted. The bridge keeps running. */
+void wifi_mqtt_bridge_publish_failed(void)
+{
+	s_async_failures++;
+}
+
+/* Telemetry is best-effort: a stale, invalid or rejected message is dropped
+ * and logged, and the bridge keeps running. It never sends to g_mbf_faults,
+ * because the vehicle controller latches a safe stop on any fault message. */
 void wifi_mqtt_bridge_poll(wifi_mqtt_bridge_publish_t publish, int link_up, int mqtt_ready)
 {
 	int status = __atomic_load_n(&s_status, __ATOMIC_ACQUIRE);
+	uint32_t failures;
 	SYSTIM now;
-	ER result;
-	fault_message_t fault = {0};
 
-	if (status == 0) return;
-	if (status == 1 && __atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) return;
-	if (status == 1) {
-		result = tk_get_otm(&now);
-		if (result != E_OK || publish == NULL ||
-		    (mqtt_ready && !link_up) ||
-		    now.lo - s_bridge.last_clock_ms > INT32_MAX ||
-		    bridge_cycle(&s_bridge, s_buffer, now.lo, mqtt_ready, publish) != E_OK) {
-			__atomic_store_n(&s_status, -1, __ATOMIC_RELEASE);
-			tm_printf((UB*)"MQTT telemetry bridge stopped: clock, message or publish error\n");
-			status = -1;
-		} else {
-			s_bridge.last_clock_ms = now.lo;
-			snapshot_write(&s_snapshot, now.lo,
-				       (link_up ? 1U : 0U) | (mqtt_ready ? 2U : 0U));
-		}
+	if ((status != 1) || __atomic_load_n(&s_stop_requested, __ATOMIC_ACQUIRE)) return;
+	if ((tk_get_otm(&now) != E_OK) || (publish == NULL)) return;
+	if (mqtt_ready && !link_up) mqtt_ready = 0;	/* inconsistent: treat as not ready */
+	if (bridge_cycle(&s_bridge, s_buffer, now.lo, mqtt_ready, publish) != E_OK) {
+		s_bridge.have_pending = false;
+		note_drop(now.lo, "stale, invalid or rejected");
 	}
-	if (status == -1 && !s_fault_sent) {
-		fault.header.type = VEHICLE_MESSAGE_FAULT;
-		fault.header.version = VEHICLE_MESSAGE_VERSION;
-		fault.header.sequence = 1U;
-		if (tk_get_otm(&now) != E_OK) return;
-		fault.header.timestamp_ms = now.lo;
-		fault.source = VEHICLE_FAULT_COMMUNICATION;
-		fault.code = VEHICLE_FAULT_CODE_WIFI_BACKEND;
-		result = tk_snd_mbf(g_mbf_faults, &fault, (INT)sizeof(fault), TMO_POL);
-		if (result == E_OK) s_fault_sent = true;
-		else if (!s_fault_delivery_reported) {
-			tm_printf((UB*)"MQTT bridge fault delivery failed: %d\n", (int)result);
-			s_fault_delivery_reported = true;
-		}
-	}
+	failures = s_async_failures;
+	s_async_failures = 0U;
+	if (failures != 0U) note_drop(now.lo, "publish failed after sending");
+	s_bridge.last_clock_ms = now.lo;
+	snapshot_write(&s_snapshot, now.lo, (link_up ? 1U : 0U) | (mqtt_ready ? 2U : 0U));
 }
 
 #if APP_TEST

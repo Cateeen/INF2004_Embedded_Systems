@@ -69,9 +69,14 @@ static BOOL safety_rearm_test(void)
 	     safety_inputs(&safety, 1U, 100U) &&
 	     !car_safety_follow(&safety, 100U, true, false, false) &&
 	     car_safety_follow(&safety, 100U, true, true, false);
+	/* A lost line does not disarm a following robot: the steering holds
+	 * 300 ms then latches a stop, and a junction turn leaves the line. */
 	line = safety_line(2U, 101U, 0U);
 	ok = car_safety_line(&safety, &line, 101U) &&
-	     !car_safety_follow(&safety, 101U, true, false, false) && ok;
+	     car_safety_follow(&safety, 101U, true, false, false) && ok;
+	/* Arming still needs the line: GO off, then a GO edge with no line. */
+	ok = !car_safety_follow(&safety, 101U, false, false, false) &&
+	     !car_safety_follow(&safety, 101U, true, true, false) && ok;
 	line = safety_line(3U, 102U, 1U);
 	ok = car_safety_line(&safety, &line, 102U) &&
 	     !car_safety_follow(&safety, 102U, true, false, false) &&
@@ -91,6 +96,78 @@ static BOOL safety_rearm_test(void)
 	ok = car_safety_imu(&safety, &imu, 106U) &&
 	     !car_safety_follow(&safety, 106U, true, false, false) &&
 	     car_safety_follow(&safety, 106U, true, true, false) && ok;
+	return ok;
+}
+
+/* Straddle line sensors: centred reads no line (both white), so arming
+ * needs only the floor under the robot (not picked up). */
+static BOOL safety_straddle_test(void)
+{
+	car_safety_config_t config = safety_config;
+	car_safety_t safety = {0};
+	line_observation_message_t line;
+	BOOL ok;
+
+	config.straddle_line = true;
+	ok = car_safety_init(&safety, &config, 100U) && safety_inputs(&safety, 1U, 100U);
+	line = safety_line(2U, 101U, 0U);                       /* tape in the gap */
+	ok = car_safety_line(&safety, &line, 101U) && safety.line_clear &&
+	     car_safety_follow(&safety, 101U, true, true, false) && ok;
+	ok = !car_safety_follow(&safety, 101U, false, false, false) && ok;
+	line = safety_line(3U, 102U, 0U);
+	line.picked_up = 1U;                                    /* lifted */
+	ok = car_safety_line(&safety, &line, 102U) && !safety.line_clear &&
+	     !car_safety_follow(&safety, 102U, true, true, false) && ok;
+	return ok;
+}
+
+/* NO_ULTRASONIC fallback (obstacle_optional): an ultrasonic that never gives
+ * a first reading turns obstacle detection off instead of faulting; once a
+ * reading has arrived, it cannot be turned off and faults latch as usual. */
+static BOOL safety_optional_obstacle_test(void)
+{
+	car_safety_config_t config = safety_config;
+	car_safety_t safety = {0};
+	line_observation_message_t line;
+	imu_estimate_message_t imu;
+	obstacle_event_message_t obstacle;
+	BOOL ok;
+
+	/* Not optional: no first ahead reading by its deadline is a fault. */
+	ok = car_safety_init(&safety, &config, 100U);
+	line = safety_line(1U, 150U, 1U);
+	imu = safety_imu(1U, 150U);
+	ok = car_safety_line(&safety, &line, 150U) && car_safety_imu(&safety, &imu, 150U) && ok;
+	line = safety_line(2U, 201U, 1U);
+	ok = !car_safety_line(&safety, &line, 201U) &&
+	     (safety.faults & CAR_SAFETY_FAULT_OBSTACLE) != 0U && !safety.obstacle_disabled &&
+	     !car_safety_disable_obstacle(&safety) && ok;
+
+	/* Optional: the same deadline turns detection off, no fault; the robot
+	 * arms with ahead clear and ignores obstacle messages from then on. */
+	config.obstacle_optional = true;
+	ok = car_safety_init(&safety, &config, 100U) && ok;
+	line = safety_line(1U, 150U, 1U);
+	imu = safety_imu(1U, 150U);
+	ok = car_safety_line(&safety, &line, 150U) && car_safety_imu(&safety, &imu, 150U) && ok;
+	line = safety_line(2U, 201U, 1U);
+	imu = safety_imu(2U, 201U);
+	ok = car_safety_line(&safety, &line, 201U) && car_safety_imu(&safety, &imu, 201U) &&
+	     safety.faults == 0U && safety.obstacle_disabled && safety.have_ahead &&
+	     safety.ahead_clear && car_safety_follow(&safety, 201U, true, true, false) && ok;
+	obstacle = safety_obstacle(1U, 202U, VEHICLE_OBSTACLE_AHEAD_READING, 50U);
+	ok = car_safety_obstacle(&safety, &obstacle, 202U) &&
+	     car_safety_follow(&safety, 202U, true, false, false) &&
+	     !car_safety_begin_scan(&safety, 202U) && ok;
+
+	/* Optional, obstacle task fault before the first reading: off at once. */
+	ok = car_safety_init(&safety, &config, 100U) &&
+	     car_safety_disable_obstacle(&safety) && safety.obstacle_disabled &&
+	     safety.faults == 0U && ok;
+
+	/* Optional, but a reading already arrived: cannot be turned off. */
+	ok = car_safety_init(&safety, &config, 100U) && safety_inputs(&safety, 1U, 150U) &&
+	     !car_safety_disable_obstacle(&safety) && !safety.obstacle_disabled && ok;
 	return ok;
 }
 
@@ -145,11 +222,28 @@ static BOOL safety_fault_test(void)
 	     (safety.faults & CAR_SAFETY_FAULT_LINE) != 0U && ok;
 	ok = car_safety_init(&safety, &config, 100U) &&
 	     safety_inputs(&safety, 1U, 100U) && ok;
+	/* Emergency while not armed: no fault, just not clear ahead. */
 	obstacle = safety_obstacle(2U, 101U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
 	obstacle.emergency = 1U;
-	ok = !car_safety_obstacle(&safety, &obstacle, 101U) &&
-	     (safety.faults & CAR_SAFETY_FAULT_EMERGENCY) != 0U &&
+	ok = car_safety_obstacle(&safety, &obstacle, 101U) && safety.faults == 0U &&
 	     !car_safety_follow(&safety, 101U, true, true, false) && ok;
+	/* While armed: stops at once, never latches; re-arms only once clear
+	 * ahead and with a fresh GO edge. */
+	ok = car_safety_init(&safety, &config, 100U) &&
+	     safety_inputs(&safety, 1U, 100U) &&
+	     car_safety_follow(&safety, 100U, true, true, false) && ok;
+	obstacle = safety_obstacle(2U, 101U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
+	obstacle.emergency = 1U;
+	ok = car_safety_obstacle(&safety, &obstacle, 101U) && safety.faults == 0U &&
+	     !safety.armed && ok;
+	obstacle = safety_obstacle(3U, 102U, VEHICLE_OBSTACLE_AHEAD_READING, 100U);
+	obstacle.emergency = 1U;
+	ok = car_safety_obstacle(&safety, &obstacle, 102U) && safety.faults == 0U &&
+	     !car_safety_follow(&safety, 102U, true, true, false) && ok;
+	obstacle = safety_obstacle(4U, 103U, VEHICLE_OBSTACLE_AHEAD_READING, OBS_DIST_NONE);
+	ok = car_safety_obstacle(&safety, &obstacle, 103U) &&
+	     !car_safety_follow(&safety, 103U, true, false, false) &&
+	     car_safety_follow(&safety, 103U, true, true, false) && ok;
 	config.line_max_age_ms = 1000U;
 	config.imu_max_age_ms = 1000U;
 	ok = car_safety_init(&safety, &config, 100U) &&
@@ -207,8 +301,11 @@ static BOOL controller_state_flow_test(void)
 	     controller_state_step(&controller, 100U, true, false) == CONTROLLER_BLOCKED &&
 	     controller_state_step(&controller, 100U, false, false) == CONTROLLER_WAITING &&
 	     controller_state_step(&controller, 100U, true, false) == CONTROLLER_FOLLOWING;
+	/* Losing the line keeps FOLLOWING; starting again needs it back. */
 	line = safety_line(2U, 101U, 0U);
 	ok = car_safety_line(&controller.safety, &line, 101U) &&
+	     controller_state_step(&controller, 101U, true, false) == CONTROLLER_FOLLOWING &&
+	     controller_state_step(&controller, 101U, false, false) == CONTROLLER_WAITING &&
 	     controller_state_step(&controller, 101U, true, false) == CONTROLLER_BLOCKED && ok;
 	line = safety_line(3U, 102U, 1U);
 	ok = car_safety_line(&controller.safety, &line, 102U) &&
@@ -305,6 +402,8 @@ BOOL car_gate_test(void)
 	BOOL state_flow_ok;
 	BOOL state_fault_ok;
 	BOOL state_scan_ok;
+	BOOL straddle_ok;
+	BOOL optional_ok;
 	TEST_INIT();
 
 	motion_ok = car_gate_motion(true, false, 0U) &&
@@ -332,19 +431,24 @@ BOOL car_gate_test(void)
 	state_flow_ok = controller_state_flow_test();
 	state_fault_ok = controller_state_fault_test();
 	state_scan_ok = controller_state_scan_test();
+	straddle_ok = safety_straddle_test();
+	optional_ok = safety_optional_obstacle_test();
 
 	TEST_CHECK("VC-U01", motion_ok, "stop, emergency and fault veto motion");
 	TEST_CHECK("VC-U02", follow_ok, "obstacle vetoes line following");
 	TEST_CHECK("VC-U03", rearm_ok, "line following requires a fresh go edge");
 	TEST_CHECK("VC-U04", safety_ok, "sensor vetoes require a fresh go edge");
 	TEST_CHECK("VC-U05", scan_ok, "scan requires fresh ahead data before rearming");
-	TEST_CHECK("VC-U06", fault_ok, "invalid, late and emergency inputs latch faults");
+	TEST_CHECK("VC-U06", fault_ok, "invalid and late inputs latch faults; obstacle emergency readings stop the robot without latching");
 	TEST_CHECK("VC-U07", wrap_ok, "sensor and clock wrap with backward clock rejection");
 	TEST_CHECK("VC-U10", state_flow_ok, "state transitions and fresh go edges");
 	TEST_CHECK("VC-U11", state_fault_ok, "state faults, emergency latch and clock wrap");
 	TEST_CHECK("VC-U12", state_scan_ok, "scan state and ahead reacquisition");
+	TEST_CHECK("VC-U35", straddle_ok, "straddle line sensors: arming needs the floor (not lifted), not the tape under a sensor");
+	TEST_CHECK("VC-U37", optional_ok, "NO_ULTRASONIC: no first ultrasonic reading turns obstacle detection off instead of faulting; after a reading it faults as usual");
 	TEST_SUMMARY("controller gate");
 	return motion_ok && follow_ok && rearm_ok && safety_ok && scan_ok && fault_ok &&
-	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok;
+	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok && straddle_ok &&
+	       optional_ok;
 }
 #endif

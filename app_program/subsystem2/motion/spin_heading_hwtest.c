@@ -31,15 +31,16 @@
 
 #if APP_SENSOR_TEST == 12
 
-/* Measured by ruler: wheel contact centre to centre. Tune from the results. */
+/* Effective track from the spin test (ruler 110 mm; wheel contact and slip
+ * make it act wider). Calibrated on the mat: heading within ~2 deg/turn. */
 #ifndef SPIN_TRACK_MM
-#define SPIN_TRACK_MM 110U
+#define SPIN_TRACK_MM 116U
 #endif
 #ifndef SPIN_PWM
-#define SPIN_PWM 40U          /* % while far from the target */
+#define SPIN_PWM 25U          /* % while far from the target */
 #endif
 #ifndef SPIN_PWM_SLOW
-#define SPIN_PWM_SLOW 30U     /* % for the last SLOW_ZONE_DEG */
+#define SPIN_PWM_SLOW 20U     /* % for the last SLOW_ZONE_DEG */
 #endif
 
 /* Signed % added to the RIGHT wheel's PWM to even out unequal motors. */

@@ -54,6 +54,12 @@ endif
 # sys_check_timeouts(), and any application tcp_*/udp_*/dns_* call -- runs
 # on the same processor-1-owned task that already services the radio, per
 # docs/RELEASE.md safety rule 6. See lib/liblwip/sysdepend/pico_rp2040/.
+# SENSOR_TEST=wifi tests the whole network path, so it turns lwIP and MQTT
+# on unless the command line says otherwise.
+ifeq ($(SENSOR_TEST),wifi)
+NET ?= lwip
+MQTT ?= 1
+endif
 NET ?= none
 ifneq ($(filter $(NET),none lwip),$(NET))
 $(error Unknown NET '$(NET)'; use none or lwip)
@@ -121,9 +127,25 @@ endif
 VEHICLE_SUFFIX := _vehicle
 endif
 
+# NO_ULTRASONIC=1 (with VEHICLE=1): if the HC-SR04 never gives a first reading
+# (e.g. it is powered from USB VBUS and the robot runs on battery), the
+# vehicle switches obstacle detection and bypass OFF instead of faulting, and
+# follows the line without stopping for obstacles. A sensor that answers is
+# used as normal. Default 0: no ultrasonic is a fault, as before.
+NO_ULTRASONIC ?= 0
+ifneq ($(filter $(NO_ULTRASONIC),0 1),$(NO_ULTRASONIC))
+$(error Unknown NO_ULTRASONIC '$(NO_ULTRASONIC)'; use 0 or 1)
+endif
+ifeq ($(NO_ULTRASONIC),1)
+ifneq ($(VEHICLE),1)
+$(error NO_ULTRASONIC=1 requires VEHICLE=1)
+endif
+VEHICLE_SUFFIX := _vehicle_noultra
+endif
+
 # SENSOR_TEST selects one live hardware diagnostic; vehicle and test tasks stay off.
 SENSOR_TEST ?= none
-SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves servo encoder line_barcode line barcode
+SENSOR_TEST_MODES := none ir imu imu_tilt imu_hump ultrasonic obstacle_width spin_heading motor_moves pid_tune spin_width diag_width line_follow junction wifi servo encoder line_barcode line barcode
 ifneq ($(words $(SENSOR_TEST)),1)
 $(error SENSOR_TEST must be exactly one of: $(SENSOR_TEST_MODES))
 endif
@@ -135,13 +157,23 @@ BARCODE_TEST_MODULE_COUNTS ?= 0
 BARCODE_TEST_BLACK_ADC ?= 1000
 BARCODE_TEST_WHITE_ADC ?= 600
 BARCODE_TEST_DEBOUNCE_COUNTS ?= 4
+# The payload the barcode should read, without the *s (e.g. Y): each pass is
+# compared run by run with its Code 39 pattern. Empty = no comparison.
+BARCODE_TEST_EXPECT ?=
+# BARCODE_TEST_DRIVE=<cm/s> (DRIVES MOTORS): GO drives straight at that speed
+# for BARCODE_TEST_DRIVE_MM, no steering, recording the pass; 0 = hand push;
+# BARCODE_TEST_DRIVE=vehicle = the main robot's line speed (VEHICLE_LINE_SPEED_CM_S).
+BARCODE_TEST_DRIVE ?= 0
+BARCODE_TEST_DRIVE_MM ?= 300
 # obstacle_width: confirm distance, and optional known object width for calibration.
 OBSTACLE_DETECT_MM ?= 400
 OBSTACLE_TRUE_WIDTH_MM ?= 0
 # spin_heading (DRIVES MOTORS): wheel track and turning PWM percentages.
-SPIN_TRACK_MM ?= 110
-SPIN_PWM ?= 40
-SPIN_PWM_SLOW ?= 30
+# Calibrated on the mat 2026-11-23: effective track 116 mm (ruler 110), heading
+# within ~2 deg per full turn; 25/20 % keeps the stop overshoot to ~3.5 deg.
+SPIN_TRACK_MM ?= 116
+SPIN_PWM ?= 25
+SPIN_PWM_SLOW ?= 20
 SPIN_RIGHT_TRIM ?= 0
 # motor_moves (DRIVES MOTORS): open-loop PWM %, per-wheel trim %, straight
 # distance, wheel track and inner-wheel share % for the arcs.
@@ -151,6 +183,176 @@ MOVE_TRIM_R ?= 100
 MOVE_DIST_MM ?= 500
 MOVE_TRACK_MM ?= 110
 MOVE_ARC_INNER ?= 50
+MOVE_SKIP_BALANCE ?= 0
+# pid_tune (DRIVES MOTORS): wheel speed PID gains (decimals allowed), target
+# cm/s, base and max PWM %, update period, floor distance, in-air run time,
+# per-sample trace (0/1) and arc steering cm/s (0 skips the arc steps).
+PID_KP ?= 2.0
+PID_KI ?= 0.0
+PID_KD ?= 0.0
+PID_SPEED ?= 15
+PID_BASE ?= 20
+PID_MAX ?= 60
+PID_PERIOD_MS ?= 50
+PID_DIST_MM ?= 400
+PID_AIR_MS ?= 3000
+PID_TRACE ?= 1
+PID_TURN ?= 4
+# pid_tune wheel feed-forward %PWM per cm/s around PID_BASE at PID_SPEED (0 =
+# flat base; PID_FF=1.4 PID_BASE=22 PID_SPEED=15 matches the vehicle). The arc
+# steps print the slope the wheels actually needed.
+PID_FF ?= 0
+# spin_width (DRIVES MOTORS, uses the spin_heading SPIN_* values): turn limit
+# each way, measuring step and edge-finding step in degrees, sensor distance
+# ahead of the wheel axle, obstacle cluster tolerance, free gap needed beside
+# the obstacle (robot width + clearance), how far beyond the obstacle side
+# objects still count (assumed depth + robot length + margin), beam trim in degrees (decimals
+# allowed), an optional known object width for calibration, and SCAN_FULL=1 to
+# always sweep the whole R..L SCAN_HALF_DEG instead of finding the edges first.
+# SCAN_BYPASS=1 then pulls out to the chosen side (right unless the obstacle
+# sticks out further right): car width, side gap to keep, extra margin for the
+# scan's width error, and the sideways speed. SCAN_REJOIN=1 then drives past it,
+# looking across at the line from SCAN_MIN_DEPTH_MM past the face and every
+# SCAN_PASS_STEP_MM (giving up after SCAN_MAX_DEPTH_MM), and rejoins the line.
+SCAN_HALF_DEG ?= 70
+SCAN_STEP_DEG ?= 3
+SCAN_FIND_STEP_DEG ?= 6
+SCAN_LANE_MM ?= 200
+SCAN_BEYOND_MM ?= 400
+SCAN_MAX_OBSTACLE_MM ?= 450
+SCAN_FULL ?= 0
+SCAN_BYPASS ?= 1
+SCAN_CAR_WIDTH_MM ?= 140
+SCAN_CLEAR_MM ?= 50
+SCAN_MARGIN_MM ?= 80
+SCAN_SPEED_CM_S ?= 15
+SCAN_REJOIN ?= 1
+SCAN_MIN_DEPTH_MM ?= 50
+SCAN_PASS_STEP_MM ?= 100
+SCAN_MAX_DEPTH_MM ?= 600
+# diag_width (DRIVES MOTORS, uses the spin_heading SPIN_* values): pass angle
+# (heading left, servo right; servo limit 20), speed along the path, straight
+# back-up before the pass, car width, side gap to keep, pull out after
+# measuring (0/1), and an optional known width.
+DIAG_ANGLE_DEG ?= 20
+DIAG_SPEED_CM_S ?= 15
+DIAG_BACKUP_MM ?= 100
+DIAG_CAR_WIDTH_MM ?= 140
+DIAG_CLEAR_MM ?= 50
+DIAG_PULLOUT ?= 1
+DIAG_TRUE_WIDTH_MM ?= 0
+# line_follow (DRIVES MOTORS): line steering speed, full turn, first-correction
+# turn and the ms it takes to build from one to the other (override
+# line_steering.h for this build; LF_SPEED + LF_TURN <= 20; LF_TURN_MIN=LF_TURN
+# is the old fixed bang-bang), wheel feed-forward %PWM per cm/s (0 = old flat
+# base), run length, steering period (= controller), trace (0/1), tightest
+# curve radius on the mat (0 = unknown; enables the "turn needed" check) and
+# effective wheel track.
+LF_SPEED ?= 10
+LF_TURN ?= 6
+LF_TURN_MIN ?= 2
+LF_RAMP_MS ?= 400
+LF_FF ?= 1.4
+# Ramp-mode (SLOPE) profile, used by the vehicle while the IMU reports a ramp;
+# LF_SLOPE=1 runs it for the whole line_follow run (the test has no IMU).
+LF_SLOPE ?= 0
+LF_SLOPE_SPEED ?= 9
+LF_SLOPE_TURN ?= 5
+LF_SLOPE_TURN_MIN ?= 2
+LF_SLOPE_RAMP_MS ?= 400
+LF_DIST_MM ?= 1500
+LF_STEER_MS ?= 50
+LF_TRACE ?= 1
+LF_CURVE_R_MM ?= 0
+LF_TRACK_MM ?= 116
+# LF_BARCODE=1 also decodes barcodes while following, with decoders on the
+# same pass: A exactly as the vehicle's line task (10 ms samples, hysteresis
+# 1000/600, 4-count debounce, 50 ms odometry extrapolated) and B fast (2 ms,
+# fresh encoder counts) as the reference; LF_BC_MODULE = smallest counts per
+# narrow module expected (vehicle: 35; bigger barcodes adapt).
+LF_BARCODE ?= 0
+LF_BC_MODULE ?= 35
+# LF_BC_SLOW=<cm/s> (straddle only, 0 = off): drive at this speed from the
+# first black on the barcode sensor until it has read white for LF_BC_SLOW_MM,
+# to see whether slowing down over barcodes helps the vehicle's decoder.
+LF_BC_SLOW ?= 0
+LF_BC_SLOW_MM ?= 60
+# Decoder C measures distance at the barcode sensor, this far left of centre.
+LF_BC_SENSOR_Y_MM ?= 40
+# LF_STRADDLE=1: test-only straddle steering (sensors wider apart than the tape;
+# tape between them = straight). One sensor = gentle turn LF_SL_TURN; held over
+# LF_SL_OVERSHOOT_MS = pivot back (LF_SL_REC_SPEED -/+ LF_SL_REC_TURN); both
+# white over LF_SL_BLIND_MS = search towards the last side (0 = off); a pivot
+# over LF_SL_PIVOT_MAX_MS = line lost. See line_follow_hwtest.c.
+# The speed and every LF_SL_* steering value default to the MAIN ROBOT's
+# (vehicle_controller_task.h: 10 cm/s, turn 2, pivot 5/4, ...); set one on the
+# make command line (e.g. LF_SPEED=8 or LF_SL_TURN=3) to override it.
+# After a correction the robot steers back the other way for
+# LF_SL_COUNTER_PCT % of its length (max LF_SL_COUNTER_MAX_MS).
+LF_STRADDLE ?= 0
+LF_SL_TURN ?=
+LF_SL_COUNTER_PCT ?=
+LF_SL_COUNTER_MAX_MS ?=
+# Line-sensor hysteresis in straddle mode: black at >= LF_SL_BLACK_ADC, white
+# again at <= LF_SL_WHITE_ADC (LF_SL_BLACK_ADC=0: the reader's threshold).
+LF_SL_BLACK_ADC ?= 1500
+LF_SL_WHITE_ADC ?= 900
+LF_SL_OVERSHOOT_MS ?=
+LF_SL_REC_SPEED ?=
+LF_SL_REC_TURN ?=
+LF_SL_BLIND_MS ?=
+LF_SL_PIVOT_MAX_MS ?=
+# Straddle speed: LF_SPEED only when given on the command line.
+LF_SL_SPEED ?= $(if $(filter command line environment,$(origin LF_SPEED)),$(LF_SPEED))
+# junction (DRIVES MOTORS): follows the line with the line_steering.h settings
+# and detects a tape crossing the path with the left (barcode) sensor + the
+# line sensors. JN_ACTION = stop | straight | left | right | uturn. Turns drive
+# JN_FORWARD_MM first (~ line sensors to wheel axle), spin by the encoders
+# (braking JN_TURN_TRIM_DEG early), then follow the new line JN_AFTER_MM.
+# Detector: left black JN_LEFT_MIN_MM..JN_LEFT_MAX_MM, then centre+right both
+# black >= JN_BOTH_MIN_MM from JN_OFFSET_MM after it (+/- JN_TOL_MM).
+# Widths are as the sensors measure them: 18 mm tape reads ~12 mm, and the
+# line sensors reach it ~8 mm after the left one (measured).
+JN_ACTION ?= stop
+JN_FORWARD_MM ?= 100
+# Right turns: the tracked tape edge is off the robot centreline, so they need
+# a different forward distance (2x that offset apart from left turns).
+JN_FORWARD_RIGHT_MM ?= 120
+# JN_SEEK=1 turns until a line sensor finds the new line (looking from
+# JN_SEEK_BEFORE_DEG before to JN_SEEK_AFTER_DEG past the target angle);
+# JN_SEEK=0 spins a fixed angle, braking JN_TURN_TRIM_DEG early.
+JN_SEEK ?= 1
+JN_SEEK_BEFORE_DEG ?= 30
+JN_SEEK_AFTER_DEG ?= 30
+JN_AFTER_MM ?= 400
+JN_RUN_MM ?= 1500
+JN_TURN_TRIM_DEG ?= 4
+JN_TRACE ?= 1
+JN_LEFT_MIN_MM ?= 8
+JN_LEFT_MAX_MM ?= 80
+JN_OFFSET_MM ?= 8
+JN_TOL_MM ?= 12
+JN_BOTH_MIN_MM ?= 5
+# No-line start (line sensors white at GO, e.g. only a crossing tape on the
+# mat): drive straight up to JN_BLIND_MM to find it, backing off it first if
+# the left sensor starts on it.
+JN_BLIND_MM ?= 200
+# LF_STRADDLE=1 (sensors straddle the tape, left sensor behind): straddle
+# steering (LF_SL_* above) and junction = centre+right both black for
+# JN_BOTH_MIN_MM; both-black dropouts under JN_GAP_MM are bridged, and after a
+# junction it re-arms once they are not both black for JN_REARM_MM.
+JN_GAP_MM ?= 3
+# JN_NO_LINE=1 (straddle): no-line start -- drive straight to a single tape laid
+# across the mat, then do JN_ACTION (turns follow that tape afterwards).
+JN_NO_LINE ?= 0
+# Straddle seek stops with the tape IN the gap (lead sensor black, then white):
+# 0 off, 1 left spins (left turn, U-turn), 2 all spins.
+JN_SEEK_GAP ?= 1
+JN_REARM_MM ?= 30
+SCAN_SENSOR_OFFSET_MM ?= 70
+SCAN_CLUSTER_MM ?= 60
+SCAN_TRIM_DEG ?= 15.0
+SCAN_TRUE_WIDTH_MM ?= 0
 ifneq ($(SENSOR_TEST),none)
 ifneq ($(TEST)$(ODOMETRY_TEST)$(VEHICLE),000)
 $(error SENSOR_TEST cannot be combined with TEST, ODOMETRY_TEST, or VEHICLE)
@@ -169,6 +371,21 @@ else ifeq ($(SENSOR_TEST),spin_heading)
 SENSOR_TEST_VALUE := 12
 else ifeq ($(SENSOR_TEST),motor_moves)
 SENSOR_TEST_VALUE := 13
+else ifeq ($(SENSOR_TEST),pid_tune)
+SENSOR_TEST_VALUE := 14
+else ifeq ($(SENSOR_TEST),spin_width)
+SENSOR_TEST_VALUE := 15
+else ifeq ($(SENSOR_TEST),diag_width)
+SENSOR_TEST_VALUE := 16
+else ifeq ($(SENSOR_TEST),line_follow)
+SENSOR_TEST_VALUE := 17
+else ifeq ($(SENSOR_TEST),junction)
+SENSOR_TEST_VALUE := 18
+else ifeq ($(SENSOR_TEST),wifi)
+SENSOR_TEST_VALUE := 19
+ifneq ($(MQTT),1)
+$(error SENSOR_TEST=wifi needs WIFI=cyw43 NET=lwip MQTT=1)
+endif
 else ifeq ($(SENSOR_TEST),servo)
 SENSOR_TEST_VALUE := 4
 else ifeq ($(SENSOR_TEST),encoder)
@@ -275,12 +492,15 @@ endif
 CFLAGS  += -DAPP_TEST=$(TEST)
 CFLAGS  += -DAPP_ODOMETRY_TEST=$(ODOMETRY_TEST)
 CFLAGS  += -DAPP_VEHICLE=$(VEHICLE)
+CFLAGS  += -DAPP_NO_ULTRASONIC=$(NO_ULTRASONIC)
 CFLAGS  += -DAPP_SENSOR_TEST=$(SENSOR_TEST_VALUE)
 ifeq ($(SENSOR_TEST),barcode)
 CFLAGS  += -DBARCODE_TEST_MODULE_COUNTS=$(BARCODE_TEST_MODULE_COUNTS)
 CFLAGS  += -DBARCODE_TEST_BLACK_ADC=$(BARCODE_TEST_BLACK_ADC)
 CFLAGS  += -DBARCODE_TEST_WHITE_ADC=$(BARCODE_TEST_WHITE_ADC)
 CFLAGS  += -DBARCODE_TEST_DEBOUNCE_COUNTS=$(BARCODE_TEST_DEBOUNCE_COUNTS)
+CFLAGS  += -DBARCODE_TEST_EXPECT=\"$(BARCODE_TEST_EXPECT)\"
+CFLAGS  += -DBARCODE_TEST_DRIVE=$(if $(filter vehicle,$(BARCODE_TEST_DRIVE)),VEHICLE_LINE_SPEED_CM_S,$(BARCODE_TEST_DRIVE)) -DBARCODE_TEST_DRIVE_MM=$(BARCODE_TEST_DRIVE_MM)U
 endif
 ifeq ($(SENSOR_TEST),servo)
 CFLAGS  += -DSERVO_TEST_US=$(SERVO_TEST_US)
@@ -295,7 +515,78 @@ CFLAGS  += -DSPIN_RIGHT_TRIM=$(SPIN_RIGHT_TRIM)
 endif
 ifeq ($(SENSOR_TEST),motor_moves)
 CFLAGS  += -DMOVE_PWM=$(MOVE_PWM)U -DMOVE_TRIM_L=$(MOVE_TRIM_L)U -DMOVE_TRIM_R=$(MOVE_TRIM_R)U
-CFLAGS  += -DMOVE_DIST_MM=$(MOVE_DIST_MM)U -DMOVE_TRACK_MM=$(MOVE_TRACK_MM)U -DMOVE_ARC_INNER=$(MOVE_ARC_INNER)U
+CFLAGS  += -DMOVE_DIST_MM=$(MOVE_DIST_MM)U -DMOVE_TRACK_MM=$(MOVE_TRACK_MM)U -DMOVE_ARC_INNER=$(MOVE_ARC_INNER)U -DMOVE_SKIP_BALANCE=$(MOVE_SKIP_BALANCE)U
+endif
+ifeq ($(SENSOR_TEST),pid_tune)
+CFLAGS  += -DPID_KP=$(PID_KP) -DPID_KI=$(PID_KI) -DPID_KD=$(PID_KD)
+CFLAGS  += -DPID_SPEED=$(PID_SPEED)U -DPID_BASE=$(PID_BASE)U -DPID_MAX=$(PID_MAX)U
+CFLAGS  += -DPID_PERIOD_MS=$(PID_PERIOD_MS)U -DPID_DIST_MM=$(PID_DIST_MM)U
+CFLAGS  += -DPID_AIR_MS=$(PID_AIR_MS)U -DPID_TRACE=$(PID_TRACE)U -DPID_TURN=$(PID_TURN)U
+CFLAGS  += -DPID_FF=$(PID_FF)
+endif
+ifeq ($(SENSOR_TEST),spin_width)
+CFLAGS  += -DSPIN_TRACK_MM=$(SPIN_TRACK_MM)U -DSPIN_PWM=$(SPIN_PWM)U -DSPIN_PWM_SLOW=$(SPIN_PWM_SLOW)U
+CFLAGS  += -DSCAN_HALF_DEG=$(SCAN_HALF_DEG)U -DSCAN_STEP_DEG=$(SCAN_STEP_DEG)U
+CFLAGS  += -DSCAN_SENSOR_OFFSET_MM=$(SCAN_SENSOR_OFFSET_MM)U -DSCAN_CLUSTER_MM=$(SCAN_CLUSTER_MM)U
+CFLAGS  += -DSCAN_TRIM_DEG=$(SCAN_TRIM_DEG) -DSCAN_TRUE_WIDTH_MM=$(SCAN_TRUE_WIDTH_MM)U
+CFLAGS  += -DSCAN_FIND_STEP_DEG=$(SCAN_FIND_STEP_DEG)U -DSCAN_LANE_MM=$(SCAN_LANE_MM)U -DSCAN_FULL=$(SCAN_FULL)
+CFLAGS  += -DSCAN_BEYOND_MM=$(SCAN_BEYOND_MM)U -DSCAN_MAX_OBSTACLE_MM=$(SCAN_MAX_OBSTACLE_MM)U
+CFLAGS  += -DSCAN_BYPASS=$(SCAN_BYPASS) -DSCAN_CAR_WIDTH_MM=$(SCAN_CAR_WIDTH_MM)U -DSCAN_CLEAR_MM=$(SCAN_CLEAR_MM)U
+CFLAGS  += -DSCAN_MARGIN_MM=$(SCAN_MARGIN_MM)U -DSCAN_SPEED_CM_S=$(SCAN_SPEED_CM_S)U
+CFLAGS  += -DSCAN_REJOIN=$(SCAN_REJOIN) -DSCAN_MIN_DEPTH_MM=$(SCAN_MIN_DEPTH_MM)U
+CFLAGS  += -DSCAN_PASS_STEP_MM=$(SCAN_PASS_STEP_MM)U -DSCAN_MAX_DEPTH_MM=$(SCAN_MAX_DEPTH_MM)U
+endif
+ifeq ($(SENSOR_TEST),diag_width)
+CFLAGS  += -DSPIN_TRACK_MM=$(SPIN_TRACK_MM)U -DSPIN_PWM=$(SPIN_PWM)U -DSPIN_PWM_SLOW=$(SPIN_PWM_SLOW)U
+CFLAGS  += -DDIAG_ANGLE_DEG=$(DIAG_ANGLE_DEG)U -DDIAG_SPEED_CM_S=$(DIAG_SPEED_CM_S)U
+CFLAGS  += -DDIAG_CAR_WIDTH_MM=$(DIAG_CAR_WIDTH_MM)U -DDIAG_CLEAR_MM=$(DIAG_CLEAR_MM)U
+CFLAGS  += -DDIAG_PULLOUT=$(DIAG_PULLOUT) -DDIAG_BACKUP_MM=$(DIAG_BACKUP_MM)U
+CFLAGS  += -DDIAG_TRUE_WIDTH_MM=$(DIAG_TRUE_WIDTH_MM)U
+endif
+ifeq ($(SENSOR_TEST),line_follow)
+CFLAGS  += -DLINE_STEERING_SPEED_CM_S=$(LF_SPEED) -DLINE_STEERING_TURN_CM_S=$(LF_TURN)
+CFLAGS  += -DLINE_STEERING_TURN_MIN_CM_S=$(LF_TURN_MIN) -DLINE_STEERING_RAMP_MS=$(LF_RAMP_MS)
+CFLAGS  += -DLF_FF=$(LF_FF) -DLF_SLOPE=$(LF_SLOPE)
+CFLAGS  += -DLF_BARCODE=$(LF_BARCODE) -DLF_BC_MODULE=$(LF_BC_MODULE)U -DLF_BC_SENSOR_Y_MM=$(LF_BC_SENSOR_Y_MM)
+CFLAGS  += -DLF_BC_SLOW=$(LF_BC_SLOW) -DLF_BC_SLOW_MM=$(LF_BC_SLOW_MM)
+CFLAGS  += -DLINE_STEERING_SLOPE_SPEED_CM_S=$(LF_SLOPE_SPEED) -DLINE_STEERING_SLOPE_TURN_CM_S=$(LF_SLOPE_TURN)
+CFLAGS  += -DLINE_STEERING_SLOPE_TURN_MIN_CM_S=$(LF_SLOPE_TURN_MIN) -DLINE_STEERING_SLOPE_RAMP_MS=$(LF_SLOPE_RAMP_MS)
+CFLAGS  += -DLF_DIST_MM=$(LF_DIST_MM)U -DLF_STEER_MS=$(LF_STEER_MS)U -DLF_TRACE=$(LF_TRACE)U
+CFLAGS  += -DLF_CURVE_R_MM=$(LF_CURVE_R_MM)U -DLF_TRACK_MM=$(LF_TRACK_MM)U
+endif
+# Straddle steering (straddle_hwtest.h), shared by line_follow and junction.
+ifneq ($(filter line_follow junction,$(SENSOR_TEST)),)
+# Steering values left empty use the vehicle's (straddle_hwtest.h).
+CFLAGS  += -DLF_STRADDLE=$(LF_STRADDLE)
+CFLAGS  += $(if $(LF_SL_SPEED),-DLF_SL_SPEED=$(LF_SL_SPEED))
+CFLAGS  += $(if $(LF_SL_TURN),-DLF_SL_TURN=$(LF_SL_TURN))
+CFLAGS  += $(if $(LF_SL_OVERSHOOT_MS),-DLF_SL_OVERSHOOT_MS=$(LF_SL_OVERSHOOT_MS)U)
+CFLAGS  += $(if $(LF_SL_REC_SPEED),-DLF_SL_REC_SPEED=$(LF_SL_REC_SPEED))
+CFLAGS  += $(if $(LF_SL_REC_TURN),-DLF_SL_REC_TURN=$(LF_SL_REC_TURN))
+CFLAGS  += $(if $(LF_SL_BLIND_MS),-DLF_SL_BLIND_MS=$(LF_SL_BLIND_MS)U)
+CFLAGS  += $(if $(LF_SL_PIVOT_MAX_MS),-DLF_SL_PIVOT_MAX_MS=$(LF_SL_PIVOT_MAX_MS)U)
+CFLAGS  += $(if $(LF_SL_COUNTER_PCT),-DLF_SL_COUNTER_PCT=$(LF_SL_COUNTER_PCT))
+CFLAGS  += $(if $(LF_SL_COUNTER_MAX_MS),-DLF_SL_COUNTER_MAX_MS=$(LF_SL_COUNTER_MAX_MS)U)
+CFLAGS  += -DLF_SL_BLACK_ADC=$(LF_SL_BLACK_ADC) -DLF_SL_WHITE_ADC=$(LF_SL_WHITE_ADC)
+endif
+ifeq ($(SENSOR_TEST),junction)
+CFLAGS  += -DJN_GAP_MM=$(JN_GAP_MM) -DJN_REARM_MM=$(JN_REARM_MM) -DJN_NO_LINE=$(JN_NO_LINE) -DJN_SEEK_GAP=$(JN_SEEK_GAP)
+# Same follow speed as SENSOR_TEST=line_follow (LF_SPEED etc. override line_steering.h).
+CFLAGS  += -DLINE_STEERING_SPEED_CM_S=$(LF_SPEED) -DLINE_STEERING_TURN_CM_S=$(LF_TURN)
+CFLAGS  += -DLINE_STEERING_TURN_MIN_CM_S=$(LF_TURN_MIN) -DLINE_STEERING_RAMP_MS=$(LF_RAMP_MS)
+endif
+ifeq ($(SENSOR_TEST),junction)
+JN_ACTION_MODES := stop straight left right uturn
+ifeq ($(filter $(JN_ACTION_MODES),$(JN_ACTION)),)
+$(error Unknown JN_ACTION '$(JN_ACTION)'; use one of: $(JN_ACTION_MODES))
+endif
+JN_ACTION_VALUE := $(if $(filter stop,$(JN_ACTION)),0,$(if $(filter straight,$(JN_ACTION)),1,$(if $(filter left,$(JN_ACTION)),2,$(if $(filter right,$(JN_ACTION)),3,4))))
+CFLAGS  += -DJN_ACTION=$(JN_ACTION_VALUE) -DJN_FORWARD_MM=$(JN_FORWARD_MM)U -DJN_FORWARD_RIGHT_MM=$(JN_FORWARD_RIGHT_MM)U -DJN_AFTER_MM=$(JN_AFTER_MM)U
+CFLAGS  += -DJN_RUN_MM=$(JN_RUN_MM)U -DJN_TURN_TRIM_DEG=$(JN_TURN_TRIM_DEG) -DJN_TRACE=$(JN_TRACE)U
+CFLAGS  += -DJN_LEFT_MIN_MM=$(JN_LEFT_MIN_MM) -DJN_LEFT_MAX_MM=$(JN_LEFT_MAX_MM)
+CFLAGS  += -DJN_OFFSET_MM=$(JN_OFFSET_MM) -DJN_TOL_MM=$(JN_TOL_MM) -DJN_BOTH_MIN_MM=$(JN_BOTH_MIN_MM)
+CFLAGS  += -DJN_BLIND_MM=$(JN_BLIND_MM)U -DJN_SEEK=$(JN_SEEK)
+CFLAGS  += -DJN_SEEK_BEFORE_DEG=$(JN_SEEK_BEFORE_DEG) -DJN_SEEK_AFTER_DEG=$(JN_SEEK_AFTER_DEG)
 endif
 CFLAGS  += -DTM_CONSOLE_UART=$(CRASH_REPORT)
 ifeq ($(CRASH_REPORT),0)
@@ -329,9 +620,9 @@ endif
 # before any recipe executes.
 ################################################################################
 
-PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
+PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-net$(NET)-mqtt$(MQTT)-crash$(CRASH_REPORT)-vehicle$(VEHICLE)-noultra$(NO_ULTRASONIC)-odometry$(ODOMETRY_TEST)-test$(TEST)-sensor$(SENSOR_TEST)-servo-pulse$(SERVO_TEST_US)
 ifeq ($(SENSOR_TEST),barcode)
-PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BARCODE_TEST_WHITE_ADC)-$(BARCODE_TEST_BLACK_ADC)-debounce$(BARCODE_TEST_DEBOUNCE_COUNTS)
+PROFILE_ID := $(PROFILE_ID)-barcode-module$(BARCODE_TEST_MODULE_COUNTS)-adc$(BARCODE_TEST_WHITE_ADC)-$(BARCODE_TEST_BLACK_ADC)-debounce$(BARCODE_TEST_DEBOUNCE_COUNTS)-expect$(BARCODE_TEST_EXPECT)-drive$(BARCODE_TEST_DRIVE)-$(BARCODE_TEST_DRIVE_MM)
 endif
 ifeq ($(SENSOR_TEST),obstacle_width)
 PROFILE_ID := $(PROFILE_ID)-detect$(OBSTACLE_DETECT_MM)-truewidth$(OBSTACLE_TRUE_WIDTH_MM)
@@ -340,7 +631,22 @@ ifeq ($(SENSOR_TEST),spin_heading)
 PROFILE_ID := $(PROFILE_ID)-track$(SPIN_TRACK_MM)-pwm$(SPIN_PWM)-$(SPIN_PWM_SLOW)-trim$(SPIN_RIGHT_TRIM)
 endif
 ifeq ($(SENSOR_TEST),motor_moves)
-PROFILE_ID := $(PROFILE_ID)-pwm$(MOVE_PWM)-trim$(MOVE_TRIM_L)-$(MOVE_TRIM_R)-dist$(MOVE_DIST_MM)-track$(MOVE_TRACK_MM)-arc$(MOVE_ARC_INNER)
+PROFILE_ID := $(PROFILE_ID)-pwm$(MOVE_PWM)-trim$(MOVE_TRIM_L)-$(MOVE_TRIM_R)-dist$(MOVE_DIST_MM)-track$(MOVE_TRACK_MM)-arc$(MOVE_ARC_INNER)-skipbal$(MOVE_SKIP_BALANCE)
+endif
+ifeq ($(SENSOR_TEST),pid_tune)
+PROFILE_ID := $(PROFILE_ID)-kp$(PID_KP)-ki$(PID_KI)-kd$(PID_KD)-v$(PID_SPEED)-base$(PID_BASE)-max$(PID_MAX)-T$(PID_PERIOD_MS)-dist$(PID_DIST_MM)-air$(PID_AIR_MS)-trace$(PID_TRACE)-turn$(PID_TURN)-ff$(PID_FF)
+endif
+ifeq ($(SENSOR_TEST),spin_width)
+PROFILE_ID := $(PROFILE_ID)-track$(SPIN_TRACK_MM)-pwm$(SPIN_PWM)-$(SPIN_PWM_SLOW)-half$(SCAN_HALF_DEG)-step$(SCAN_STEP_DEG)-off$(SCAN_SENSOR_OFFSET_MM)-cl$(SCAN_CLUSTER_MM)-trim$(SCAN_TRIM_DEG)-true$(SCAN_TRUE_WIDTH_MM)-find$(SCAN_FIND_STEP_DEG)-lane$(SCAN_LANE_MM)-beyond$(SCAN_BEYOND_MM)-maxobs$(SCAN_MAX_OBSTACLE_MM)-full$(SCAN_FULL)-byp$(SCAN_BYPASS)-car$(SCAN_CAR_WIDTH_MM)-clr$(SCAN_CLEAR_MM)-mrg$(SCAN_MARGIN_MM)-v$(SCAN_SPEED_CM_S)-rej$(SCAN_REJOIN)-md$(SCAN_MIN_DEPTH_MM)-ps$(SCAN_PASS_STEP_MM)-xd$(SCAN_MAX_DEPTH_MM)
+endif
+ifeq ($(SENSOR_TEST),diag_width)
+PROFILE_ID := $(PROFILE_ID)-track$(SPIN_TRACK_MM)-pwm$(SPIN_PWM)-$(SPIN_PWM_SLOW)-ang$(DIAG_ANGLE_DEG)-v$(DIAG_SPEED_CM_S)-car$(DIAG_CAR_WIDTH_MM)-clr$(DIAG_CLEAR_MM)-out$(DIAG_PULLOUT)-bak$(DIAG_BACKUP_MM)-true$(DIAG_TRUE_WIDTH_MM)
+endif
+ifeq ($(SENSOR_TEST),line_follow)
+PROFILE_ID := $(PROFILE_ID)-v$(LF_SPEED)-turn$(LF_TURN)-min$(LF_TURN_MIN)-ramp$(LF_RAMP_MS)-ff$(LF_FF)-slope$(LF_SLOPE)-s$(LF_SLOPE_SPEED)-$(LF_SLOPE_TURN)-$(LF_SLOPE_TURN_MIN)-$(LF_SLOPE_RAMP_MS)-dist$(LF_DIST_MM)-steer$(LF_STEER_MS)-trace$(LF_TRACE)-curve$(LF_CURVE_R_MM)-track$(LF_TRACK_MM)-bc$(LF_BARCODE)-$(LF_BC_MODULE)-y$(LF_BC_SENSOR_Y_MM)-slow$(LF_BC_SLOW)-$(LF_BC_SLOW_MM)-sl$(LF_STRADDLE)-sv$(LF_SL_SPEED)-$(LF_SL_TURN)-$(LF_SL_OVERSHOOT_MS)-$(LF_SL_REC_SPEED)-$(LF_SL_REC_TURN)-$(LF_SL_BLIND_MS)-$(LF_SL_PIVOT_MAX_MS)-cs$(LF_SL_COUNTER_PCT)-$(LF_SL_COUNTER_MAX_MS)-adc$(LF_SL_BLACK_ADC)-$(LF_SL_WHITE_ADC)
+endif
+ifeq ($(SENSOR_TEST),junction)
+PROFILE_ID := $(PROFILE_ID)-act$(JN_ACTION)-fwd$(JN_FORWARD_MM)-$(JN_FORWARD_RIGHT_MM)-after$(JN_AFTER_MM)-run$(JN_RUN_MM)-trim$(JN_TURN_TRIM_DEG)-trace$(JN_TRACE)-l$(JN_LEFT_MIN_MM)-$(JN_LEFT_MAX_MM)-o$(JN_OFFSET_MM)-t$(JN_TOL_MM)-b$(JN_BOTH_MIN_MM)-blind$(JN_BLIND_MM)-seek$(JN_SEEK)-$(JN_SEEK_BEFORE_DEG)-$(JN_SEEK_AFTER_DEG)-gap$(JN_GAP_MM)-rearm$(JN_REARM_MM)-nl$(JN_NO_LINE)-sg$(JN_SEEK_GAP)-v$(LF_SPEED)-turn$(LF_TURN)-min$(LF_TURN_MIN)-ramp$(LF_RAMP_MS)-sl$(LF_STRADDLE)-sv$(LF_SL_SPEED)-$(LF_SL_TURN)-$(LF_SL_OVERSHOOT_MS)-$(LF_SL_REC_SPEED)-$(LF_SL_REC_TURN)-$(LF_SL_BLIND_MS)-$(LF_SL_PIVOT_MAX_MS)-cs$(LF_SL_COUNTER_PCT)-$(LF_SL_COUNTER_MAX_MS)-adc$(LF_SL_BLACK_ADC)-$(LF_SL_WHITE_ADC)
 endif
 PROFILE_FILE := .build_profile
 

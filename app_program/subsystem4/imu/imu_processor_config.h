@@ -9,6 +9,17 @@
 #define OVERTURN_MIN_AZ    6.5f // catches gentle lift deceleration
 
 #define TILT_THRESHOLD_DEG 30.0f
+/* A tilt (lifted or overturned) clears once the attitude has been normal
+ * for this long, so the robot can be started again after being put down
+ * (the controller still needs a fresh GO press). */
+#define IMU_TILT_CLEAR_MS 1000U
+/* Vehicle: lifted/overturned only counts once the raw attitude has stayed
+ * past the limits this long (4 samples). The check uses the unfiltered
+ * reading, and a bump over a tape seam, the caster jolting or the jerk of a
+ * junction spin can put one sample past them (az < 6.5, roll > 15 deg) and
+ * stopped the run; a real lift lasts far longer (and pick-up is also caught
+ * by the line sensors). */
+#define IMU_TILT_CONFIRM_MS 200U
 
 /* Robot geometry: two rear drive wheels and one front-centre ball caster.
  * Measured between ground contact points. */
@@ -19,6 +30,14 @@
  * once every contact is back within IMU_HUMP_END_M. Real floors vary by
  * about 1-1.5 deg (2-3 mm across the robot), so stay above that. */
 #define IMU_HUMP_START_M   0.005f
+/* Vehicle: a hump starts only once the height has stayed above
+ * IMU_HUMP_START_M this long. The accelerometer cannot tell tilt from
+ * acceleration: speeding up or braking at 1 m/s^2 reads as ~6 deg of pitch
+ * (5 mm needs only 3.6 deg pitch or 2.5 deg roll on this chassis), and line
+ * steering, junction stops and spins do that for a few hundred ms at a time;
+ * a ramp tilts the robot for seconds. Raise it if level ground still shows
+ * humps; lower it if ramp mode engages too late on the ramp. */
+#define IMU_HUMP_CONFIRM_MS 400U
 #define IMU_HUMP_END_M     0.003f
 #define MIN_HUMP_HEIGHT_M  0.005f /* smallest peak worth reporting */
 

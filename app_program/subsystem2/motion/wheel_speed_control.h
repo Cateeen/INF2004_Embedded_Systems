@@ -33,6 +33,19 @@ typedef struct
 
     uint8_t base_pwm_percent;
     uint8_t max_pwm_percent;
+
+    /*
+     * Optional per-wheel feed-forward. Each wheel's PID corrects around
+     *   base_pwm_percent + ff_pwm_per_cm_s * (that wheel's target - ff_ref_speed_cm_s)
+     * (clamped to 0..max), i.e. base_pwm_percent is the PWM that holds
+     * ff_ref_speed_cm_s. Steering then lands immediately: the inner wheel of
+     * a turn starts lower and the outer higher, instead of both starting at
+     * base and waiting for the integral. 0 (the default when omitted) keeps
+     * the flat base for both wheels. ff_ref_speed_cm_s must be > 0 when
+     * ff_pwm_per_cm_s > 0.
+     */
+    float ff_pwm_per_cm_s;
+    float ff_ref_speed_cm_s;
 } wheel_speed_config_t;
 
 typedef struct
@@ -41,6 +54,10 @@ typedef struct
     pid_controller_t right_pid;
 
     wheel_speed_config_t config;
+
+    /* Per-wheel targets; both start at config.target_speed_cm_s. */
+    float left_target_cm_s;
+    float right_target_cm_s;
 
     bool initialized;
 } wheel_speed_control_t;
@@ -78,6 +95,32 @@ bool wheel_speed_control_update(
     float left_speed_cm_s,
     float right_speed_cm_s,
     float dt_seconds,
+    wheel_speed_output_t *output);
+
+/*
+ * Set separate target speeds for steering
+ * (cm/s magnitudes, both finite and > 0).
+ *
+ * PID state is kept so steering changes are
+ * smooth. Returns false and changes nothing
+ * if a target is invalid.
+ */
+bool wheel_speed_control_set_targets(
+    wheel_speed_control_t *controller,
+    float left_target_cm_s,
+    float right_target_cm_s);
+
+/*
+ * PWM for the current targets from the last measured speeds, WITHOUT
+ * advancing the PIDs (no integration, no stored-error change): lets a new
+ * steering target act at once instead of waiting for the next speed
+ * sample. The next wheel_speed_control_update continues as normal.
+ * Returns false (output unchanged) on invalid input.
+ */
+bool wheel_speed_control_retarget_output(
+    const wheel_speed_control_t *controller,
+    float left_speed_cm_s,
+    float right_speed_cm_s,
     wheel_speed_output_t *output);
 
 /*

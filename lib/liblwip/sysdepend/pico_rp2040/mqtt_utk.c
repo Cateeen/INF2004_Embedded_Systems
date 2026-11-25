@@ -16,12 +16,15 @@
  */
 
 #include "lwip/apps/mqtt.h"
+#include "lwip/apps/mqtt_priv.h"	/* client->conn, to turn Nagle off */
+#include "lwip/altcp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/timeouts.h"
 #include "wifi_secrets.h"
 #include "mqtt_utk.h"
 #include "../../../../app_program/subsystem1/wifi/wifi_mqtt_bridge_owner.h"
 #include "../../../../app_program/subsystem1/wifi/wifi_telemetry.h"
+#include "../../../../app_program/subsystem1/wifi/dashboard_link_owner.h"
 #include <tm/tmonitor.h>
 
 #define MQTT_UTK_HEARTBEAT_MS   5000
@@ -66,10 +69,35 @@ static int telemetry_publish(const uint8_t *payload)
 	return WIFI_MQTT_PUBLISH_ERROR;
 }
 
+/* Dashboard topics (robot/event, robot/telemetry/detail, robot/barcode).
+ * Failures are logged and the message dropped -- dashboard events must not
+ * stop the telemetry bridge or the car. */
+static void dashboard_done_cb(void *arg, err_t result)
+{
+	(void)arg;
+	if(result != ERR_OK) {
+		tm_printf((UB*)"mqtt: dashboard publish failed, err=%d\n", (int)result);
+	}
+}
+
+static int dashboard_publish(const char *topic, const uint8_t *payload, uint16_t length)
+{
+	err_t	err;
+
+	if(topic == NULL) return WIFI_MQTT_PUBLISH_ERROR;
+	err = mqtt_publish(client, topic, payload, length, 0, 0, dashboard_done_cb, NULL);
+	if(err == ERR_OK) return WIFI_MQTT_PUBLISH_OK;
+	if(err == ERR_MEM) return WIFI_MQTT_PUBLISH_BUSY;
+	tm_printf((UB*)"mqtt: dashboard publish rejected, err=%d\n", (int)err);
+	return WIFI_MQTT_PUBLISH_ERROR;
+}
+
 void mqtt_utk_poll(int link_up)
 {
-	wifi_mqtt_bridge_poll(telemetry_publish, link_up,
-			      link_up && client != NULL && mqtt_client_is_connected(client));
+	int	mqtt_ready = link_up && client != NULL && mqtt_client_is_connected(client);
+
+	wifi_mqtt_bridge_poll(telemetry_publish, link_up, mqtt_ready);
+	dashboard_link_owner_poll(dashboard_publish, mqtt_ready);
 }
 
 /* mqtt.c NUL-terminates the topic before handing it over, but it is only
@@ -98,16 +126,22 @@ static void incoming_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags)
 
 	for(i = 0; i < len; i++) {
 		if(rx_len < (MQTT_UTK_RX_DATA_MAX - 1)) {
-			/* The console is a terminal -- keep raw bytes from a
-			 * payload this demo did not publish from scrambling it. */
-			UB c = data[i];
-			rx_data[rx_len++] = (c >= 0x20 && c < 0x7f)? c: '.';
+			rx_data[rx_len++] = data[i];
 		} else {
 			rx_truncated = 1;
 		}
 	}
 
 	if((flags & MQTT_DATA_FLAG_LAST) != 0) {
+		/* Binary dashboard commands (robot/command) need the raw bytes. */
+		if(!rx_truncated) {
+			dashboard_link_owner_on_message(rx_topic, rx_data, rx_len);
+		}
+		/* The console is a terminal -- keep raw bytes from a payload
+		 * this demo did not publish from scrambling it. */
+		for(i = 0; i < rx_len; i++) {
+			if(rx_data[i] < 0x20 || rx_data[i] >= 0x7f) rx_data[i] = '.';
+		}
 		rx_data[rx_len] = '\0';
 		tm_printf((UB*)"mqtt: RX [%s] \"%s\"%s\n", rx_topic, rx_data,
 			  rx_truncated? " (truncated)": "");
@@ -121,6 +155,16 @@ static void subscribe_done_cb(void *arg, err_t result)
 		tm_printf((UB*)"mqtt: subscribed to " MQTT_TOPIC "\n");
 	} else {
 		tm_printf((UB*)"mqtt: subscribe failed, err=%d\n", (int)result);
+	}
+}
+
+static void command_subscribe_done_cb(void *arg, err_t result)
+{
+	(void)arg;
+	if(result == ERR_OK) {
+		tm_printf((UB*)"mqtt: subscribed to " DASHBOARD_COMMAND_TOPIC "\n");
+	} else {
+		tm_printf((UB*)"mqtt: robot/command subscribe failed, err=%d\n", (int)result);
 	}
 }
 
@@ -141,11 +185,27 @@ static void heartbeat_timeout(void *arg)
 	(void)arg;
 
 	if(mqtt_client_is_connected(client)) {
+		UB	dashboard_hb[2];
+
+		/* Binary heartbeat for the dashboard's MQTT link card. */
+		if(dashboard_link_owner_heartbeat(dashboard_hb)) {
+			(void)mqtt_publish(client, DASHBOARD_HEARTBEAT_TOPIC, dashboard_hb,
+					   (u16_t)sizeof(dashboard_hb), 0, 0,
+					   publish_done_cb, NULL);
+		}
+		err_t	err;
+
 		len = tm_sprintf(payload, (const UB*)"hb %u", count++);
-		tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\"\n", payload);
-		(void)mqtt_publish(client, MQTT_TOPIC, payload, (u16_t)len,
+		err = mqtt_publish(client, MQTT_TOPIC, payload, (u16_t)len,
 				   0 /* qos */, 0 /* retain */,
 				   publish_done_cb, NULL);
+		if(err == ERR_OK) {
+			tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\"\n", payload);
+		} else {
+			tm_printf((UB*)"mqtt: TX [" MQTT_TOPIC "] \"%s\" NOT SENT, err=%d%s\n",
+				  payload, (int)err,
+				  err == ERR_MEM ? " (output buffer or request slots full)" : "");
+		}
 	}
 
 	/* Re-arms itself every call -- mqtt.c's connection callback (below)
@@ -177,6 +237,12 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t 
 
 		tm_printf((UB*)"mqtt: connected to " MQTT_BROKER_IP "\n");
 
+		/* Send each small publish at once. With Nagle on, TCP holds a
+		 * small segment until the previous one is ACKed, and Windows
+		 * delays ACKs by up to 200 ms: telemetry queued up behind that
+		 * and went stale. */
+		if(c != NULL && c->conn != NULL) altcp_nagle_disable(c->conn);
+
 		/* Subscribe to the same topic this client publishes to, so every
 		 * heartbeat comes back from the broker and is printed by
 		 * incoming_data_cb(). A matching RX for each TX is end-to-end
@@ -190,6 +256,15 @@ static void connection_cb(mqtt_client_t *c, void *arg, mqtt_connection_status_t 
 				     subscribe_done_cb, NULL);
 		if(err != ERR_OK) {
 			tm_printf((UB*)"mqtt: mqtt_subscribe() failed, err=%d\n",
+				  (int)err);
+		}
+
+		/* Junction instructions and Start/Stop from the dashboard,
+		 * handled by dashboard_link_owner_on_message(). */
+		err = mqtt_subscribe(client, DASHBOARD_COMMAND_TOPIC, 0 /* qos */,
+				     command_subscribe_done_cb, NULL);
+		if(err != ERR_OK) {
+			tm_printf((UB*)"mqtt: robot/command subscribe failed, err=%d\n",
 				  (int)err);
 		}
 

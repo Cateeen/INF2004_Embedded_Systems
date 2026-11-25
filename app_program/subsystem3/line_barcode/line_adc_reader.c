@@ -6,7 +6,6 @@
 #define LINE_ADC_OVERSAMPLES 8U
 #define LINE_ADC_MAX_VALUE 4095U
 #define LINE_ADC_FIRST_PIN 26U
-#define LINE_ADC_BLACK_THRESHOLD 1000U
 
 static line_adc_reader_t s_task_reader;
 static line_adc_config_t s_task_reader_config;
@@ -47,9 +46,9 @@ ER line_adc_reader_default_config(line_adc_config_t *config,
 				  uint32_t max_sample_span_ms)
 {
 	line_adc_config_t imported = {
-		{2U, LINE_ADC_BLACK_THRESHOLD, true},
-		{1U, LINE_ADC_BLACK_THRESHOLD, true},
-		{0U, LINE_ADC_BLACK_THRESHOLD, true},
+		{2U, LINE_ADC_BARCODE_BLACK_THRESHOLD, true},
+		{1U, LINE_ADC_LINE_BLACK_THRESHOLD, true},
+		{0U, LINE_ADC_LINE_BLACK_THRESHOLD, true},
 		max_sample_span_ms
 	};
 
@@ -138,8 +137,31 @@ static ER read_channel(line_adc_reader_t *reader, const line_adc_channel_t *chan
 	return E_OK;
 }
 
+/* A sample whose span is over budget was interrupted (another task or an
+ * interrupt ran in the middle of it): it is discarded and re-read, up to
+ * this many attempts in all, before the reader faults. */
+#define LINE_ADC_SAMPLE_ATTEMPTS 3U
+
+static ER read_sample_once(line_adc_reader_t *reader, ir_readings_t *readings,
+			   uint32_t *timestamp_ms, bool line, bool barcode, bool last);
+
 static ER read_sample(line_adc_reader_t *reader, ir_readings_t *readings,
 		      uint32_t *timestamp_ms, bool line, bool barcode)
+{
+	unsigned attempt;
+	ER er = E_TMOUT;
+
+	for (attempt = 1U; attempt <= LINE_ADC_SAMPLE_ATTEMPTS; attempt++) {
+		er = read_sample_once(reader, readings, timestamp_ms, line, barcode,
+				      attempt == LINE_ADC_SAMPLE_ATTEMPTS);
+		if (er != E_BUSY) break;
+	}
+	return er;
+}
+
+/* E_BUSY: over the span budget and not the last attempt (retry). */
+static ER read_sample_once(line_adc_reader_t *reader, ir_readings_t *readings,
+			   uint32_t *timestamp_ms, bool line, bool barcode, bool last)
 {
 	ir_readings_t result = {0};
 	SYSTIM start, barcode_start, end;
@@ -176,7 +198,9 @@ static ER read_sample(line_adc_reader_t *reader, ir_readings_t *readings,
 		goto fault;
 	}
 	if (end_ms - start_ms > reader->config.max_sample_span_ms) {
-		tm_printf((UB*)"line ADC sample span exceeded budget: limit=%u ms\n",
+		if (!last) return E_BUSY;
+		tm_printf((UB*)"line ADC sample span exceeded budget %u times: limit=%u ms\n",
+			  (unsigned)LINE_ADC_SAMPLE_ATTEMPTS,
 			  (unsigned)reader->config.max_sample_span_ms);
 		er = E_TMOUT;
 		goto fault;
@@ -254,10 +278,10 @@ BOOL line_adc_reader_test(void)
 		      imported.barcode.threshold == 1000U &&
 		      imported.barcode.black_above &&
 		      imported.center.channel == 1U &&
-		      imported.center.threshold == 1000U &&
+		      imported.center.threshold == LINE_ADC_LINE_BLACK_THRESHOLD &&
 		      imported.center.black_above &&
 		      imported.right.channel == 0U &&
-		      imported.right.threshold == 1000U &&
+		      imported.right.threshold == LINE_ADC_LINE_BLACK_THRESHOLD &&
 		      imported.right.black_above &&
 		      imported.max_sample_span_ms == 25U;
 	imported_ok = imported_ok &&
@@ -266,7 +290,8 @@ BOOL line_adc_reader_test(void)
 
 	TEST_CHECK("ADC-U01", config_ok, "channel ownership and sample limits");
 	TEST_CHECK("ADC-U02", threshold_ok, "per-sensor black polarity");
-	TEST_CHECK("ADC-U03", imported_ok, "original ADC channel and threshold migration");
+	TEST_CHECK("ADC-U03", imported_ok,
+		   "original ADC channels; line sensors black above 1200, barcode above 1000");
 	TEST_SUMMARY("line ADC reader");
 	return config_ok && threshold_ok && imported_ok;
 }

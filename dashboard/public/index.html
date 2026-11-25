@@ -6,30 +6,74 @@
     <div class="brandmark">P<span>◆</span></div>
     <div class="railsection">MISSION 01</div>
     <a class="navitem active" href="#overview"><span>▦</span> Overview</a>
-    <a class="navitem" href="#sensors"><span>⌁</span> Sensors</a>
+    <a class="navitem" href="#mapping"><span>⇄</span> Barcode mapping</a>
+    <a class="navitem" href="#sensors"><span>⌁</span> Subsystems</a>
     <a class="navitem" href="#activity"><span>☷</span> Activity log</a>
-    <div class="railbottom"><div class="sidecaption">SYSTEM</div><div class="systemlabel"><span class="signal" id="side-dot"></span><span id="side-state">Starting…</span></div><div class="sidecaption" style="margin-top:16px">PROJECT</div><p>INF2004<br>Autonomous Robotic Car</p></div>
+    <div class="railbottom"><div class="sidecaption">SYSTEM</div><div class="systemlabel"><span class="signal" id="side-dot"></span><span id="side-state">Starting…</span></div><div class="sidecaption sidegap">PROJECT</div><p>INF2004<br>Autonomous Robotic Car</p></div>
   </aside>
   <main class="main" id="overview">
-    <header class="topbar"><div><div class="eyebrow">INF2004 / AUTONOMOUS VEHICLE</div><h1>Mission Control <span class="spark">✦</span></h1><p class="subtitle">Real-time visibility into every decision your PicoCar makes.</p></div><div class="topcontrols"><div class="pill" id="connection-pill"><span class="signal" id="connection-dot"></span><span id="connection-text">Starting…</span></div><div class="clockbox"><div class="tiny">LOCAL TIME</div><div id="localtime">--:--:--</div></div></div></header>
-    <div id="stale-banner" class="alert hidden">No recent Pico W telemetry. Real readings are shown as unavailable until a valid packet arrives.</div>
-    <section class="kpi-grid">
-      <div class="kpi"><div class="kpi-label">CURRENT STATE <span>↗</span></div><div class="kpi-value small" id="vehicle-status">—</div><div class="kpi-foot"><span class="mini-icon blue">◉</span><span id="vehicle-hint">Waiting for telemetry</span></div></div>
-      <div class="kpi"><div class="kpi-label">WHEEL SPEED <span>⌁</span></div><div class="kpi-value"><span id="speed">—</span><span class="unit"> m/s</span></div><div class="kpi-foot">Measured speed · <span id="speed-src">not available</span></div></div>
-      <div class="kpi"><div class="kpi-label">DISTANCE TRAVELED <span>↗</span></div><div class="kpi-value"><span id="distance">—</span><span class="unit"> m</span></div><div class="kpi-foot">Encoder-derived · <span id="distance-src">not available</span></div></div>
-      <div class="kpi"><div class="kpi-label">SAFETY STATUS <span>⬡</span></div><div class="kpi-value small" id="safety-status">—</div><div class="kpi-foot" id="safety-note">Awaiting fault state</div></div>
+    <header class="topbar">
+      <div><div class="eyebrow">INF2004 / AUTONOMOUS VEHICLE</div><h1>Mission Control <span class="spark">✦</span></h1><p class="subtitle">Live telemetry and junction instructions for the PicoCar over MQTT.</p></div>
+      <div class="topcontrols">
+        <div class="pill runpill" id="run-pill"><span class="signal" id="run-dot"></span><span id="run-text">Robot idle</span></div>
+        <div class="pill" id="connection-pill"><span class="signal" id="connection-dot"></span><span id="connection-text">Starting…</span></div>
+      </div>
+    </header>
+
+    <div id="preview-banner" class="alert preview hidden">PREVIEW MODE — simulated demo run. Nothing is sent to or received from the car.</div>
+    <div id="pickup-banner" class="pickup hidden"><span>■</span><div><strong>CAR PICKED UP — MOTORS STOPPED</strong><small id="pickup-detail">End of demo</small></div></div>
+    <div id="stale-banner" class="alert hidden">No recent Pico W telemetry. Live readings show as unavailable until a valid packet arrives. Checklist evidence is kept.</div>
+
+    <section class="hero-grid">
+      <div class="kpi nextjunction" id="next-card">
+        <div class="kpi-label">NEXT JUNCTION <span>⤳</span></div>
+        <div class="nj-body"><div class="nj-icon" id="nj-icon">↰</div><div><div class="nj-action" id="nj-action">TURN LEFT</div><div class="nj-source" id="nj-source">Default — no barcode decoded yet</div></div></div>
+      </div>
+      <div class="kpi"><div class="kpi-label">CURRENT STATE <span>↗</span></div><div class="kpi-value small" id="vehicle-status">—</div><div class="kpi-foot" id="vehicle-hint">Waiting for telemetry</div></div>
     </section>
+
     <div class="main-grid">
-      <section class="panel controls"><div class="sectionheading"><div><div class="eyebrow">OPERATOR CONSOLE</div><h2>Vehicle control</h2></div><span class="tag warning">LIVE MQTT</span></div><div class="controlnote"><span class="icon-warn">⚑</span><div><strong>Physical movement control</strong><p>Commands are sent to the robot over MQTT. Calibrate movement durations and distances in the vehicle controller before driving.</p></div></div><div class="controls-grid vehicle-controls"><button id="robot-start" class="action-primary">▶ Start</button><button id="robot-stop" class="action-stop">■ Stop</button><button id="forward" data-command="forward" class="action-ghost">↑ Forward</button><button id="reverse" data-command="reverse" class="action-ghost">↓ Reverse</button><button id="left" data-command="left" class="action-ghost">↶ Turn left</button><button id="right" data-command="right" class="action-ghost">↷ Turn right</button><button id="uturn" data-command="uturn" class="action-ghost">↻ U-turn 180°</button></div><div class="separator"></div><div class="smalllabel">JUNCTION BARCODE MAPPING</div><div class="mapping-grid"><label>Character<select id="mapping-letter"><option value="A">A</option><option value="B">B</option><option value="C">C</option><option value="D">D</option><option value="E">E</option><option value="F">F</option><option value="G">G</option><option value="H">H</option><option value="I">I</option><option value="J">J</option><option value="K">K</option><option value="L">L</option><option value="M">M</option><option value="N">N</option><option value="O">O</option><option value="P">P</option><option value="Q">Q</option><option value="R">R</option><option value="S">S</option><option value="T">T</option><option value="U">U</option><option value="V">V</option><option value="W">W</option><option value="X">X</option><option value="Y">Y</option><option value="Z">Z</option></select></label><label>Movement<select id="mapping-movement"><option value="forward">Forward</option><option value="uturn">U-turn</option><option value="left">Left</option><option value="right">Right</option></select></label><button id="save-mapping" class="action-ghost">Save mapping</button></div><p class="disabledcaption">Mappings are retained by the dashboard and sent with the decoded barcode at the next junction.</p></section>
-      <section class="panel sensorpanel" id="sensors"><div class="sectionheading"><div><div class="eyebrow">SENSOR SUITE</div><h2>System telemetry</h2></div><span class="tag muted">LIVE DATA</span></div><div class="sensorrows">
-        <div class="sensorrow"><div class="sensorbadge">01</div><div><strong>Wi-Fi / MQTT</strong><small>Packet sequence & connectivity</small></div><div class="sensorright"><strong id="mqtt-status">—</strong><small id="mqtt-details">Broker unavailable</small></div></div>
-        <div class="sensorrow"><div class="sensorbadge">02</div><div><strong>IR sensors</strong><small>Barcode, centre, right readings</small></div><div class="sensorright"><strong id="ir-status">—</strong><small id="ir-details">No readings</small></div></div>
-        <div class="sensorrow"><div class="sensorbadge">03</div><div><strong>Barcode</strong><small>Decoded junction marker</small></div><div class="sensorright"><strong id="barcode-status">—</strong><small id="barcode-details">Barcode unavailable</small></div></div>
-        <div class="sensorrow"><div class="sensorbadge">04</div><div><strong>Terrain / hump</strong><small>Hump event and measured height</small></div><div class="sensorright"><strong id="terrain-status">—</strong><small id="imu-details">Height unavailable</small></div></div>
-        <div class="sensorrow"><div class="sensorbadge">05</div><div><strong>Obstacle system</strong><small>Ultrasonic distance</small></div><div class="sensorright"><strong id="obs-status">—</strong><small id="obs-details">No distance data</small></div></div>
-      </div></section>
+      <section class="panel" id="mapping">
+        <div class="sectionheading"><div><div class="eyebrow">BARCODE NAVIGATION</div><h2>Character → instruction mapping</h2></div><span class="tag muted" id="last-barcode-tag">NO BARCODE YET</span></div>
+        <div class="mapping-grid"><label>Character<select id="mapping-letter"></select></label><label>Instruction<select id="mapping-movement"><option value="forward">↑ Go straight</option><option value="left">↰ Turn left</option><option value="right">↱ Turn right</option><option value="uturn">↻ U-turn</option></select></label><button id="save-mapping" class="action-ghost">Save</button></div>
+        <div class="letter-grid" id="letter-grid"></div>
+        <p class="caption">Click a letter to edit it. If you remap the most recently decoded letter, the new instruction is resent to the car straight away. The amber letter is the most recently decoded one.</p>
+      </section>
+
+      <section class="panel controls">
+        <div class="sectionheading"><div><div class="eyebrow">OPERATOR CONSOLE</div><h2>Run control</h2></div><span class="tag warning" id="link-tag">LIVE MQTT</span></div>
+        <div class="controls-grid"><button id="robot-toggle" class="action-primary robot-toggle">▶ Start run</button></div>
+        <div class="separator"></div>
+        <div class="sectionheading tight"><div class="smalllabel">RECENT BARCODES</div><button class="textbutton" id="reset-run">↺ Reset run</button></div>
+        <div class="barcode-list" id="barcode-list"><div class="emptylog">No barcodes read this run</div></div>
+      </section>
     </div>
-    <section class="panel logpanel" id="activity"><div class="sectionheading"><div><div class="eyebrow">DECISION HISTORY</div><h2>Event timeline</h2></div><div><button class="textbutton" id="clear-log">Clear data</button><button class="textbutton" id="download-log">↓ Export CSV</button></div></div><div class="loghead"><span>TIME</span><span>TYPE</span><span>EVENT</span></div><div id="event-list" class="loglist"><div class="emptylog">Waiting for events…</div></div></section>
-    <footer><span>PicoCar / INF2004 · Mission Control v1.0</span><span>Local dashboard · LIVE mode = real MQTT data only</span></footer>
+
+    <section class="sub-grid" id="sensors">
+      <div class="panel card">
+        <div class="cardhead"><span class="sensorbadge">IR</span><div><strong>Line following</strong><small>Buddy 3</small></div><span class="chip" id="line-chip">—</span></div>
+        <div class="bigstat word" id="line-word">—</div>
+        <dl class="facts"><dt>Line lost</dt><dd id="line-losses">—</dd><dt>Bend pivots</dt><dd id="line-pivots">—</dd><dt>Line searches</dt><dd id="line-searches">—</dd><dt>IR (L / C / R)</dt><dd id="ir-raw">not sent</dd></dl>
+      </div>
+      <div class="panel card">
+        <div class="cardhead"><span class="sensorbadge">IMU</span><div><strong>Hump / terrain</strong><small>Buddy 4</small></div><span class="chip" id="terrain-chip">—</span></div>
+        <div class="bigstat"><span id="hump-peak">—</span><small> cm peak</small></div>
+        <dl class="facts"><dt>Current height</dt><dd id="hump-now">—</dd><dt>Peak = highest hump this run</dt><dd></dd></dl>
+      </div>
+      <div class="panel card">
+        <div class="cardhead"><span class="sensorbadge">US</span><div><strong>Obstacle profile</strong><small>Buddy 5</small></div><span class="chip" id="obstacle-chip">—</span></div>
+        <div class="bigstat"><span id="obs-width">—</span><small> cm wide</small></div>
+        <div class="clearbar" aria-label="Left clearance, obstacle width, right clearance"><span class="seg left" id="seg-left"></span><span class="seg mid" id="seg-mid"></span><span class="seg right" id="seg-right"></span></div>
+        <dl class="facts"><dt>Distance</dt><dd id="obs-dist">—</dd><dt>Clearance L / R</dt><dd id="obs-clear">—</dd><dt>Bypass side</dt><dd id="obs-side">—</dd></dl>
+      </div>
+      <div class="panel card">
+        <div class="cardhead"><span class="sensorbadge">Wi-Fi</span><div><strong>MQTT link</strong><small>Buddy 1</small></div><span class="chip" id="mqtt-chip">—</span></div>
+        <div class="bigstat"><span id="mqtt-rate">—</span><small> msg/s</small></div>
+        <dl class="facts"><dt>Last packet</dt><dd id="mqtt-age">—</dd><dt>Heartbeat</dt><dd id="mqtt-hb">—</dd><dt>Valid / rejected</dt><dd id="mqtt-count">—</dd></dl>
+      </div>
+    </section>
+
+    <section class="panel logpanel" id="activity"><div class="sectionheading"><div><div class="eyebrow">DECISION HISTORY</div><h2>Event timeline</h2></div><div><button class="textbutton" id="clear-log">Clear log</button><button class="textbutton" id="download-log">↓ Export CSV</button></div></div><div class="loghead"><span>TIME</span><span>TYPE</span><span>EVENT</span></div><div id="event-list" class="loglist"><div class="emptylog">Waiting for events…</div></div></section>
+    <footer><span>PicoCar / INF2004 · Mission Control v2.0</span><span id="footer-mode">Local dashboard · real MQTT data only</span></footer>
   </main>
 </div><script src="/app.js"></script></body></html>

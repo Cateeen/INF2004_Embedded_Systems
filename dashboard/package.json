@@ -5,6 +5,7 @@
   "description": "Read-only MQTT telemetry dashboard and isolated presentation simulator for INF2004 PicoCar",
   "scripts": {
     "start": "node server.js",
+    "preview": "node server.js --preview",
     "test": "node --test"
   },
   "dependencies": {

@@ -158,6 +158,9 @@ typedef struct {
     uint16_t confidence;
     uint8_t line_detected;
     uint8_t intersection_detected;
+    /* 1 while all three IR sensors have read black (no floor) for
+     * LINE_PICKUP_MS: the robot has been lifted. Appended. */
+    uint8_t picked_up;
 } line_observation_message_t;
 
 typedef struct {
@@ -230,6 +233,9 @@ typedef struct {
     uint8_t active;
     uint8_t faulted;
     uint16_t fault_code;
+    /* 1 while the motors are lent (motion_task_borrow_motors): motor_*_pwm
+     * are then the borrower's outputs. Appended. */
+    uint8_t lent;
 } motion_status_message_t;
 
 typedef struct {
@@ -266,7 +272,7 @@ typedef struct {
  * These limits describe the initial queue contract. They are not µT-Kernel
  * object IDs; the task startup module will create the actual message buffers.
  */
-#define VEHICLE_MB_LINE_CAPACITY       4U
+#define VEHICLE_MB_LINE_CAPACITY       8U   /* line task 10 ms, controller ~50-60 ms */
 #define VEHICLE_MB_BARCODE_CAPACITY    8U
 #define VEHICLE_MB_IMU_CAPACITY        2U
 #define VEHICLE_MB_OBSTACLE_CAPACITY   4U

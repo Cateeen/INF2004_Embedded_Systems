@@ -278,10 +278,10 @@ BOOL line_adc_reader_test(void)
 		      imported.barcode.threshold == 1000U &&
 		      imported.barcode.black_above &&
 		      imported.center.channel == 1U &&
-		      imported.center.threshold == 1500U &&
+		      imported.center.threshold == LINE_ADC_LINE_BLACK_THRESHOLD &&
 		      imported.center.black_above &&
 		      imported.right.channel == 0U &&
-		      imported.right.threshold == 1500U &&
+		      imported.right.threshold == LINE_ADC_LINE_BLACK_THRESHOLD &&
 		      imported.right.black_above &&
 		      imported.max_sample_span_ms == 25U;
 	imported_ok = imported_ok &&
@@ -291,7 +291,7 @@ BOOL line_adc_reader_test(void)
 	TEST_CHECK("ADC-U01", config_ok, "channel ownership and sample limits");
 	TEST_CHECK("ADC-U02", threshold_ok, "per-sensor black polarity");
 	TEST_CHECK("ADC-U03", imported_ok,
-		   "original ADC channels; line sensors black above 1500, barcode above 1000");
+		   "original ADC channels; line sensors black above 1200, barcode above 1000");
 	TEST_SUMMARY("line ADC reader");
 	return config_ok && threshold_ok && imported_ok;
 }

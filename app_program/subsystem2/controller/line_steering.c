@@ -68,18 +68,53 @@ line_steering_command_t line_steering_update(
 		if (!steering->line_lost) {
 			steering->line_lost = true;
 			steering->lost_since_ms = now_ms;
+			steering->lost_ramp_ms = steering->ramp_ms;  /* turning, or not */
+		}
+		if (steering->slope) {
+			/* On a hump (a straight): drive straight blind, no stop,
+			 * capped; the normal 300 ms counts from the hump's end. */
+			if (!steering->slope_lost) {
+				steering->slope_lost = true;
+				steering->slope_lost_since_ms = now_ms;
+			}
+			if ((uint32_t)(now_ms - steering->slope_lost_since_ms) >=
+			    (uint32_t)LINE_STEERING_SLOPE_LOST_MAX_MS) {
+				steering->stop_latched = true;
+				return stop;
+			}
+			steering->lost_since_ms = now_ms;
+			steering->last_linear_cm_s = profile->speed_cm_s;
+			steering->last_turn_cm_s = 0;
+			command.linear_cm_s = profile->speed_cm_s;
+			command.turn_cm_s = 0;
+			return command;
 		}
 		if ((uint32_t)(now_ms - steering->lost_since_ms) >= LOST_CONTINUE_MS) {
 			steering->stop_latched = true;
 			return stop;
 		}
-		/* Repeat the last command; the build-up is left as it was. */
+		/* Keep turning towards the side the line was last seen on, and
+		 * keep BUILDING the turn as if that side were still seen (right-
+		 * edge following: on a left curve the tape escapes left past the
+		 * centre sensor, often while the build-up is still small, and
+		 * holding that weak turn ran wide). A brief loss on a straight
+		 * barely changes the turn (no swing); on a curve the build-up is
+		 * already high and carries on to full. Lost on a hump keeps
+		 * going straight (slope_lost). */
 		command.linear_cm_s = steering->last_linear_cm_s;
 		command.turn_cm_s = steering->last_turn_cm_s;
+		if (!steering->slope_lost && steering->side != 0) {
+			steering->ramp_ms += dt;
+			if (steering->ramp_ms > profile->ramp_ms)
+				steering->ramp_ms = profile->ramp_ms;
+			command.turn_cm_s = (int16_t)(steering->side *
+				line_steering_ramp_turn(profile, steering->ramp_ms));
+		}
 		return command;
 	}
 
 	steering->line_lost = false;
+	steering->slope_lost = false;
 	switch (position) {
 	case POS_JUNCTION:
 		/* Centred: drive straight, and bleed the build-up off so a brief

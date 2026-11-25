@@ -216,6 +216,12 @@ ER dashboard_report_line_rejoined(void)
 		      dashboard_msg_simple_event(DASHBOARD_EVENT_LINE_REJOINED, payload));
 }
 
+ER dashboard_report_line_event(dashboard_line_event_t event)
+{
+	char payload[DASHBOARD_MSG_PAYLOAD_MAX];
+	return submit(DASHBOARD_TOPIC_EVENT, payload, dashboard_msg_line_event(event, payload));
+}
+
 /* ---- From the dashboard ----------------------------------------------------- */
 
 dashboard_turn_t dashboard_next_junction(void)
@@ -352,7 +358,10 @@ BOOL dashboard_link_test(void)
 						   DASHBOARD_SIDE_RIGHT, text) > 0U &&
 		    dashboard_msg_heartbeat(1U, 200U, heartbeat) &&
 		    heartbeat[0] == 0x24U && heartbeat[1] == 72U &&
-		    !dashboard_msg_heartbeat(5U, 0U, heartbeat);
+		    !dashboard_msg_heartbeat(5U, 0U, heartbeat) &&
+		    dashboard_msg_line_event(DASHBOARD_LINE_SEARCH_CENTRED, text) == 40U &&
+		    text[0] == '{' && text[39] == '}' &&	/* {"type":"LINE","event":"SEARCH_CENTRED"} */
+		    dashboard_msg_line_event((dashboard_line_event_t)9, text) == 0U;
 
 	/* Junction default, update, reset; Start resets; run command once. */
 	command_ok = dashboard_next_junction() == DASHBOARD_TURN_LEFT;

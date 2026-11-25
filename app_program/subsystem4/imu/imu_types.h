@@ -40,6 +40,9 @@ typedef struct {
     bool            shock_detected; /* collision detection is disabled */
     bool            tilt_detected;  /* until IMU_TILT_CLEAR_MS of normal attitude */
     uint32_t        last_tilt_ms;   /* last sample that was lifted or overturned */
+    uint32_t        tilt_confirm_ms;   /* 0 = a single sample counts */
+    bool            tilt_candidate;    /* past the limits, not yet confirmed */
+    uint32_t        tilt_candidate_ms; /* since this sample */
     imu_fsm_state_t fsm_state;
     imu_event_type_t motion_event;
 

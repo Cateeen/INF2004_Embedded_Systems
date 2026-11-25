@@ -71,6 +71,9 @@ bool imu_processor_init(imu_state_t *state) {
     state->hump_candidate        = false;
     state->hump_candidate_ms     = 0U;
     state->hump_candidate_distance_m = 0.0f;
+    state->tilt_confirm_ms       = 0U;
+    state->tilt_candidate        = false;
+    state->tilt_candidate_ms     = 0U;
     state->wheel_left_m          = 0.0f;
     state->wheel_right_m         = 0.0f;
     state->ball_m                = 0.0f;
@@ -87,6 +90,7 @@ bool imu_processor_init_vehicle(imu_state_t *state) {
         !imu_processor_set_terrain_filter(state, IMU_TERRAIN_FILTER_ALPHA) ||
         !imu_processor_set_mount_yaw(state, IMU_MOUNT_YAW_DEG)) return false;
     state->hump_confirm_ms = IMU_HUMP_CONFIRM_MS;
+    state->tilt_confirm_ms = IMU_TILT_CONFIRM_MS;
     return true;
 }
 
@@ -236,6 +240,12 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
 
     /* 1. Global Safety Watchdog: Lifted or Overturned (immediately disarms motors) */
     if (check_lifted_or_overturned(accel, state->current_pitch_deg, state->current_roll_deg)) {
+        if (!state->tilt_candidate) {
+            state->tilt_candidate    = true;
+            state->tilt_candidate_ms = now_ms;
+        }
+        if ((uint32_t)(now_ms - state->tilt_candidate_ms) < state->tilt_confirm_ms)
+            goto pack_telemetry;    /* maybe a jolt: wait, change nothing */
         state->tilt_detected = true;
         state->last_tilt_ms  = now_ms;
         state->hump_candidate = false;
@@ -243,6 +253,7 @@ bool imu_processor_update(imu_state_t *state, const accel_data_t *accel,
         state->fsm_state     = IMU_STATE_TILT;
         goto pack_telemetry;
     }
+    state->tilt_candidate = false;
     if (state->tilt_detected &&
         (uint32_t)(now_ms - state->last_tilt_ms) >= IMU_TILT_CLEAR_MS) {
         state->tilt_detected = false;   /* put down and level again */

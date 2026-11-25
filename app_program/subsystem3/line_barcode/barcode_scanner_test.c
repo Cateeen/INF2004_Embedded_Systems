@@ -153,6 +153,62 @@ static bool rejection_test(void)
 	       event.reject == BARCODE_REJECT_SEPARATION;
 }
 
+/* One character at any scale: a white gap, then the nine elements. */
+static bool feed_scaled(const char *pattern, int32_t *count, int32_t gap,
+			int32_t narrow, int32_t wide)
+{
+	unsigned i;
+	bool black = true;
+
+	*count += gap;
+	if (!barcode_scanner_update(&scanner, black, *count)) return false;
+	for (i = 0U; i < BARCODE_ELEMENTS; i++) {
+		*count += pattern[i] == 'w' ? wide : narrow;
+		black = !black;
+		if (!barcode_scanner_update(&scanner, black, *count)) return false;
+	}
+	return true;
+}
+
+/*
+ * Config says a 10-count module, but labels are printed bigger: the module
+ * is learned from the frame, so a 5x label (gap 50 > the old fixed 40-count
+ * limit) decodes, a smaller 0.8x one decodes, and a gap that is too big for
+ * the measured size is still rejected.
+ */
+static bool scaled_label_test(void)
+{
+	const char *star = "nwnnwnwnn";
+	const char *a = "wnnnnwnnw";
+	static const int32_t scale_x10[] = {8, 10, 25, 50, 120};
+	barcode_char_info_t event;
+	uint8_t result[1];
+	uint8_t length = 0;
+	int32_t count;
+	unsigned s;
+
+	for (s = 0U; s < sizeof(scale_x10) / sizeof(scale_x10[0]); s++) {
+		int32_t narrow = scale_x10[s];
+		int32_t wide = narrow * 5 / 2;
+		count = 0;
+		if (!barcode_scanner_init(&scanner, &config, false, count) ||
+		    !feed_scaled(star, &count, 500, narrow, wide) ||
+		    !feed_scaled(a, &count, narrow, narrow, wide) ||
+		    !feed_scaled(star, &count, narrow, narrow, wide) ||
+		    !barcode_scanner_take_result(&scanner, result, sizeof(result), &length) ||
+		    length != 1U || result[0] != 'A')
+			return false;
+	}
+
+	count = 0;
+	return barcode_scanner_init(&scanner, &config, false, count) &&
+	       feed_scaled(star, &count, 500, 50, 125) &&
+	       barcode_scanner_module_counts(&scanner) == 50U &&
+	       barcode_scanner_update(&scanner, true, count += 201) &&
+	       barcode_scanner_take_event(&scanner, &event) &&
+	       event.reject == BARCODE_REJECT_GAP && event.aborted_frame;
+}
+
 BOOL barcode_scanner_test(void)
 {
 	BOOL forward_ok;
@@ -160,6 +216,7 @@ BOOL barcode_scanner_test(void)
 	BOOL rejection_ok;
 	BOOL reversed_label_ok;
 	BOOL calibrated_ok;
+	BOOL scaled_ok;
 	TEST_INIT();
 
 	forward_ok = frame_test(1);
@@ -168,12 +225,15 @@ BOOL barcode_scanner_test(void)
 	reversed_label_ok = reversed_label_test(1) && reversed_label_test(-1);
 	calibrated_ok = calibrated_y_test(1, false) && calibrated_y_test(1, true) &&
 			calibrated_y_test(-1, false) && calibrated_y_test(-1, true);
+	scaled_ok = scaled_label_test();
 	TEST_CHECK("BAR-U01", forward_ok, "forward frame and result capacity");
 	TEST_CHECK("BAR-U02", reverse_ok, "reverse frame and payload order");
 	TEST_CHECK("BAR-U03", rejection_ok, "invalid config and bad scan rejection");
 	TEST_CHECK("BAR-U04", reversed_label_ok, "backwards label in both travel directions");
 	TEST_CHECK("BAR-U05", calibrated_ok, "calibrated Y scan widths in both orientations");
+	TEST_CHECK("BAR-U06", scaled_ok, "barcode size learned per frame (0.8x to 12x)");
 	TEST_SUMMARY("barcode");
-	return forward_ok && reverse_ok && rejection_ok && reversed_label_ok && calibrated_ok;
+	return forward_ok && reverse_ok && rejection_ok && reversed_label_ok && calibrated_ok &&
+	       scaled_ok;
 }
 #endif

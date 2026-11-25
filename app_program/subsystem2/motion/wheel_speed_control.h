@@ -111,6 +111,19 @@ bool wheel_speed_control_set_targets(
     float right_target_cm_s);
 
 /*
+ * PWM for the current targets from the last measured speeds, WITHOUT
+ * advancing the PIDs (no integration, no stored-error change): lets a new
+ * steering target act at once instead of waiting for the next speed
+ * sample. The next wheel_speed_control_update continues as normal.
+ * Returns false (output unchanged) on invalid input.
+ */
+bool wheel_speed_control_retarget_output(
+    const wheel_speed_control_t *controller,
+    float left_speed_cm_s,
+    float right_speed_cm_s,
+    wheel_speed_output_t *output);
+
+/*
  * Reset both PID controllers.
  *
  * Call whenever movement stops,

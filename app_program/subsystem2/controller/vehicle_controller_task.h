@@ -31,23 +31,52 @@ typedef void (*vehicle_controller_barcode_t)(void *context, const char *payload,
  * a bypass that could not resume. A toggle GO input should turn itself off
  * here, so the next single press is the fresh GO edge that re-arms. */
 typedef void (*vehicle_controller_go_reset_t)(void *context);
+/* Called (with input_context) on a GO press while FAULTED. Faults latch and
+ * the failed subsystem task has stopped, so recovery is a full restart:
+ * this should reboot the system (it need not return). */
+typedef void (*vehicle_controller_restart_t)(void *context);
 
 /*
- * Junction manoeuvre, measured with SENSOR_TEST=junction: after the
- * junction is detected (line sensors just over the crossing) drive straight
- * FORWARD_MM (right turns FORWARD_RIGHT_MM: the tracked tape edge is off the
- * robot's centreline) so the wheels are over the crossing, stop, spin until
- * the line sensors find the new line, stop, and resume line following.
- * "Found" is: leave the line, then see the next one -- a left/right turn
- * stops at the first line, a U-turn passes the side arm and stops at the
- * second (the line it came on). Times are from the speed, since the
- * controller has no distance feedback.
+ * Straddle line following (straddle_steering.h): the two line sensors sit
+ * further apart than the tape, which normally runs in the gap between them.
+ * Tuned with SENSOR_TEST=line_follow LF_STRADDLE=1 at 10 cm/s (LF_SL_TURN=2,
+ * LF_SL_OVERSHOOT_MS=250, LF_SL_BLIND_MS=1000, LF_SL_PIVOT_MAX_MS=4000,
+ * LF_SL_COUNTER_PCT=50 / 300 ms). The pivot is 5/4 cm/s (wheels 1 and 9):
+ * the motion task refuses |turn| >= speed, so the test's 4/4 (inner wheel
+ * stopped) is not possible; the same 8 cm/s wheel difference turns at the
+ * same rate.
+ */
+#define VEHICLE_LINE_SPEED_CM_S       10
+#define VEHICLE_LINE_TURN_CM_S        2
+#define VEHICLE_LINE_OVERSHOOT_MS     250U
+#define VEHICLE_LINE_PIVOT_SPEED_CM_S 5
+#define VEHICLE_LINE_PIVOT_TURN_CM_S  4
+#define VEHICLE_LINE_BLIND_MS         1000U   /* 0 = no blind search */
+#define VEHICLE_LINE_PIVOT_MAX_MS     4000U
+#define VEHICLE_LINE_COUNTER_PCT      50U
+#define VEHICLE_LINE_COUNTER_MAX_MS   300U
+
+/*
+ * Junction manoeuvre, measured with SENSOR_TEST=junction LF_STRADDLE=1:
+ * after the junction is detected (both line sensors just over the crossing)
+ * drive straight FORWARD_MM (right turns FORWARD_RIGHT_MM) so the wheels are
+ * over the crossing, stop, spin until the new line is reached, stop, and
+ * resume line following. A line is reached when it arrives at the LEADING
+ * line sensor of the spin (the branch straight ahead starts in the gap and
+ * leaves through the other one); with SEEK_GAP the spin goes on until the
+ * line has passed that sensor into the gap (left spins stopped a few
+ * degrees short otherwise). A left/right turn stops at the first line, a
+ * U-turn (spun left) passes the side arm and stops at the second (the line
+ * it came on). Times are from the speed, since the controller has no
+ * distance feedback.
  */
 #define VEHICLE_JUNCTION_FORWARD_MM       100U
 #define VEHICLE_JUNCTION_FORWARD_RIGHT_MM 120U
 #define VEHICLE_JUNCTION_SPIN_CM_S        8      /* each wheel, opposite ways */
 #define VEHICLE_JUNCTION_SETTLE_MS        400U   /* wheels stopped before/after the spin */
 #define VEHICLE_JUNCTION_SPIN_MAX_MS      4000U  /* no line by then: stop */
+#define VEHICLE_JUNCTION_SEEK_GAP_LEFT    true   /* left turns and U-turns */
+#define VEHICLE_JUNCTION_SEEK_GAP_RIGHT   false  /* right turns were fine without */
 
 typedef struct {
 	car_safety_config_t safety;
@@ -68,11 +97,13 @@ typedef struct {
 	 * scan it, drive round it and rejoin the line, and resume following
 	 * without a GO press if every arming check passes. Needs
 	 * vehicle_bypass_start(), and the obstacle task's emergency distance
-	 * well below obstacle_stop_mm (the bypass works ~20-30 cm from it).
+	 * well below obstacle_stop_mm (the bypass starts ~20 cm from it).
 	 * false: stop and wait for GO, as before. */
 	bool obstacle_bypass;
 	/* May be NULL (then two presses of a toggle GO restart the robot). */
 	vehicle_controller_go_reset_t go_reset;
+	/* May be NULL (then a fault needs a power cycle). */
+	vehicle_controller_restart_t restart;
 } vehicle_controller_task_config_t;
 
 /* Opt-in safety/arming task. The callback supplies trusted local GO and
@@ -82,7 +113,7 @@ typedef struct {
  * buffers.
  * It sends ARM only after the safety gate passes and a fresh zero-output
  * motion status is received. While FOLLOWING it then sends one line-steering
- * VELOCITY command per cycle (speed and turn from line_steering, 200 ms
+ * VELOCITY command per cycle (speed and turn from straddle_steering, 200 ms
  * lifetime) and STOP when it leaves FOLLOWING. A junction observation runs
  * the junction manoeuvre above (VELOCITY, STOP, TURN, STOP) instead of the
  * steering until it completes. A motion status that reports

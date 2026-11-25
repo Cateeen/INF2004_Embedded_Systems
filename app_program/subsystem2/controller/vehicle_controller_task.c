@@ -1,7 +1,7 @@
 #include "../../app.h"
 #include "../../vehicle_buffers.h"
 #include "vehicle_controller_task.h"
-#include "line_steering.h"
+#include "straddle_steering.h"
 #include "vehicle_bypass.h"
 #include "../../subsystem1/wifi/vehicle_telemetry.h"
 #include "../../subsystem1/wifi/dashboard_link.h"
@@ -29,7 +29,7 @@ typedef struct {
 	motion_status_message_t motion_status;
 	uint8_t imu_fsm_state;		/* latest imu_fsm_state_t, for telemetry */
 	uint8_t line_position;		/* latest POS_* from the line observations */
-	line_steering_t steering;
+	straddle_t steering;            /* straddle line following */
 	/* Motion status may report a moving robot only up to this time. */
 	uint32_t motion_allowed_until_ms;
 	bool motion_commanded;
@@ -37,15 +37,15 @@ typedef struct {
 	bool arm_requested;
 	bool emergency_sent;
 	bool have_motion_status;
-	/* Line observations received this cycle (for the junction spin). */
-	bool line_seen;
-	bool line_missing;
 	/* Junction manoeuvre (VEHICLE_JUNCTION_* in the header). */
 	bool junction_pending;          /* a junction observation arrived */
-	bool junction_left_line;        /* spinning: the sensors left the line */
+	bool junction_lead_seen;        /* spinning: the leading sensor is on a tape */
+	bool junction_found;            /* spinning: the new line is in the gap */
+	bool junction_skip;             /* the lead sensor's tape is the line being left */
 	uint8_t junction_phase;         /* JUNCTION_* below */
 	uint8_t junction_turn;          /* VEHICLE_JUNCTION_LEFT/RIGHT/UTURN */
 	uint8_t junction_lines;         /* lines still to reach while spinning */
+	int8_t junction_dir;            /* spinning: +1 left, -1 right */
 	int16_t junction_speed;         /* forward speed for the approach */
 	uint32_t junction_ms;           /* detection time, then phase start */
 	uint32_t junction_forward_ms;   /* approach drive time */
@@ -72,13 +72,15 @@ enum {
 	BYPASS_STOPPING,        /* STOP sent: wait for the motion task to report idle */
 	BYPASS_RUNNING          /* the vehicle_bypass task drives the motors */
 };
-/* An obstacle first seen closer than this is not bypassed (the bypass needs
- * 20-30 cm of room; something this close appeared suddenly, e.g. a hand):
- * the robot just stops. */
-#define VEHICLE_BYPASS_MIN_MM      150U
+/* An obstacle first seen this close or closer is not bypassed: it is inside
+ * the 120 mm emergency distance, i.e. it appeared suddenly (e.g. a hand)
+ * rather than being approached and stopped for at the 200 mm stop distance.
+ * The robot just stops. */
+#define VEHICLE_BYPASS_MIN_MM      125U
 /* Wheels stopped this long, and idle reported, before the bypass starts. */
 #define VEHICLE_BYPASS_SETTLE_MS   500U
 #define VEHICLE_BYPASS_IDLE_MAX_MS 2000U
+
 
 enum {
 	JUNCTION_IDLE = 0,      /* line following */
@@ -87,6 +89,21 @@ enum {
 	JUNCTION_SPIN,          /* spinning until the new line is reached */
 	JUNCTION_SETTLE_OUT     /* stopped on the new line, settling */
 };
+
+/* Straddle line following (vehicle_controller_task.h). Losing the line on a
+ * bend is handled by its own RECOVER pivot and blind SEARCH. */
+static const straddle_config_t s_straddle_config = {
+	VEHICLE_LINE_SPEED_CM_S, VEHICLE_LINE_TURN_CM_S, VEHICLE_LINE_OVERSHOOT_MS,
+	VEHICLE_LINE_PIVOT_SPEED_CM_S, VEHICLE_LINE_PIVOT_TURN_CM_S,
+	VEHICLE_LINE_BLIND_MS, VEHICLE_LINE_PIVOT_MAX_MS,
+	VEHICLE_LINE_COUNTER_PCT, VEHICLE_LINE_COUNTER_MAX_MS
+};
+/* The motion task refuses VELOCITY with |turn| >= speed (a wheel would stop
+ * or reverse) or a faster wheel over its limit. */
+_Static_assert(VEHICLE_LINE_TURN_CM_S >= 1 && VEHICLE_LINE_TURN_CM_S < VEHICLE_LINE_SPEED_CM_S &&
+	       VEHICLE_LINE_PIVOT_TURN_CM_S >= 1 &&
+	       VEHICLE_LINE_PIVOT_TURN_CM_S < VEHICLE_LINE_PIVOT_SPEED_CM_S,
+	       "straddle turns must be >= 1 and below their speed");
 
 static vehicle_controller_task_config_t s_config;
 static vehicle_controller_context_t s_context;
@@ -161,12 +178,51 @@ static bool motion_expected(const vehicle_controller_context_t *context,
 	       (int32_t)(timestamp_ms - context->motion_allowed_until_ms) <= 0;
 }
 
+/*
+ * Junction spin, one line observation at a time (they come every 10 ms; the
+ * controller only every 50 ms, and a sensor can cross the tape in less).
+ * The sensors straddle the line, so at the start of the spin the branch
+ * straight ahead sits in the gap: it leaves through the TRAILING sensor and
+ * is ignored. A line counts when it arrives at the LEADING sensor (the
+ * centre one spinning left, the right one spinning right):
+ *   gap seek (VEHICLE_JUNCTION_SEEK_GAP_*): the line is reached once it has
+ *     left the leading sensor again, i.e. sits in the gap -- stopping as
+ *     soon as the sensor touched it left the robot a few degrees short;
+ *   otherwise: reached as soon as the leading sensor sees it.
+ * The last line also counts if the trailing sensor goes black while the
+ * leading one is on it (past the gap already). A tape already under the
+ * leading sensor when the spin starts (junction_skip) is the line being
+ * left: it is let through without counting.
+ */
+static void junction_seek(vehicle_controller_context_t *context, uint8_t position)
+{
+	const bool centre = position == POS_LEFT || position == POS_JUNCTION;
+	const bool right = position == POS_RIGHT || position == POS_JUNCTION;
+	const bool lead = context->junction_dir > 0 ? centre : right;
+	const bool trail = context->junction_dir > 0 ? right : centre;
+	const bool gap = context->junction_dir > 0 ? VEHICLE_JUNCTION_SEEK_GAP_LEFT :
+						     VEHICLE_JUNCTION_SEEK_GAP_RIGHT;
+
+	if (context->junction_found || context->junction_lines == 0U) return;
+	if (!context->junction_lead_seen) {
+		if (!lead) return;
+		context->junction_lead_seen = true;
+		if (!gap && context->junction_lines == 1U) context->junction_found = true;
+		return;
+	}
+	if (!lead) {                    /* the tape has passed into the gap */
+		context->junction_lead_seen = false;
+		if (context->junction_skip) context->junction_skip = false;
+		else if (--context->junction_lines == 0U) context->junction_found = true;
+	} else if (trail && !context->junction_skip && context->junction_lines == 1U) {
+		context->junction_found = true;
+	}
+}
+
 static bool receive_line(vehicle_controller_context_t *context, uint32_t now)
 {
 	unsigned i;
 
-	context->line_seen = false;
-	context->line_missing = false;
 	for (i = 0U; i < VEHICLE_MB_LINE_CAPACITY; i++) {
 		line_observation_message_t message;
 		INT received = tk_rcv_mbf(g_mbf_line_observations, &message, TMO_POL);
@@ -182,8 +238,8 @@ static bool receive_line(vehicle_controller_context_t *context, uint32_t now)
 			return false;
 		context->line_position = line_position_of(&message);
 		context->picked_up = message.picked_up != 0U;
-		if (message.line_detected != 0U) context->line_seen = true;
-		else context->line_missing = true;
+		if (context->junction_phase == JUNCTION_SPIN)
+			junction_seek(context, context->line_position);
 		if (message.intersection_detected != 0U) {
 			context->junction_pending = true;
 			context->junction_ms = message.header.timestamp_ms;
@@ -273,6 +329,32 @@ static bool receive_imu(vehicle_controller_context_t *context, uint32_t now)
 	return true;
 }
 
+/*
+ * Line state for the dashboard with straddle line sensors. Centred on the
+ * tape reads both white -- the same as no tape at all -- so "no tape under a
+ * sensor" is NOT a lost line:
+ *   following : FOUND while the steering tracks the tape (straight,
+ *               correcting, pivoting at a bend or searching), LOST only once
+ *               it has given up (stop latched);
+ *   otherwise : FOUND if a sensor sees tape; LOST if the steering gave up
+ *               and nothing has been seen since; else UNKNOWN (both white:
+ *               the tape may be between the sensors, or not there);
+ *   lifted    : UNKNOWN (no floor under the sensors).
+ * Pivots, searches and the give-up are also sent as LINE events.
+ */
+static uint8_t straddle_line_state(const vehicle_controller_context_t *context,
+				   controller_state_value_t state)
+{
+	if (context->picked_up) return WIFI_TELEMETRY_LINE_UNKNOWN;
+	if (state == CONTROLLER_FOLLOWING && context->arm_requested &&
+	    context->steering.initialized)
+		return context->steering.stop_latched ? WIFI_TELEMETRY_LINE_LOST :
+							WIFI_TELEMETRY_LINE_FOUND;
+	if (context->line_position != POS_LOST) return WIFI_TELEMETRY_LINE_FOUND;
+	return context->steering.stop_latched ? WIFI_TELEMETRY_LINE_LOST :
+						WIFI_TELEMETRY_LINE_UNKNOWN;
+}
+
 /* Dashboard snapshot of what the controller currently believes. Read-only
  * with respect to control: it only reads context and never changes state. */
 static void report_telemetry(const vehicle_controller_context_t *context,
@@ -304,6 +386,8 @@ static void report_telemetry(const vehicle_controller_context_t *context,
 	} else if (context->junction_phase != JUNCTION_IDLE) {
 		/* Leaving the line to turn at a junction is not losing it. */
 		data.line_state = WIFI_TELEMETRY_LINE_FOUND;
+	} else if (safety->config.straddle_line) {
+		data.line_state = straddle_line_state(context, state);
 	} else {
 		data.line_state = safety->line_clear ? WIFI_TELEMETRY_LINE_FOUND
 						     : WIFI_TELEMETRY_LINE_LOST;
@@ -478,8 +562,34 @@ static const char *arm_refusal(const car_safety_t *safety)
 	if (!safety->imu_clear)
 		return "IMU: tilted, or still calibrating -- put it down flat and keep it still ~1 s";
 	if (!safety->ahead_clear) return "something ahead within the stop distance";
-	if (!safety->line_clear) return "the line is not under the sensors";
+	if (!safety->line_clear)
+		return safety->config.straddle_line ? "the robot is lifted (no floor under the sensors)" :
+						      "the line is not under the sensors";
 	return "a safety check";
+}
+
+/* Why a following robot stopped by itself (once per stop). */
+static void print_stop_reason(const vehicle_controller_context_t *context,
+			      controller_state_value_t state)
+{
+	const car_safety_t *safety = &context->controller.safety;
+
+	if (state == CONTROLLER_FOLLOWING) {
+		/* Still armed, but the steering latched its stop. */
+		tm_printf((UB*)"stopped: %s\n",
+			  context->picked_up ? "picked up" :
+			  "line lost (the pivot / search for the tape found none)");
+	} else if (state == CONTROLLER_FAULTED) {
+		tm_printf((UB*)"stopped: fault -- %s\n",
+			  safety->fault_reason != NULL ? safety->fault_reason : "unknown");
+	} else if (safety->have_ahead && !safety->ahead_clear) {
+		tm_printf((UB*)"stopped: something ahead at %u mm%s\n",
+			  (unsigned)context->ahead_mm,
+			  context->ahead_mm <= VEHICLE_BYPASS_MIN_MM ?
+			  " (too close to bypass: appeared suddenly)" : "");
+	} else {
+		tm_printf((UB*)"stopped: %s\n", arm_refusal(safety));
+	}
 }
 
 static void junction_reset(vehicle_controller_context_t *context)
@@ -519,7 +629,7 @@ static int junction_step(vehicle_controller_context_t *context, uint32_t now)
 			return 0;       /* straight on: keep following */
 		}
 		context->junction_turn = turn;
-		context->junction_speed = line_steering_profile(&context->steering)->speed_cm_s;
+		context->junction_speed = context->steering.config.speed_cm_s;
 		mm = turn == VEHICLE_JUNCTION_RIGHT ? VEHICLE_JUNCTION_FORWARD_RIGHT_MM :
 						      VEHICLE_JUNCTION_FORWARD_MM;
 		/* mm at speed cm/s takes mm * 100 / speed ms, from the detection. */
@@ -548,41 +658,41 @@ static int junction_step(vehicle_controller_context_t *context, uint32_t now)
 		context->junction_ms = now;
 		context->junction_lines =
 			context->junction_turn == VEHICLE_JUNCTION_UTURN ? 2U : 1U;
-		context->junction_left_line = false;
+		context->junction_dir = context->junction_turn == VEHICLE_JUNCTION_RIGHT ? -1 : 1;
+		/* Stopped and settled: a tape under the leading sensor now is
+		 * the line being left, not the new one. */
+		context->junction_skip =
+			context->junction_dir > 0 ?
+			(context->line_position == POS_LEFT || context->line_position == POS_JUNCTION) :
+			(context->line_position == POS_RIGHT || context->line_position == POS_JUNCTION);
+		context->junction_lead_seen = context->junction_skip;
+		context->junction_found = false;
 		/* fall through */
 	case JUNCTION_SPIN:
-		/* Leave the line (a whole cycle without it), then reach the next. */
-		if (!context->junction_left_line) {
-			if (context->line_missing && !context->line_seen)
-				context->junction_left_line = true;
-		} else if (context->line_seen) {
-			context->junction_lines--;
-			context->junction_left_line = false;
-		}
-		if (context->junction_lines == 0U) {
+		/* junction_seek() follows the lines, one observation at a time. */
+		if (context->junction_found) {
 			sent = publish_motion_command(context, VEHICLE_MOTION_STOP, 0U, now);
 			context->junction_phase = JUNCTION_SETTLE_OUT;
 			context->junction_ms = now;
 		} else if ((uint32_t)(now - context->junction_ms) > VEHICLE_JUNCTION_SPIN_MAX_MS) {
 			/* No line: stop and stay stopped, as for a lost line. */
 			tm_printf((UB*)"junction: no line found while turning; stopped\n");
+			(void)dashboard_report_line_event(DASHBOARD_LINE_LOST);
 			sent = publish_motion_command(context, VEHICLE_MOTION_STOP, 0U, now);
 			context->steering.stop_latched = true;
 			context->steering_stop_sent = true;
 			junction_reset(context);
 		} else {
 			sent = publish_motion_message(context, VEHICLE_MOTION_TURN, 0U, 0,
-				context->junction_turn == VEHICLE_JUNCTION_RIGHT ?
-				(int16_t)-VEHICLE_JUNCTION_SPIN_CM_S :
-				(int16_t)VEHICLE_JUNCTION_SPIN_CM_S,
+				(int16_t)(context->junction_dir * VEHICLE_JUNCTION_SPIN_CM_S),
 				VEHICLE_CONTROLLER_DRIVE_MS, now);
 		}
 		break;
 	case JUNCTION_SETTLE_OUT:
 		if ((uint32_t)(now - context->junction_ms) < VEHICLE_JUNCTION_SETTLE_MS) break;
 		/* On the new line: follow it from scratch. A junction seen while
-		 * turning (the left sensor sweeps over tape) is not a new one. */
-		line_steering_reset(&context->steering);
+		 * turning is not a new one. */
+		straddle_reset(&context->steering);
 		context->steering_stop_sent = false;
 		junction_reset(context);
 		junction_done(context->junction_turn);
@@ -716,6 +826,25 @@ static void pickup_step(vehicle_controller_context_t *context,
 	}
 }
 
+/*
+ * Straddle steering edges to the dashboard (one event each, never per
+ * cycle): a pivot at a bend, a blind search's outcome (the tape had escaped
+ * and was found again, or it was between the sensors all along), and the
+ * line given up. before = the steering before this cycle's update.
+ */
+static void report_line_events(const straddle_t *before, const straddle_t *after)
+{
+	if (after->recoveries != before->recoveries)
+		(void)dashboard_report_line_event(DASHBOARD_LINE_PIVOT);
+	if (before->state == STRADDLE_SEARCH && after->state != STRADDLE_SEARCH &&
+	    !after->stop_latched)
+		(void)dashboard_report_line_event(after->false_searches != before->false_searches ?
+						  DASHBOARD_LINE_SEARCH_CENTRED :
+						  DASHBOARD_LINE_SEARCH_FOUND);
+	if (after->stop_latched && !before->stop_latched)
+		(void)dashboard_report_line_event(DASHBOARD_LINE_LOST);
+}
+
 static bool controller_cycle(vehicle_controller_context_t *context,
 			     uint32_t now,
 			     const vehicle_controller_inputs_t *inputs)
@@ -749,8 +878,31 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 	 * switches GO off). */
 	if (inputs->go && !context->previous_go && state != CONTROLLER_FOLLOWING &&
 	    state != CONTROLLER_FAULTED) {
-		tm_printf((UB*)"GO refused: %s\n", arm_refusal(&context->controller.safety));
+		const car_safety_t *safety = &context->controller.safety;
+
+		if (safety->faults == 0U && safety->have_ahead && !safety->ahead_clear)
+			/* Say how close: 20 mm means the sensor returned an echo
+			 * shorter than its minimum range (a glitch or a stuck
+			 * sensor), not a real object at 2 cm. */
+			tm_printf((UB*)"GO refused: something ahead at %u mm (stop distance %u mm)%s\n",
+				  (unsigned)context->ahead_mm,
+				  (unsigned)safety->config.obstacle_stop_mm,
+				  context->ahead_mm <= 20U ?
+				  " -- 20 mm is the sensor's floor: the ultrasonic sensor is stuck "
+				  "(usually after RST); unplug USB AND switch the battery off for 5 s, "
+				  "then power on" : "");
+		else
+			tm_printf((UB*)"GO refused: %s\n", arm_refusal(safety));
 		go_reset();
+	} else if (inputs->go && !context->previous_go && state == CONTROLLER_FAULTED) {
+		/* Faults latch and the failed task has stopped: GO restarts. */
+		if (s_config.restart != NULL) {
+			tm_printf((UB*)"GO while faulted: restarting the robot\n");
+			s_config.restart(s_config.input_context);
+		} else {
+			tm_printf((UB*)"GO refused: fault latched -- power-cycle the robot\n");
+			go_reset();
+		}
 	}
 	context->previous_go = inputs->go;
 	bypass_step(context, state, now, inputs);
@@ -758,8 +910,10 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 	 * toggle GO turns off, so one press -- not two -- starts it again. */
 	if (inputs->go && context->bypass_phase == BYPASS_IDLE &&
 	    ((context->last_state == CONTROLLER_FOLLOWING && state != CONTROLLER_FOLLOWING) ||
-	     (state == CONTROLLER_FOLLOWING && context->steering.stop_latched)))
+	     (state == CONTROLLER_FOLLOWING && context->steering.stop_latched))) {
+		print_stop_reason(context, state);
 		go_reset();
+	}
 	context->last_state = state;
 	report_telemetry(context, state, now);
 	if (state == CONTROLLER_FAULTED) {
@@ -798,7 +952,7 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 		if (!context->arm_requested) {
 			if (publish_motion_command(context, VEHICLE_MOTION_ARM, 0U, now)) {
 				context->arm_requested = true;
-				line_steering_reset(&context->steering);
+				(void)straddle_init(&context->steering, &s_straddle_config);
 				context->steering_stop_sent = false;
 				junction_reset(context);
 				/* The motion task ignores VELOCITY stamped in the
@@ -813,17 +967,20 @@ static bool controller_cycle(vehicle_controller_context_t *context,
 				context->emergency_sent = true;
 			return false;
 		}
-		/* Gentler steering profile while the IMU has the robot on a ramp
-		 * (rising covers the climb, top and descent; falling holds 300 ms
-		 * of level ground after it). */
-		line_steering_set_slope(&context->steering, on_hump(context->imu_fsm_state));
+		/* No blind search while the IMU has the robot on a ramp (rising
+		 * covers the climb, top and descent; falling holds 300 ms of level
+		 * ground after it): over the crest the tape is often out of sight
+		 * and straight on is right. */
+		straddle_set_hump(&context->steering, on_hump(context->imu_fsm_state));
 		junction = junction_step(context, now);
 		if (junction > 0) return true;
 		if (junction < 0) {
 			sent = false;
 		} else {
-			steer = line_steering_update(&context->steering,
-						     context->line_position, now);
+			const straddle_t before = context->steering;
+
+			steer = straddle_update(&context->steering, context->line_position, now);
+			report_line_events(&before, &context->steering);
 			if (steer.stop_latched) {
 				if (context->steering_stop_sent) return true;
 				sent = publish_motion_command(context, VEHICLE_MOTION_STOP, 0U, now);
@@ -1122,9 +1279,6 @@ static BOOL queue_test_line(uint32_t now, uint32_t sequence, int16_t lateral_err
 /* Line following: after ARM the controller sends a steering VELOCITY every
  * cycle, accepts a moving status while it commands motion, stops on GO off
  * and faults if motion is still reported after the stop window. */
-/* The first two corrections are 10 ms apart: both still at the minimum turn. */
-_Static_assert(2 * (LINE_STEERING_TURN_CM_S - LINE_STEERING_TURN_MIN_CM_S) * 10 <
-	       LINE_STEERING_RAMP_MS, "controller_drive_test assumes 10 ms of ramp rounds to TURN_MIN");
 static BOOL controller_drive_test(void)
 {
 	vehicle_controller_context_t context = {0};
@@ -1141,17 +1295,18 @@ static BOOL controller_drive_test(void)
 	ok = controller_cycle(&context, 102U, &inputs) &&
 	     receive_test_command(VEHICLE_MOTION_ARM, 1U) &&
 	     tk_rcv_mbf(g_mbf_motion_commands, &unexpected, TMO_POL) == E_TMOUT && ok;
-	/* Line to the left: slow the left wheel. */
+	/* Tape under the left (centre) sensor: gentle turn left. */
 	ok = queue_test_line(110U, 2U, -1) && ok;
 	ok = controller_cycle(&context, 110U, &inputs) &&
-	     receive_test_velocity(LINE_STEERING_SPEED_CM_S, LINE_STEERING_TURN_MIN_CM_S, 2U) && ok;
+	     receive_test_velocity(VEHICLE_LINE_SPEED_CM_S, VEHICLE_LINE_TURN_CM_S, 2U) && ok;
 	ok = queue_motion_status(120U, 2U, 1U, 22, -26) && ok;
 	ok = controller_cycle(&context, 120U, &inputs) &&
 	     context.controller.state == CONTROLLER_FOLLOWING &&
-	     receive_test_velocity(LINE_STEERING_SPEED_CM_S, LINE_STEERING_TURN_MIN_CM_S, 3U) && ok;
+	     receive_test_velocity(VEHICLE_LINE_SPEED_CM_S, VEHICLE_LINE_TURN_CM_S, 3U) && ok;
+	/* Both black (a crossing tape): straight. */
 	ok = queue_test_line(130U, 3U, 0) && ok;
 	ok = controller_cycle(&context, 130U, &inputs) &&
-	     receive_test_velocity(LINE_STEERING_SPEED_CM_S, 0, 4U) && ok;
+	     receive_test_velocity(VEHICLE_LINE_SPEED_CM_S, 0, 4U) && ok;
 	inputs.go = false;
 	ok = controller_cycle(&context, 140U, &inputs) &&
 	     context.controller.state == CONTROLLER_WAITING &&
@@ -1233,54 +1388,6 @@ static BOOL controller_stale_status_test(void)
 	return drain_controller_test_buffers() && ok;
 }
 
-static BOOL queue_test_imu(uint32_t now, uint32_t sequence, uint8_t terrain_state)
-{
-	imu_estimate_message_t imu = {0};
-
-	imu.header = (vehicle_message_header_t){VEHICLE_MESSAGE_IMU_ESTIMATE,
-						 VEHICLE_MESSAGE_VERSION, sequence, now};
-	imu.validity = VEHICLE_IMU_VALID_ROLL_PITCH;
-	imu.terrain_telemetry = terrain_state;
-	return tk_snd_mbf(g_mbf_imu_estimates, &imu, (INT)sizeof(imu), TMO_POL) == E_OK;
-}
-
-/* Ramp mode: while the IMU reports a hump (rising or falling) line following
- * uses the SLOPE profile, and NORMAL again once it reports level. */
-static BOOL controller_slope_test(void)
-{
-	vehicle_controller_context_t context = {0};
-	vehicle_controller_inputs_t inputs = {false, false};
-	BOOL ok = controller_state_init(&context.controller, &test_config.safety, 100U);
-
-	context.status_wait_ms = 100U;
-	ok = queue_safe_sensor_messages(100U, 1U) && ok;
-	ok = controller_cycle(&context, 100U, &inputs) && ok;
-	inputs.go = true;
-	ok = controller_cycle(&context, 101U, &inputs) && ok;
-	ok = queue_motion_status(101U, 1U, 0U, 0, 0) && ok;
-	ok = controller_cycle(&context, 102U, &inputs) &&
-	     receive_test_command(VEHICLE_MOTION_ARM, 1U) && ok;
-	/* On the ramp: SLOPE speed and first correction. */
-	ok = queue_test_imu(110U, 2U, (uint8_t)IMU_STATE_HUMP_RISING) && ok;
-	ok = queue_test_line(110U, 2U, -1) && ok;
-	ok = controller_cycle(&context, 110U, &inputs) &&
-	     receive_test_velocity(LINE_STEERING_SLOPE_SPEED_CM_S,
-				   LINE_STEERING_SLOPE_TURN_MIN_CM_S, 2U) && ok;
-	ok = queue_test_imu(120U, 3U, (uint8_t)IMU_STATE_HUMP_FALLING) && ok;
-	ok = queue_test_line(120U, 3U, 0) && ok;
-	ok = controller_cycle(&context, 120U, &inputs) &&
-	     receive_test_velocity(LINE_STEERING_SLOPE_SPEED_CM_S, 0, 3U) && ok;
-	/* Level again: NORMAL. */
-	ok = queue_test_imu(130U, 4U, (uint8_t)IMU_STATE_MONITORING) && ok;
-	ok = queue_test_line(130U, 4U, 0) && ok;
-	ok = controller_cycle(&context, 130U, &inputs) &&
-	     receive_test_velocity(LINE_STEERING_SPEED_CM_S, 0, 4U) && ok;
-	inputs.go = false;
-	ok = controller_cycle(&context, 140U, &inputs) &&
-	     receive_test_command(VEHICLE_MOTION_STOP, 5U) && ok;
-	return drain_controller_test_buffers() && ok;
-}
-
 /* ---- Junction manoeuvre ---------------------------------------------------- */
 
 #define TEST_NO_COMMAND 0xFFU
@@ -1307,6 +1414,7 @@ typedef struct {
 	vehicle_controller_inputs_t inputs;
 	uint32_t line_seq, imu_seq, obstacle_seq, status_seq;
 	uint32_t now;
+	uint8_t terrain;                    /* imu_fsm_state_t for the IMU messages */
 	motion_command_message_t command;   /* mode TEST_NO_COMMAND if none sent */
 } junction_test_t;
 
@@ -1331,6 +1439,7 @@ static BOOL junction_cycle(junction_test_t *t, uint8_t detected, int16_t lateral
 	imu.header = (vehicle_message_header_t){VEHICLE_MESSAGE_IMU_ESTIMATE,
 						 VEHICLE_MESSAGE_VERSION, ++t->imu_seq, t->now};
 	imu.validity = VEHICLE_IMU_VALID_ROLL_PITCH;
+	imu.terrain_telemetry = t->terrain;
 	obstacle.header = (vehicle_message_header_t){VEHICLE_MESSAGE_OBSTACLE_EVENT,
 						      VEHICLE_MESSAGE_VERSION, ++t->obstacle_seq,
 						      t->now};
@@ -1371,20 +1480,43 @@ static BOOL junction_arm(junction_test_t *t)
 	t->inputs.go = true;
 	ok = junction_cycle(t, 1U, -1, 0U) && t->command.mode == VEHICLE_MOTION_ARM && ok;
 	ok = junction_cycle(t, 1U, -1, 0U) &&
-	     is_motion(t, VEHICLE_MOTION_VELOCITY, LINE_STEERING_SPEED_CM_S,
-		       LINE_STEERING_TURN_MIN_CM_S) && ok;
+	     is_motion(t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_SPEED_CM_S,
+		       VEHICLE_LINE_TURN_CM_S) && ok;
+	return ok;
+}
+
+/* Line observations as positions: tape in the gap, under the centre (left)
+ * sensor, under the right one. */
+#define SEEN_GAP     0U, 0
+#define SEEN_CENTRE  1U, -1
+#define SEEN_RIGHT   1U, 1
+
+/* n cycles with the same observation, each still spinning. */
+static BOOL spin_cycles(junction_test_t *t, uint8_t detected, int16_t lateral, unsigned n,
+			int16_t spin)
+{
+	BOOL ok = TRUE;
+
+	for (unsigned i = 0U; i < n; i++)
+		ok = junction_cycle(t, detected, lateral, 0U) &&
+		     is_motion(t, VEHICLE_MOTION_TURN, 0, spin) && ok;
 	return ok;
 }
 
 /*
  * A junction with the given turn: drive on for the forward distance, stop,
- * settle, spin (+ left) until the sensors leave the line and reach the next
- * one (a U-turn: the second), stop, settle, then follow again.
+ * settle, spin (+ left) until the new line is reached (a U-turn: the
+ * second), stop, settle, then follow again. Spinning, the branch straight
+ * ahead leaves through the trailing sensor first (ignored); a line counts at
+ * the leading sensor -- left spins once it has passed into the gap, right
+ * spins as soon as the sensor sees it. start_on_lead: a tape is already
+ * under the leading sensor when the spin starts (the branch being left):
+ * it passes without counting.
  */
-static BOOL junction_turn_test(uint8_t turn)
+static BOOL junction_turn_test(uint8_t turn, bool start_on_lead)
 {
 	junction_test_t t;
-	const int16_t speed = LINE_STEERING_SPEED_CM_S;
+	const int16_t speed = VEHICLE_LINE_SPEED_CM_S;
 	const int16_t spin = turn == VEHICLE_JUNCTION_RIGHT ?
 			     (int16_t)-VEHICLE_JUNCTION_SPIN_CM_S :
 			     (int16_t)VEHICLE_JUNCTION_SPIN_CM_S;
@@ -1392,7 +1524,6 @@ static BOOL junction_turn_test(uint8_t turn)
 				     VEHICLE_JUNCTION_FORWARD_RIGHT_MM :
 				     VEHICLE_JUNCTION_FORWARD_MM) * 100U / (uint32_t)speed;
 	uint32_t detected_at, stopped_at;
-	unsigned line_pass, i;
 	BOOL ok;
 
 	s_test_turn = turn;
@@ -1413,28 +1544,52 @@ static BOOL junction_turn_test(uint8_t turn)
 	while (t.now + 10U - stopped_at < VEHICLE_JUNCTION_SETTLE_MS && ok)
 		ok = junction_cycle(&t, 1U, -1, 0U) && t.command.mode == TEST_NO_COMMAND;
 
-	/* Spin: starts on the original line, leaves it, reaches line(s). */
-	ok = junction_cycle(&t, 1U, -1, 0U) &&
-	     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
-	for (line_pass = 0U; line_pass < (turn == VEHICLE_JUNCTION_UTURN ? 2U : 1U); line_pass++) {
-		for (i = 0U; i < 5U; i++)
-			ok = junction_cycle(&t, 0U, 0, 0U) &&
-			     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
-		if (line_pass == 0U && turn == VEHICLE_JUNCTION_UTURN) {
-			/* The side arm: passed, the spin goes on. */
-			ok = junction_cycle(&t, 1U, 1, 0U) &&
-			     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
-		}
+	/* Spin: the branch ahead starts in the gap and leaves through the
+	 * trailing sensor (ignored) -- or starts under the leading sensor. */
+	if (!start_on_lead) {
+		ok = junction_cycle(&t, SEEN_GAP, 0U) &&
+		     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
+	} else if (turn == VEHICLE_JUNCTION_RIGHT) {
+		ok = junction_cycle(&t, SEEN_RIGHT, 0U) &&
+		     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
+		ok = spin_cycles(&t, SEEN_RIGHT, 2U, spin) && ok;
+		ok = spin_cycles(&t, SEEN_GAP, 2U, spin) && ok;
+	} else {
+		ok = junction_cycle(&t, SEEN_CENTRE, 0U) &&
+		     is_motion(&t, VEHICLE_MOTION_TURN, 0, spin) && ok;
+		ok = spin_cycles(&t, SEEN_CENTRE, 2U, spin) && ok;
+		ok = spin_cycles(&t, SEEN_GAP, 2U, spin) && ok;
 	}
-	ok = junction_cycle(&t, 1U, -1, 0U) && t.command.mode == VEHICLE_MOTION_STOP &&
-	     s_test_done_count == 0U && ok;
+	if (turn == VEHICLE_JUNCTION_RIGHT) {
+		ok = spin_cycles(&t, SEEN_CENTRE, 3U, spin) && ok;      /* trailing */
+		ok = spin_cycles(&t, SEEN_GAP, 5U, spin) && ok;
+		/* The new line at the leading (right) sensor: stop at once. */
+		ok = junction_cycle(&t, SEEN_RIGHT, 0U) && t.command.mode == VEHICLE_MOTION_STOP &&
+		     s_test_done_count == 0U && ok;
+	} else {
+		ok = spin_cycles(&t, SEEN_RIGHT, 3U, spin) && ok;       /* trailing */
+		ok = spin_cycles(&t, SEEN_GAP, 5U, spin) && ok;
+		if (turn == VEHICLE_JUNCTION_UTURN) {
+			/* The side arm: in at the leading sensor, through the
+			 * gap, out at the trailing one; the spin goes on. */
+			ok = spin_cycles(&t, SEEN_CENTRE, 3U, spin) && ok;
+			ok = spin_cycles(&t, SEEN_GAP, 3U, spin) && ok;
+			ok = spin_cycles(&t, SEEN_RIGHT, 3U, spin) && ok;
+			ok = spin_cycles(&t, SEEN_GAP, 5U, spin) && ok;
+		}
+		/* The new line at the leading (centre) sensor: not yet ... */
+		ok = spin_cycles(&t, SEEN_CENTRE, 3U, spin) && ok;
+		/* ... it stops once the line has passed into the gap. */
+		ok = junction_cycle(&t, SEEN_GAP, 0U) && t.command.mode == VEHICLE_MOTION_STOP &&
+		     s_test_done_count == 0U && ok;
+	}
 	stopped_at = t.now;
 	while (t.now + 10U - stopped_at < VEHICLE_JUNCTION_SETTLE_MS && ok)
 		ok = junction_cycle(&t, 1U, -1, 0U) && t.command.mode == TEST_NO_COMMAND;
 
 	/* Following again from scratch, and the turn is reported done. */
 	ok = junction_cycle(&t, 1U, -1, 0U) &&
-	     is_motion(&t, VEHICLE_MOTION_VELOCITY, speed, LINE_STEERING_TURN_MIN_CM_S) &&
+	     is_motion(&t, VEHICLE_MOTION_VELOCITY, speed, VEHICLE_LINE_TURN_CM_S) &&
 	     s_test_done_count == 1U && s_test_done_turn == turn && ok;
 	return drain_controller_test_buffers() && ok;
 }
@@ -1451,8 +1606,8 @@ static BOOL junction_other_test(void)
 	s_test_done_count = 0U;
 	ok = junction_arm(&t);
 	ok = junction_cycle(&t, 1U, -1, 1U) &&
-	     is_motion(&t, VEHICLE_MOTION_VELOCITY, LINE_STEERING_SPEED_CM_S,
-		       LINE_STEERING_TURN_MIN_CM_S) &&
+	     is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_SPEED_CM_S,
+		       VEHICLE_LINE_TURN_CM_S) &&
 	     s_test_done_count == 1U && s_test_done_turn == VEHICLE_JUNCTION_STRAIGHT && ok;
 	ok = drain_controller_test_buffers() && ok;
 
@@ -1477,9 +1632,39 @@ static BOOL junction_other_test(void)
 	s_config.junction_turn = NULL;
 	ok = junction_arm(&t) && ok;
 	ok = junction_cycle(&t, 1U, -1, 1U) &&
-	     is_motion(&t, VEHICLE_MOTION_VELOCITY, LINE_STEERING_SPEED_CM_S,
-		       LINE_STEERING_TURN_MIN_CM_S) && ok;
+	     is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_SPEED_CM_S,
+		       VEHICLE_LINE_TURN_CM_S) && ok;
 	s_config.junction_turn = test_junction_turn;
+	return drain_controller_test_buffers() && ok;
+}
+
+/* On a hump (IMU rising/falling) the straddle steering never starts its
+ * blind search, however long the tape stays out of sight; level again, it
+ * searches towards the last-seen side after VEHICLE_LINE_BLIND_MS. */
+static BOOL controller_hump_test(void)
+{
+	junction_test_t t;
+	uint32_t from;
+	BOOL ok;
+
+	s_config.junction_turn = NULL;
+	ok = junction_arm(&t);                  /* tape last seen: centre (left) */
+	t.terrain = (uint8_t)IMU_STATE_HUMP_RISING;
+	from = t.now;
+	while (t.now - from < VEHICLE_LINE_BLIND_MS + 200U && ok)
+		ok = junction_cycle(&t, SEEN_GAP, 0U) && t.command.mode == VEHICLE_MOTION_VELOCITY &&
+		     t.command.linear_velocity == VEHICLE_LINE_SPEED_CM_S;
+	ok = is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_SPEED_CM_S, 0) && ok;
+	t.terrain = (uint8_t)IMU_STATE_MONITORING;
+	from = t.now;
+	while (t.now - from <= VEHICLE_LINE_BLIND_MS + 20U && ok &&
+	       !is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_PIVOT_SPEED_CM_S,
+			  VEHICLE_LINE_PIVOT_TURN_CM_S))
+		ok = junction_cycle(&t, SEEN_GAP, 0U);
+	ok = is_motion(&t, VEHICLE_MOTION_VELOCITY, VEHICLE_LINE_PIVOT_SPEED_CM_S,
+		       VEHICLE_LINE_PIVOT_TURN_CM_S) &&
+	     t.now - from >= VEHICLE_LINE_BLIND_MS - 20U && ok;
+	s_config = test_config;
 	return drain_controller_test_buffers() && ok;
 }
 
@@ -1535,9 +1720,12 @@ static BOOL controller_junction_test(void)
 
 	s_config.junction_turn = test_junction_turn;
 	s_config.junction_done = test_junction_done;
-	ok = junction_turn_test(VEHICLE_JUNCTION_LEFT);
-	ok = junction_turn_test(VEHICLE_JUNCTION_RIGHT) && ok;
-	ok = junction_turn_test(VEHICLE_JUNCTION_UTURN) && ok;
+	ok = junction_turn_test(VEHICLE_JUNCTION_LEFT, false);
+	ok = junction_turn_test(VEHICLE_JUNCTION_RIGHT, false) && ok;
+	ok = junction_turn_test(VEHICLE_JUNCTION_UTURN, false) && ok;
+	ok = junction_turn_test(VEHICLE_JUNCTION_LEFT, true) && ok;
+	ok = junction_turn_test(VEHICLE_JUNCTION_RIGHT, true) && ok;
+	ok = junction_turn_test(VEHICLE_JUNCTION_UTURN, true) && ok;
 	ok = junction_other_test() && ok;
 	s_config = test_config;
 	return ok;
@@ -1573,16 +1761,45 @@ static BOOL controller_lent_pickup_test(void)
 	return !context.pickup_reported && ok;
 }
 
+/* Straddle line state for the dashboard: both white while following is on
+ * the line (also pivoting or searching); LOST only once the steering gave
+ * up; idle with both white is UNKNOWN; lifted is UNKNOWN. */
+static BOOL controller_line_state_test(void)
+{
+	vehicle_controller_context_t c = {0};
+	BOOL ok;
+
+	c.line_position = POS_LOST;
+	ok = straddle_line_state(&c, CONTROLLER_WAITING) == WIFI_TELEMETRY_LINE_UNKNOWN;
+	c.line_position = POS_RIGHT;
+	ok = straddle_line_state(&c, CONTROLLER_WAITING) == WIFI_TELEMETRY_LINE_FOUND && ok;
+	c.line_position = POS_LOST;
+	ok = straddle_init(&c.steering, &s_straddle_config) && ok;
+	c.arm_requested = true;
+	ok = straddle_line_state(&c, CONTROLLER_FOLLOWING) == WIFI_TELEMETRY_LINE_FOUND && ok;
+	c.steering.state = STRADDLE_SEARCH;
+	ok = straddle_line_state(&c, CONTROLLER_FOLLOWING) == WIFI_TELEMETRY_LINE_FOUND && ok;
+	c.steering.stop_latched = true;
+	ok = straddle_line_state(&c, CONTROLLER_FOLLOWING) == WIFI_TELEMETRY_LINE_LOST &&
+	     straddle_line_state(&c, CONTROLLER_WAITING) == WIFI_TELEMETRY_LINE_LOST && ok;
+	c.line_position = POS_LEFT;
+	ok = straddle_line_state(&c, CONTROLLER_WAITING) == WIFI_TELEMETRY_LINE_FOUND && ok;
+	c.picked_up = true;
+	ok = straddle_line_state(&c, CONTROLLER_FOLLOWING) == WIFI_TELEMETRY_LINE_UNKNOWN && ok;
+	return ok;
+}
+
 BOOL vehicle_controller_task_test(void)
 {
 	BOOL lent_ok;
+	BOOL line_state_ok;
 	BOOL arm_ok;
 	BOOL fault_ok;
 	BOOL emergency_ok;
 	BOOL status_ok;
 	BOOL stale_status_ok;
 	BOOL drive_ok;
-	BOOL slope_ok;
+	BOOL hump_ok;
 	BOOL junction_ok;
 	BOOL barcode_ok;
 	TEST_INIT();
@@ -1600,22 +1817,24 @@ BOOL vehicle_controller_task_test(void)
 	status_ok = controller_nonidle_status_test();
 	stale_status_ok = controller_stale_status_test();
 	drive_ok = controller_drive_test();
-	slope_ok = controller_slope_test();
+	hump_ok = controller_hump_test();
 	junction_ok = controller_junction_test();
 	barcode_ok = controller_barcode_test();
 	lent_ok = controller_lent_pickup_test();
+	line_state_ok = controller_line_state_test();
 	TEST_CHECK("VC-U13", arm_ok, "fresh safety inputs and local GO gate ARM/STOP commands");
 	TEST_CHECK("VC-U14", emergency_ok, "local emergency input sends a latched emergency stop");
 	TEST_CHECK("VC-U15", fault_ok, "missing sensor deadlines latch fault and request emergency stop");
 	TEST_CHECK("VC-U16", status_ok, "nonzero commanded output status blocks arming and requests emergency stop");
 	TEST_CHECK("VC-U17", stale_status_ok, "stale motion status faults despite fresh sensor observations");
 	TEST_CHECK("VC-U22", drive_ok, "line following sends steering VELOCITY, accepts commanded motion, stops and faults on unexpected motion");
-	TEST_CHECK("VC-U24", slope_ok, "IMU ramp state selects the SLOPE steering profile, level returns to NORMAL");
-	TEST_CHECK("VC-U26", junction_ok, "junction: approach, stop, spin to the next line (U-turn: second), stop, resume; straight, timeout, no callback");
+	TEST_CHECK("VC-U24", hump_ok, "no blind search while the IMU reports a hump; level again, it searches towards the last-seen side");
+	TEST_CHECK("VC-U26", junction_ok, "junction: approach, stop, spin until the new line reaches the leading sensor (left: into the gap; U-turn: second line), stop, resume; straight, timeout, no callback");
 	TEST_CHECK("VC-U27", barcode_ok, "decoded barcodes are passed to the barcode hook in order and always drained");
 	TEST_CHECK("VC-U28", lent_ok, "lent motors accepted only during a bypass; pick-up while following stops once per lift");
+	TEST_CHECK("VC-U36", line_state_ok, "straddle line state: on the line while following (also pivoting or searching), lost only once given up, unknown idle with both white or lifted");
 	TEST_SUMMARY("vehicle controller task");
 	return arm_ok && fault_ok && emergency_ok && status_ok && stale_status_ok &&
-	       drive_ok && slope_ok && junction_ok && barcode_ok && lent_ok;
+	       drive_ok && hump_ok && junction_ok && barcode_ok && lent_ok && line_state_ok;
 }
 #endif

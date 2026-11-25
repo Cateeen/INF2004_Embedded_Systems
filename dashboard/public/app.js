@@ -28,8 +28,11 @@ function currentState(d, s) {
   const phase = s.run.obstacle.phase;
   if (d.obstacle === 'DETECTED' || ['SCANNING', 'BYPASS', 'SEARCH'].includes(phase)) return ['Avoiding obstacle', 'amber'];
   if (d.terrain === 'HUMP') return ['On hump', 'amber'];
+  if (d.line === 'LOST' && d.vehicle === 'RUNNING') return ['Line lost · stopped', 'red'];
+  const le = s.run.line;
+  if (d.line === 'FOUND' && d.vehicle === 'RUNNING' && le.lastEventAt && s.now - le.lastEventAt < 1500 &&
+      (le.lastEvent === 'PIVOT' || le.lastEvent === 'SEARCH_FOUND')) return ['Recovering line', 'amber'];
   if (d.line === 'FOUND' && d.vehicle === 'RUNNING') return ['Line following', 'green'];
-  if (d.line === 'LOST' && d.vehicle === 'RUNNING') return ['Searching for line', 'amber'];
   return [d.vehicle === 'COMPLETE' ? 'Complete' : 'Idle', ''];
 }
 
@@ -46,7 +49,7 @@ LETTERS.forEach(l => {
 });
 let mappingShown = false;
 function syncMappingForm() {
-  if (latest) { $('mapping-movement').value = latest.mapping[letterSelect.value] || 'forward'; mappingShown = true; }
+  if (latest) { $('mapping-movement').value = latest.mapping[letterSelect.value] || 'left'; mappingShown = true; }
   highlightEditing();
 }
 function highlightEditing() {
@@ -68,10 +71,10 @@ function renderNextJunction(s) {
 function renderMapping(s) {
   const last = s.run.barcodes[0];
   grid.querySelectorAll('.letter').forEach(b => {
-    const mv = s.mapping[b.dataset.letter] || 'forward';
+    const mv = s.mapping[b.dataset.letter] || 'left';
     b.querySelector('.m').textContent = MOVE[mv].icon;
     b.title = b.dataset.letter + ' → ' + MOVE[mv].label;
-    b.classList.toggle('changed', mv !== 'forward');
+    b.classList.toggle('changed', mv !== 'left');
     b.classList.toggle('lastread', !!last && last.letter === b.dataset.letter);
   });
   set('last-barcode-tag', last ? 'LAST DECODED: ' + last.letter : 'NO BARCODE YET');
@@ -89,8 +92,14 @@ function renderMapping(s) {
 function renderCards(s, d) {
   const r = s.run;
   /* Line */
-  set('line-word', !d ? '—' : d.line === 'FOUND' ? 'On line' : d.line === 'LOST' ? 'Line lost' : 'Unknown');
-  set('line-losses', r.startedAt ? r.line.losses + ' time' + (r.line.losses === 1 ? '' : 's') : '—');
+  /* UNKNOWN while not following: both sensors white can mean the tape is
+   * between them (straddle) or not there at all. */
+  set('line-word', !d ? '—' : d.line === 'FOUND' ? 'On line' : d.line === 'LOST' ? 'Line lost'
+    : d.vehicle === 'RUNNING' ? 'Unknown' : 'Between sensors?');
+  const times = n => n + ' time' + (n === 1 ? '' : 's');
+  set('line-losses', r.startedAt ? times(r.line.losses) : '—');
+  set('line-pivots', r.startedAt ? times(r.line.pivots) : '—');
+  set('line-searches', r.startedAt ? r.line.searches + ' found · ' + r.line.centredSearches + ' was centred' : '—');
   set('ir-raw', d && d.ir ? `${d.ir.left ?? d.ir.barcode ?? '—'} / ${d.ir.center ?? '—'} / ${d.ir.right ?? '—'}` : 'not sent');
   const line = d ? d.line : null;
   chip('line-chip', line || '—', line === 'FOUND' ? 'green' : line === 'LOST' ? 'amber' : '');
@@ -145,9 +154,14 @@ function render(s) {
   $('preview-banner').classList.toggle('hidden', !s.preview);
   $('stale-banner').classList.toggle('hidden', !s.stale || s.preview);
   $('pickup-banner').classList.toggle('hidden', !s.run.pickedUp);
-  const [runLabel, runTone] = s.run.pickedUp ? ['Robot stopped · picked up', 'stopped']
-    : s.run.endedAt ? ['Robot stopped', 'stopped']
-    : s.run.startedAt ? ['Robot running', 'running']
+  /* What the car itself reports, not what was last pressed. */
+  const vehicle = connected && d ? d.vehicle : null;
+  const [runLabel, runTone] = !connected && !s.preview ? ['Robot not connected', 'idle']
+    : s.run.pickedUp ? ['Robot stopped · picked up', 'stopped']
+    : vehicle === 'RUNNING' ? ['Robot running', 'running']
+    : vehicle === 'PAUSED' ? ['Robot paused · obstacle', 'running']
+    : vehicle === 'FAULT' ? ['Robot stopped · fault', 'stopped']
+    : s.run.startedAt ? ['Robot stopped', 'stopped']
     : ['Robot idle · not started', 'idle'];
   set('run-text', runLabel);
   $('run-pill').className = 'pill runpill ' + runTone;
@@ -155,7 +169,10 @@ function render(s) {
   if (s.run.pickedUp) set('pickup-detail', 'End of demo');
   set('link-tag', s.preview ? 'PREVIEW' : 'LIVE MQTT');
   set('footer-mode', s.preview ? 'Preview mode · simulated data' : 'Local dashboard · real MQTT data only');
-  ['robot-start', 'robot-stop', 'save-mapping'].forEach(id => { $(id).disabled = !s.brokerConnected; });
+  $('save-mapping').disabled = !s.brokerConnected;
+  /* The run button needs the car itself: it must be sending telemetry. */
+  $('robot-toggle').disabled = !(s.carConnected || s.preview);
+  renderRunButton(d, s.carConnected || s.preview);
 
   if (d) {
     const [state, tone] = currentState(d, s);
@@ -180,8 +197,33 @@ async function post(url, obj) {
     if (!r.ok) throw Error(await r.text());
   } catch (e) { alert('Dashboard request failed: ' + e.message); }
 }
-$('robot-start').addEventListener('click', () => post('/api/command', {type: 'start'}));
-$('robot-stop').addEventListener('click', () => post('/api/command', {type: 'stop'}));
+/* One Start/Stop button, driven by what the car reports (not by what was last
+ * pressed), so it always shows the action that will actually happen:
+ * running (or paused by an obstacle) -> Stop; stopped or idle -> Start;
+ * faulted -> Restart (the car reboots on a Start while faulted). */
+let runButtonSends = 'start';
+function renderRunButton(d, carConnected) {
+  const b = $('robot-toggle');
+  const vehicle = d ? d.vehicle : null;
+  if (!carConnected) {
+    runButtonSends = 'start';
+    b.textContent = 'Robot not connected';
+    b.className = 'action-primary robot-toggle';
+  } else if (vehicle === 'RUNNING' || vehicle === 'PAUSED') {
+    runButtonSends = 'stop';
+    b.textContent = '■ Stop';
+    b.className = 'action-stop robot-toggle';
+  } else if (vehicle === 'FAULT') {
+    runButtonSends = 'start';
+    b.textContent = '↻ Restart robot (fault)';
+    b.className = 'action-stop robot-toggle';
+  } else {
+    runButtonSends = 'start';
+    b.textContent = '▶ Start run';
+    b.className = 'action-primary robot-toggle';
+  }
+}
+$('robot-toggle').addEventListener('click', () => post('/api/command', {type: runButtonSends}));
 $('save-mapping').addEventListener('click', () => post('/api/mapping', {letter: letterSelect.value, movement: $('mapping-movement').value}));
 $('reset-run').addEventListener('click', () => { if (confirm('Clear the run, barcode history and barcode mapping? Next junction returns to Turn left.')) post('/api/run/reset', {}); });
 $('clear-log').addEventListener('click', () => { if (confirm('Clear the event timeline?')) post('/api/events/clear', {}); });

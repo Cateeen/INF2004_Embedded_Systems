@@ -27,6 +27,7 @@
 #include "subsystem6/gpio/gpio_dispatcher.h"
 #include "subsystem3/line_barcode/line_observation_test.h"
 #include "subsystem3/line_barcode/junction_detector.h"
+#include "subsystem3/line_barcode/straddle_junction.h"
 #include "subsystem3/line_barcode/barcode_scanner_test.h"
 #include "subsystem3/line_barcode/line_barcode_task.h"
 #include "subsystem3/line_barcode/line_adc_reader.h"
@@ -43,6 +44,7 @@
 #include "subsystem2/controller/car_gate_test.h"
 #include "subsystem2/controller/line_steering_test.h"
 #include "subsystem2/controller/line_steering.h"
+#include "subsystem2/controller/straddle_steering.h"
 #include "subsystem2/controller/controller_monitor.h"
 #include "subsystem2/controller/vehicle_controller_task.h"
 #include "subsystem2/controller/vehicle_bypass.h"
@@ -152,12 +154,9 @@ static BOOL go_button_test(void)
 /* Motion task speed limit for the faster wheel; the PID gains were verified
  * up to this speed (MOT-H01). Line steering must stay inside it. */
 #define VEHICLE_MAX_SPEED_CM_S		20U
-_Static_assert(LINE_STEERING_SPEED_CM_S + LINE_STEERING_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S &&
-	       LINE_STEERING_TURN_CM_S < LINE_STEERING_SPEED_CM_S,
-	       "line steering speed + turn must fit the motion task speed limit");
-_Static_assert(LINE_STEERING_SLOPE_SPEED_CM_S + LINE_STEERING_SLOPE_TURN_CM_S <=
-	       VEHICLE_MAX_SPEED_CM_S,
-	       "ramp-mode (SLOPE) speed + turn must fit the motion task speed limit");
+_Static_assert(VEHICLE_LINE_SPEED_CM_S + VEHICLE_LINE_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S &&
+	       VEHICLE_LINE_PIVOT_SPEED_CM_S + VEHICLE_LINE_PIVOT_TURN_CM_S <= VEHICLE_MAX_SPEED_CM_S,
+	       "straddle line following speed + turn must fit the motion task speed limit");
 /* Wheels are mirror-mounted: the left encoder counts down when driving
  * forward (verified with BAR-H02), so it is negated. */
 #define VEHICLE_LEFT_SIGN		(-1)
@@ -207,7 +206,31 @@ static void vehicle_go_reset(void *context)
 	if (!button->go && !button->restart) return;
 	button->go = false;
 	button->restart = false;
-	tm_printf((UB*)"stopped: press GO once to start again\n");
+	tm_printf((UB*)"GO is off: press GO once to start\n");
+}
+
+/* GO pressed while faulted: reboot the whole system, as the Pico SDK's
+ * watchdog_reboot() does -- the watchdog resets everything except the
+ * oscillators, and scratch[4] = 0 so the boot ROM starts the flash image
+ * normally. A latched fault has already sent the motors an emergency stop.
+ * Note: the HC-SR04 stays powered, so a stuck ultrasonic sensor still
+ * needs a full power-off. */
+#define VEHICLE_PSM_WDSEL      (0x40010000U + 0x08U)
+#define VEHICLE_PSM_WDSEL_ALL  0x0001fffcU	/* all but ROSC and XOSC */
+#define VEHICLE_WATCHDOG_CTRL  (0x40058000U + 0x00U)
+#define VEHICLE_WATCHDOG_SCRATCH4 (0x40058000U + 0x1cU)
+#define VEHICLE_WATCHDOG_TRIGGER 0x80000000U
+
+static void vehicle_restart(void *context)
+{
+	(void)context;
+	tk_dly_tsk(100);	/* let the console send the last lines */
+	out_w(VEHICLE_WATCHDOG_SCRATCH4, 0U);
+	out_w(VEHICLE_PSM_WDSEL, VEHICLE_PSM_WDSEL_ALL);
+	out_w(VEHICLE_WATCHDOG_CTRL, VEHICLE_WATCHDOG_TRIGGER);
+	for (;;) {
+		/* The reset takes effect at once. */
+	}
 }
 
 static bool vehicle_read_inputs(void *context, vehicle_controller_inputs_t *inputs)
@@ -343,28 +366,39 @@ static void vehicle_start(void)
 	/* Sensor deadlines; producers below publish well inside them. */
 	static const vehicle_controller_task_config_t controller_config = {
 		/* line, IMU, ahead max age; scan timeout; min line confidence;
-		 * obstacle stop mm; 3 s for each stream's first message. */
-		{200U, 200U, 500U, 5000U, 500U, 300U, 3000U},
+		 * obstacle stop mm; 3 s for each stream's first message;
+		 * straddle line sensors (arming needs the floor, not the tape
+		 * under a sensor: centred reads both white). */
+		{200U, 200U, 500U, 5000U, 500U, 200U, 3000U, true},
 		50U,	/* period_ms, <= half the motion status period */
 		500U,	/* motion_status_max_age_ms */
 		vehicle_read_inputs, &s_go_button,
 		vehicle_junction_turn, vehicle_junction_done, NULL,
 		vehicle_barcode, NULL,
-		/* Obstacle at <= 300 mm while following: scan it, drive round it
+		/* Obstacle at <= 200 mm while following: scan it, drive round it
 		 * and rejoin the line (vehicle_bypass, OBS-H03 manoeuvre). */
 		true,
 		/* Stopped by itself: GO toggles off, one press restarts. */
-		vehicle_go_reset
+		vehicle_go_reset,
+		/* Faulted: GO (or dashboard Start) reboots the robot. */
+		vehicle_restart
 	};
 	static const line_barcode_task_config_t line_config = {
-		20U,	/* period_ms */
+		10U,	/* period_ms: as the line_follow and barcode bench tests */
 		200U,	/* odometry_max_age_ms */
-		/* Bench-calibrated for the tested printed code. */
+		/* 35 counts = smallest narrow module expected (bench-calibrated
+		 * code); bigger labels adapt, as the module is learned per frame. */
 		{35U, 25U, 0U, 0U, 0U},
 		NULL, NULL, NULL,	/* reader installed by the ADC helper */
 		/* Junction detection on: mm of wheel travel per odometry count. */
 		VEHICLE_WHEEL_CIRC_CM * 10.0f / (float)VEHICLE_COUNTS_PER_REV,
-		vehicle_barcode_started, NULL
+		vehicle_barcode_started, NULL,
+		/* Barcode colour as SENSOR_TEST=barcode: hysteresis black >= 1000,
+		 * white <= 600; a change counts after 4 counts (0.3 mm) of travel. */
+		1000U, 600U, 4U,
+		/* Line sensors as SENSOR_TEST=line_follow LF_STRADDLE=1: black >=
+		 * 1500, white <= 900 (tape ~2300-3900, floor ~170-300). */
+		1500U, 900U
 	};
 	static const imu_task_config_t imu_config = {
 		50U,	/* period_ms */
@@ -378,9 +412,10 @@ static void vehicle_start(void)
 		2500U,	/* scan_max_age_ms: 9 points x 3 polls x 50 ms ~ 1.3 s */
 		5000U,	/* scan_timeout_ms */
 		500U,	/* command_max_age_ms */
-		/* A latched fault this close. Well under the 300 mm stop distance:
-		 * the robot stops at 300 mm and the bypass works 20-30 cm from the
-		 * obstacle (it looks across at its side from ~20 cm). */
+		/* An "emergency" reading this close (stops at once, no latch).
+		 * Under the 200 mm stop distance: the robot stops at ~200 mm and
+		 * the bypass works from there (it looks across at the obstacle's
+		 * side from ~20 cm). */
 		120U,	/* emergency_distance_mm */
 		NULL, NULL, NULL, NULL	/* callbacks installed by the port */
 	};
@@ -473,17 +508,24 @@ IMPORT UW tm_usb_state(void);
  * port, so no boot message is printed before anyone can read it.  DTR
  * (state 3) is how a terminal announces itself, but some terminal programs
  * never assert it, so once the USB link is enumerated (state 2) a timeout
- * lets the run proceed anyway.
+ * lets the run proceed anyway.  With no USB host at all (running on
+ * battery, or rebooted after the cable was pulled) the link never
+ * enumerates, so after a short wait the run starts without a monitor;
+ * output stays queued in the console ring until a host connects.
  */
 LOCAL void wait_for_serial_monitor(void)
 {
 	UW	enumerated_ms = 0;
+	UW	no_host_ms = 0;
 
 	tm_printf((UB*)"waiting for serial monitor...\n");
 	while (tm_usb_state() < 3U) {
 		if (tm_usb_state() == 2U) {
 			enumerated_ms += 100U;
 			if (enumerated_ms >= 60000U) break;	/* DTR-less terminal */
+		} else {
+			no_host_ms += 100U;
+			if (no_host_ms >= 5000U) break;		/* no USB host */
 		}
 		tk_dly_tsk(100);
 	}
@@ -555,7 +597,10 @@ EXPORT INT usermain(void)
 	}
 #endif
 #if APP_SENSOR_TEST
-#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC
+	/* The Wi-Fi test (19) starts at once, like the vehicle build, so the
+	 * dashboard link comes up with or without a serial monitor; its output
+	 * stays queued in the USB console ring until a monitor opens. */
+#if defined(TM_CONSOLE_USB_CDC) && TM_CONSOLE_USB_CDC && APP_SENSOR_TEST != 19
 	wait_for_serial_monitor();
 #endif
 #if APP_SENSOR_TEST == 5
@@ -615,6 +660,12 @@ EXPORT INT usermain(void)
 	if (!junction_detector_test()) {
 		for (;;) {
 			tm_printf((UB*)"[TEST] JN FAIL  junction detector; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!straddle_junction_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] JN FAIL  straddle junction detector; tasks not started\n");
 			tk_dly_tsk(1000);
 		}
 	}
@@ -695,11 +746,17 @@ EXPORT INT usermain(void)
 			tm_printf((UB*)"[TEST] VC FAIL  line steering; tasks not started\n");
 			tk_dly_tsk(1000);
 		}
-		if (!go_button_test()) {
-			for (;;) {
-				tm_printf((UB*)"[TEST] GO FAIL  button tests; tasks not started\n");
-				tk_dly_tsk(1000);
-			}
+	}
+	if (!go_button_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] GO FAIL  button tests; tasks not started\n");
+			tk_dly_tsk(1000);
+		}
+	}
+	if (!straddle_steering_test()) {
+		for (;;) {
+			tm_printf((UB*)"[TEST] VC FAIL  straddle steering; tasks not started\n");
+			tk_dly_tsk(1000);
 		}
 	}
 	if (!controller_monitor_test()) {

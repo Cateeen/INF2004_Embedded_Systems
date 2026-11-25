@@ -49,6 +49,25 @@ static void report_fault(uint16_t code, uint32_t timestamp_ms)
 	fault.code = code;
 	fault.recoverable = 0U;
 	tm_printf((UB*)"odometry stopped; fault code %u\n", (unsigned)code);
+	if (code == VEHICLE_FAULT_CODE_ODOMETRY_SOURCE) {
+		/* Which wheel and why the encoder decoder gave up (this task is
+		 * pinned to core 0, as encoder_source_fault requires). */
+		encoder_fault_t f;
+
+		if (encoder_source_fault(&f) >= E_OK && f.reason != ENCODER_FAULT_NONE) {
+			tm_printf((UB*)"  ENCODER FAULT: %s wheel, reason %u (1 both channels "
+				  "jumped, over the limit of %u; 2 lost edge; 3 bad level), "
+				  "%u glitches and %u both-channel jumps tolerated before it\n",
+				  f.wheel == 1U ? "LEFT" : "RIGHT", (unsigned)f.reason,
+				  (unsigned)ENCODER_AMBIGUOUS_LIMIT, (unsigned)f.glitches,
+				  (unsigned)f.ambiguous);
+			tm_printf((UB*)"  fault detail: edges 0x%02x, state AB %u%u -> %u%u, count %d\n",
+				  (unsigned)f.events, (unsigned)((f.previous_state >> 1) & 1U),
+				  (unsigned)(f.previous_state & 1U),
+				  (unsigned)((f.current_state >> 1) & 1U),
+				  (unsigned)(f.current_state & 1U), (int)f.count);
+		}
+	}
 
 	for (;;) {
 		ER er;

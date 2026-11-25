@@ -34,6 +34,12 @@
 #define OBS_PICO_EDGE_RISE_BIT 3U
 #define OBS_PICO_EDGE_FALL_BIT 2U
 #define OBS_PICO_TRIGGER_PULSE_US 10U
+/* Echo edges this soon after the trigger are ignored: the HC-SR04 sends its
+ * 8-cycle 40 kHz burst (200 us) before Echo can rise, so anything earlier is
+ * the trigger pulse coupling onto the echo wire. Without this, such a glitch
+ * reads as an instant echo, clamped to the 20 mm floor ("obstacle at 20 mm"
+ * that stays until the wiring moves). */
+#define OBS_PICO_ECHO_BLANK_US 150U
 
 typedef struct {
 	obs_pico_port_config_t hardware;
@@ -57,9 +63,27 @@ typedef struct {
 	bool have_trigger;
 	bool have_stale_echo_time;
 	bool rise_fed_to_capture;
+	/* Why the last E_IO happened (diagnostics), and the last one printed,
+	 * so a retrying caller does not flood the console. */
+	const char *io_reason;
+	const char *io_reason_logged;
 } obs_pico_port_state_t;
 
 static obs_pico_port_state_t s_port;
+
+static ER io_fail(const char *why)
+{
+	s_port.io_reason = why;
+	return E_IO;
+}
+
+/* Print why the last E_IO happened, once per change of reason. */
+static void log_io_reason(void)
+{
+	if (s_port.io_reason == NULL || s_port.io_reason == s_port.io_reason_logged) return;
+	tm_printf((UB*)"ultrasonic: %s\n", s_port.io_reason);
+	s_port.io_reason_logged = s_port.io_reason;
+}
 /* Diagnostic copy of the last complete scan; guarded by DI/EI. */
 static obs_task_sample_t s_last_scan;
 static uint32_t s_last_scan_sequence;
@@ -86,11 +110,13 @@ static void echo_irq(const uint32_t events[GPIO_IRQ_GROUPS],
 	rise_bit = 1U << OBS_PICO_EDGE_RISE_BIT;
 	fall_bit = 1U << OBS_PICO_EDGE_FALL_BIT;
 	if (!s_port.capture_active) return;
+	timestamp = timer_us();
+	if (timestamp - s_port.capture.trigger_time_us < OBS_PICO_ECHO_BLANK_US)
+		return;         /* trigger crosstalk, not an echo */
 	if ((pin_events & rise_bit) != 0U && (pin_events & fall_bit) != 0U) {
 		s_port.irq_edge_state = 3U;
 		return;
 	}
-	timestamp = timer_us();
 	if ((pin_events & rise_bit) != 0U) {
 		if (s_port.irq_edge_state != 0U) {
 			s_port.irq_edge_state = 3U;
@@ -311,8 +337,21 @@ static ER start_capture(uint32_t now_ms)
 			s_port.stale_echo_started_us = now_us;
 			s_port.have_stale_echo_time = true;
 		}
-		return now_us - s_port.stale_echo_started_us >
-		       s_port.hardware.stale_echo_timeout_us ? E_IO : E_BUSY;
+		if (now_us - s_port.stale_echo_started_us <=
+		    s_port.hardware.stale_echo_timeout_us)
+			return E_BUSY;
+		/* Stuck high (e.g. the Pico was reset mid-ping and the sensor,
+		 * still powered, never finished). Some HC-SR04 modules let go
+		 * on a fresh trigger: send one, so a retrying caller gives the
+		 * sensor a chance to recover before it reports a fault. */
+		if (gpio_set_val(OBS_PICO_TRIGGER_PIN, 1U) == E_OK) {
+			uint32_t pulse_us = timer_us();
+			while (timer_us() - pulse_us < OBS_PICO_TRIGGER_PULSE_US) {
+			}
+			(void)gpio_set_val(OBS_PICO_TRIGGER_PIN, 0U);
+		}
+		s_port.have_stale_echo_time = false;    /* time the next wait afresh */
+		return io_fail("echo held high before the ping (sensor stuck mid-measurement)");
 	}
 	s_port.have_stale_echo_time = false;
 	if (s_port.have_trigger &&
@@ -376,18 +415,20 @@ static ER poll_capture(uint32_t now_ms, uint16_t *distance_mm,
 	hcsr04_capture_result_t capture_result;
 
 	*measurement_ready = false;
-	if (edges == 3U) return E_IO;
+	if (edges == 3U) return io_fail("echo edges out of order (noise on the echo wire)");
 	if (edges == 1U && !s_port.rise_fed_to_capture) {
 		capture_result = hcsr04_capture_poll(&s_port.capture, true,
 						     rise_us, &pulse_us);
-		if (capture_result == HCSR04_CAPTURE_INVALID) return E_IO;
+		if (capture_result == HCSR04_CAPTURE_INVALID)
+			return io_fail("echo rise rejected");
 		s_port.rise_fed_to_capture = true;
 	}
 	if (edges == 2U) {
 		if (!s_port.rise_fed_to_capture) {
 			capture_result = hcsr04_capture_poll(&s_port.capture, true,
 							     rise_us, &pulse_us);
-			if (capture_result == HCSR04_CAPTURE_INVALID) return E_IO;
+			if (capture_result == HCSR04_CAPTURE_INVALID)
+				return io_fail("echo rise rejected");
 			s_port.rise_fed_to_capture = true;
 		}
 		capture_result = hcsr04_capture_poll(&s_port.capture, false,
@@ -399,7 +440,7 @@ static ER poll_capture(uint32_t now_ms, uint16_t *distance_mm,
 				*measurement_ready = true;
 				return E_OK;
 			}
-			return E_IO;
+			return io_fail("echo pulse timing invalid");
 		}
 		if (capture_result == HCSR04_CAPTURE_TIMEOUT) {
 			*distance_mm = OBS_DIST_NONE;
@@ -410,11 +451,22 @@ static ER poll_capture(uint32_t now_ms, uint16_t *distance_mm,
 		    !hcsr04_distance_mm(pulse_us,
 					s_port.hardware.sound_speed_mm_s,
 					distance_mm))
-			return E_IO;
+			return io_fail("echo distance calculation failed");
+		if (*distance_mm < s_port.hardware.min_range_mm) {
+			/* Shorter than the sensor can measure: a glitch, not an
+			 * object. Retry; after the usual attempts it is a sensor
+			 * fault, said plainly, instead of "obstacle at 20 mm". */
+			if (++s_port.attempts >= s_port.hardware.max_no_response_attempts) {
+				tm_printf((UB*)"ultrasonic: %u echoes in a row shorter than %u mm -- "
+					  "echo wire picking up the trigger, or the sensor is stuck\n",
+					  (unsigned)s_port.attempts,
+					  (unsigned)s_port.hardware.min_range_mm);
+				return io_fail("echoes shorter than the minimum range");
+			}
+			return E_OK;
+		}
 		if (*distance_mm > s_port.hardware.max_range_mm)
 			*distance_mm = OBS_DIST_NONE;
-		else if (*distance_mm < s_port.hardware.min_range_mm)
-			*distance_mm = s_port.hardware.min_range_mm;
 		*measurement_ready = true;
 		s_port.attempts = 0U;
 		return E_OK;
@@ -426,7 +478,7 @@ static ER poll_capture(uint32_t now_ms, uint16_t *distance_mm,
 		complete_capture();
 		if (++s_port.attempts >=
 		    s_port.hardware.max_no_response_attempts)
-			return E_IO;
+			return io_fail("no echo at all after the pings (sensor unpowered or not triggering)");
 		return E_OK;
 	}
 
@@ -436,7 +488,7 @@ static ER poll_capture(uint32_t now_ms, uint16_t *distance_mm,
 		if (!s_port.rise_fed_to_capture) {
 			if (++s_port.attempts >=
 			    s_port.hardware.max_no_response_attempts)
-				return E_IO;
+				return io_fail("echo never rose before the timeout");
 			return E_OK;
 		}
 		*distance_mm = OBS_DIST_NONE;
@@ -523,13 +575,23 @@ static ER poll(void *context, obs_task_mode_t mode, obs_task_sample_t *sample)
 	if (!s_port.capture_active) {
 		er = start_capture(now.lo);
 		if (er == E_BUSY) return E_OK;
-		if (er != E_OK) return er;
+		if (er != E_OK) {
+			log_io_reason();
+			return er;
+		}
 		return E_OK;
 	}
 
 	er = poll_capture(now.lo, &distance_mm, &measurement_ready);
 	if (er == E_BUSY) return E_OK;
-	if (er != E_OK) return er;
+	if (er != E_OK) {
+		/* Drop the failed measurement, so a caller that retries (the
+		 * obstacle task before its first reading) gets a fresh ping
+		 * instead of the same garbled edges again. */
+		complete_capture();
+		log_io_reason();
+		return er;
+	}
 	if (measurement_ready)
 		return publish_measurement(distance_mm, s_port.trigger_ms, sample);
 	return E_OK;

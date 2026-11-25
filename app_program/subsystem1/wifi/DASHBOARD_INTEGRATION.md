@@ -27,6 +27,9 @@ Each subsystem reports to the Mission Control dashboard (`dashboard/`) with one 
 | Buddy 5 | Fine scan finished | `dashboard_report_obstacle_profile(width_mm, left_mm, right_mm, DASHBOARD_SIDE_LEFT)` | Width, clearances, bypass side |
 | Buddy 5 | Avoidance phase changes | `dashboard_report_avoid_phase(DASHBOARD_AVOID_SEARCH)` | Obstacle card chip |
 | Buddy 5 | Back on the line | `dashboard_report_line_rejoined()` | Phase REJOINED |
+| Buddy 2 | Straddle steering pivots at a bend, a search ends, or the line is given up (the controller sends these) | `dashboard_report_line_event(DASHBOARD_LINE_PIVOT)` (`_SEARCH_FOUND`, `_SEARCH_CENTRED`, `_LOST`) | Line card: bend pivots, searches; timeline (centred searches are counted, not logged) |
+
+Line state in telemetry (straddle sensors, the tape runs between them): while following it is FOUND, including pivots and searches, and LOST only once the car has given up; when not following, both sensors white is UNKNOWN (shown as "Between sensors?"), since the tape may be between them or absent; lifted is UNKNOWN.
 
 ## Junction turn (from the dashboard)
 

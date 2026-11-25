@@ -25,7 +25,7 @@
  * (these override LINE_STEERING_SPEED_CM_S / LINE_STEERING_TURN_CM_S for this
  * build only; copy what works into line_steering.h).
  *
- * Note: the vehicle adds a little latency this test does not (line task 20 ms
+ * Note: the vehicle adds a little latency this test does not (line task 10 ms
  * + controller 50 ms + motion mailbox); raise LF_STEER_MS to mimic more.
  *
  * Safety: nothing moves until GO (GP20); GO during a run stops the motors.
@@ -78,11 +78,35 @@
 #ifndef LF_BC_SENSOR_Y_MM
 #define LF_BC_SENSOR_Y_MM 40  /* barcode sensor left of the robot's centreline */
 #endif
+#ifndef LF_BC_SLOW
+#define LF_BC_SLOW 0          /* cm/s over a barcode (straddle only); 0 = no slow-down */
+#endif
+#ifndef LF_BC_SLOW_MM
+#define LF_BC_SLOW_MM 60U     /* back to full speed after this much white */
+#endif
 
 #ifndef LF_SLOPE
 #define LF_SLOPE 0            /* 1: whole run on the SLOPE (ramp) profile; no IMU here */
 #endif
-#if LF_SLOPE
+
+/*
+ * LF_STRADDLE=1: test-only "straddle" steering instead of line_steering.c
+ * (the vehicle code is not touched): the line sensors sit further apart than
+ * the tape, tape in the gap = straight, one sensor = gentle turn, held too
+ * long = pivot back to the bend, both white too long = search. Logic and
+ * LF_SL_* settings: straddle_hwtest.h. Speed and steering default to the
+ * MAIN ROBOT's (vehicle_controller_task.h; LF_SPEED / LF_SL_* on the make
+ * line override them); LF_TURN, LF_TURN_MIN, LF_RAMP_MS and LF_SLOPE are
+ * unused in this mode.
+ */
+#include "straddle_hwtest.h"
+
+#if LF_STRADDLE
+#define SPEED  LF_SL_SPEED
+#define TURN   LF_SL_TURN
+#define TMIN   LF_SL_TURN
+#define RAMP   0
+#elif LF_SLOPE
 #define SPEED  LINE_STEERING_SLOPE_SPEED_CM_S
 #define TURN   LINE_STEERING_SLOPE_TURN_CM_S
 #define TMIN   LINE_STEERING_SLOPE_TURN_MIN_CM_S
@@ -104,6 +128,10 @@ _Static_assert(LF_STEER_MS >= 10U && LF_STEER_MS <= 200U && LF_STEER_MS % 10U ==
 _Static_assert(LF_TRACE <= 1U, "LF_TRACE must be 0 or 1");
 _Static_assert(LF_TRACK_MM >= 80U && LF_TRACK_MM <= 200U, "need 80 <= LF_TRACK_MM <= 200");
 _Static_assert((LF_FF) >= 0.0 && (LF_FF) <= 5.0, "need 0 <= LF_FF <= 5");
+_Static_assert(LF_BC_SLOW == 0 || (LF_STRADDLE && LF_BARCODE && LF_BC_SLOW > TURN &&
+				   LF_BC_SLOW <= SPEED),
+	       "LF_BC_SLOW needs LF_STRADDLE=1 LF_BARCODE=1 and LF_SL_TURN < LF_BC_SLOW <= speed");
+_Static_assert(LF_BC_SLOW_MM >= 10U && LF_BC_SLOW_MM <= 500U, "need 10 <= LF_BC_SLOW_MM <= 500");
 
 /* Wheel speed PID: same as motion_config in app_main.c (MOT-H01). */
 #define PID_KP             2.0f
@@ -147,6 +175,11 @@ _Static_assert((LF_FF) >= 0.0 && (LF_FF) <= 5.0, "need 0 <= LF_FF <= 5");
 #define LOST_CROSS_RISE    150U    /* right raw above its white floor while LOST =
 				    * tape crossed toward it (went wide: rise ~30;
 				    * turned past the tape: rise ~440) */
+#define MIN_WHEEL_CM_S     0.5f    /* PID needs targets > 0: "stopped" inner wheel */
+#define STALL_EXEMPT_CM_S  3.0f    /* a wheel asked for less is not stall-checked */
+
+/* Both white is LOST for the ramped steering, but "centred" for straddle. */
+#define IS_LOST(p)         (!LF_STRADDLE && (p) == POS_LOST)
 
 typedef enum { RUN_OK = 0, RUN_LINE_LOST, RUN_ABORT_GO, RUN_TIMEOUT, RUN_STALL_L,
 	       RUN_STALL_R, RUN_WRONG_L, RUN_WRONG_R, RUN_ENCODER, RUN_SENSOR,
@@ -184,7 +217,27 @@ typedef struct {
 	uint16_t c_min, c_max, r_min, r_max;
 	uint16_t lost_right_peak;       /* highest right raw in the latest LOST stretch */
 	uint16_t lost_centre_peak;      /* highest centre raw in the latest LOST stretch */
+	/* LF_STRADDLE only */
+	unsigned sl_corrections;        /* gentle corrections started */
+	unsigned sl_recoveries;         /* overshoot pivots */
+	unsigned sl_searches;           /* blind searches */
+	unsigned sl_false_searches;     /* ... that found the tape on the OTHER sensor */
+	unsigned sl_counters;           /* counter-steers after a correction */
+	uint32_t sl_longest_correct_ms, sl_longest_recover_ms;
+	uint8_t sl_state_at_end;
 } run_result_t;
+
+/* Wheel targets from a speed/turn command; a wheel asked to stop or reverse
+ * is held at MIN_WHEEL_CM_S (the PID only drives forward, targets > 0). */
+static bool set_targets(wheel_speed_control_t *pid, line_steering_command_t c,
+			float *left, float *right)
+{
+	*left = (float)(c.linear_cm_s - c.turn_cm_s);
+	*right = (float)(c.linear_cm_s + c.turn_cm_s);
+	if (*left < MIN_WHEEL_CM_S) *left = MIN_WHEEL_CM_S;
+	if (*right < MIN_WHEEL_CM_S) *right = MIN_WHEEL_CM_S;
+	return wheel_speed_control_set_targets(pid, *left, *right);
+}
 
 static sample_t s_samples[MAX_SAMPLES];
 static bool s_go_last_pressed;
@@ -255,19 +308,25 @@ static bool read_line(line_adc_reader_t *reader, ir_readings_t *ir, uint8_t *pos
 	uint32_t ts;
 
 	if (line_adc_reader_read_line(reader, ir, &ts) != E_OK) return false;
+#if LF_STRADDLE
+	sl_hysteresis(ir);
+#endif
 	*pos = line_following_position(ir);
 	return true;
 }
 
 #if LF_BARCODE
 /*
- * Barcode decoding while following (LF_BARCODE=1). Two decoders read the
- * left (barcode) sensor on the same pass, both with the vehicle's barcode
- * settings (LF_BC_MODULE counts per narrow module, 25 % tolerance):
- *   A "vehicle": a sample every 20 ms, black above 1000 -- exactly what the
- *     vehicle's line task does now;
- *   B "fast": a sample every 2 ms, hysteresis (black >= 1000, white <= 600)
- *     and a 4-count debounce -- as the bench barcode test;
+ * Barcode decoding while following (LF_BARCODE=1). Three decoders read the
+ * left (barcode) sensor on the same pass, all with the vehicle's barcode
+ * settings (LF_BC_MODULE counts per narrow module, 25 % tolerance; the
+ * barcode's real size is learned per frame):
+ *   A "vehicle": exactly the vehicle's line task (line_barcode_task.c): a
+ *     sample every 10 ms, hysteresis (black >= 1000, white <= 600), 4-count
+ *     debounce, and the distance from odometry published every 50 ms and
+ *     extrapolated at the last rate in between (sample_count);
+ *   B "fast": a sample every 2 ms with fresh encoder counts, same hysteresis
+ *     and debounce -- the best this sensor can do, the reference;
  *   C "fast + at sensor": as B, but the distance is the travel of the point
  *     under the barcode sensor (LF_BC_SENSOR_Y_MM left of the robot's
  *     centre), not of the centre: when the robot yaws, a point off the
@@ -277,10 +336,18 @@ static bool read_line(line_adc_reader_t *reader, ir_readings_t *ir, uint8_t *pos
  * If B decodes and A does not, the vehicle's sampling is too slow for the
  * speed; if only C decodes, the wiggle (yaw) distorts the widths; if none
  * does, look at the widths, rejects and the wiggle.
+ *
+ * LF_BC_SLOW=<cm/s> (straddle): drop to that speed at the first black A sees
+ * on the barcode sensor, back to full speed once it has read white for
+ * LF_BC_SLOW_MM -- the slow-down the vehicle would do, applied at the
+ * controller's 50 ms steering rate. Compare A's result with and without it.
  */
 #define BC_FAST_MS        2U
 #define BC_READ_US        200U    /* time one barcode ADC read takes, roughly */
-#define BC_SLOW_MS        20U
+#define BC_SLOW_MS        10U     /* = line task period_ms in app_main.c */
+#define BC_ODOM_MS        50U     /* = odometry task period in app_main.c */
+#define BC_ODOM_MAX_AGE   200U    /* = line task odometry_max_age_ms */
+#define BC_MIN_SAMPLES    3.0f    /* vehicle samples per narrow bar for a safe margin */
 #define BC_WHITE_ADC      600U
 #define BC_BLACK_ADC      LINE_ADC_BARCODE_BLACK_THRESHOLD
 #define BC_DEBOUNCE       4
@@ -300,9 +367,18 @@ typedef struct {
 static const barcode_scanner_config_t s_bc_config = {LF_BC_MODULE, 25U, 0U, 0U, 0U};
 static bc_decoder_t s_bc[BC_DECODERS];  /* [0] A vehicle, [1] B fast, [2] C at sensor */
 static const char *const s_bc_name[BC_DECODERS] = {
-	"A vehicle 20ms", "B fast 2ms", "C fast, at sensor"
+	"A vehicle 10ms", "B fast 2ms", "C fast, at sensor"
 };
 static uint32_t s_bc_last_slow_ms;
+/* Decoder A's distance, as the vehicle's line task gets it. */
+static int32_t s_odo_count;
+static uint32_t s_odo_ms;
+static float s_odo_rate;                /* counts per ms over the last period */
+/* LF_BC_SLOW: slowed down over a barcode. */
+static bool s_bc_slow;
+static int32_t s_bc_white_start;
+static unsigned s_bc_slowdowns;
+static float s_bc_slow_mm;
 static uint16_t s_bc_adc_min, s_bc_adc_max;
 /* While either decoder is inside a barcode: how the robot moved. */
 static bool s_bc_was_over;
@@ -374,6 +450,13 @@ static bool bc_start(line_adc_reader_t *reader)
 	}
 	s_bc_last_slow_ms = now_ms();
 	s_bc_last_track_ms = s_bc_last_slow_ms;
+	s_odo_count = count;
+	s_odo_ms = s_bc_last_slow_ms;
+	s_odo_rate = 0.0f;
+	s_bc_slow = false;
+	s_bc_white_start = count;
+	s_bc_slowdowns = 0U;
+	s_bc_slow_mm = 0.0f;
 	s_bc_any_edge = false;
 	s_bc_last_seq = s_bc[1].scanner.edge.sequence;
 	s_bc_now_count = s_bc_last_edge_count = count;
@@ -414,7 +497,7 @@ static void bc_events(unsigned i)
 	}
 }
 
-/* One 2 ms sample: decoders B and C every time, decoder A every 20 ms. */
+/* One 2 ms sample: decoders B and C every time, decoder A every 10 ms. */
 static bool bc_sample(line_adc_reader_t *reader)
 {
 	ir_readings_t ir;
@@ -444,15 +527,60 @@ static bool bc_sample(line_adc_reader_t *reader)
 	}
 	bc_events(1U);
 
-	/* A: what the vehicle sees. */
+	/* A: what the vehicle sees. Odometry arrives every 50 ms; between
+	 * messages the line task extrapolates at the last measured rate. */
 	now = now_ms();
+	if ((uint32_t)(now - s_odo_ms) >= BC_ODOM_MS) {
+		s_odo_rate = (float)(int32_t)((uint32_t)count - (uint32_t)s_odo_count) /
+			     (float)(uint32_t)(now - s_odo_ms);
+		s_odo_count = count;
+		s_odo_ms = now;
+	}
 	if ((uint32_t)(now - s_bc_last_slow_ms) >= BC_SLOW_MS) {
+		uint32_t since = now - s_odo_ms;
+		int32_t vehicle_count, edge_a;
+
+		if (since > BC_ODOM_MAX_AGE) since = BC_ODOM_MAX_AGE;
+		vehicle_count = (int32_t)((uint32_t)s_odo_count +
+			(uint32_t)(int32_t)__builtin_lroundf(s_odo_rate * (float)since));
 		s_bc_last_slow_ms = now;
-		s_bc[0].black = raw > BC_BLACK_ADC;
-		if (!barcode_scanner_update(&s_bc[0].scanner, s_bc[0].black, count)) return false;
+		s_bc[0].black = raw >= BC_BLACK_ADC ? true :
+				(raw <= BC_WHITE_ADC ? false : s_bc[0].black);
+		if (!bc_fast_update(0U, s_bc[0].black, vehicle_count, &edge_a)) return false;
 		bc_events(0U);
 	}
+
+	/* LF_BC_SLOW: slow from the first black the vehicle's reading sees,
+	 * until it has read white for LF_BC_SLOW_MM (true travel). */
+	if (LF_BC_SLOW > 0) {
+		if (s_bc[0].deb_black) {
+			if (!s_bc_slow) s_bc_slowdowns++;
+			s_bc_slow = true;
+			s_bc_white_start = count;
+		} else if (s_bc_slow) {
+			int32_t moved = (int32_t)((uint32_t)count - (uint32_t)s_bc_white_start);
+
+			if ((float)(moved < 0 ? -moved : moved) * BC_MM_PER_COUNT >=
+			    (float)LF_BC_SLOW_MM)
+				s_bc_slow = false;
+		}
+	}
 	return true;
+}
+
+/* Straight/correcting speed for the next steering update. */
+static int16_t bc_speed(void)
+{
+	return (LF_BC_SLOW > 0 && s_bc_slow) ? (int16_t)LF_BC_SLOW : (int16_t)SPEED;
+}
+
+/* Mean narrow width in mm over the frames decoder i read (0 if none). */
+static float bc_narrow_mm(unsigned i)
+{
+	const barcode_stats_t *st = barcode_scanner_get_stats(&s_bc[i].scanner);
+
+	return st->narrow.count ? (float)st->narrow.sum / (float)st->narrow.count *
+				  BC_MM_PER_COUNT : 0.0f;
 }
 
 /* Called every line tick (time t ms) with the heading (rad), travel since
@@ -465,6 +593,7 @@ static void bc_track(float h, float ds, int turn, uint32_t t)
 	uint32_t dt = t - s_bc_last_track_ms;
 
 	s_bc_last_track_ms = t;
+	if (s_bc_slow) s_bc_slow_mm += ds;
 	if (!over) {
 		s_bc_was_over = false;
 		return;
@@ -488,14 +617,21 @@ static void bc_track(float h, float ds, int turn, uint32_t t)
 
 static void bc_report(void)
 {
-	const float module_mm = (float)LF_BC_MODULE * BC_MM_PER_COUNT;
 	float speed = s_bc_over_ms > 0.0f ? s_bc_over_mm / s_bc_over_ms * 100.0f : 0.0f;
+	/* Narrow bar as measured (B is the most accurate); else the config. */
+	float module_mm = bc_narrow_mm(1U) > 0.0f ? bc_narrow_mm(1U) :
+			  (bc_narrow_mm(0U) > 0.0f ? bc_narrow_mm(0U) :
+			   (float)LF_BC_MODULE * BC_MM_PER_COUNT);
 	char b1[16], b2[16], b3[16], b4[16];
 	unsigned i;
 
-	tm_printf((UB*)TAG "  BARCODE (narrow module %u counts = %s mm; left sensor raw %u..%u, "
-		  "black > %u)\n", (unsigned)LF_BC_MODULE, f1(b1, module_mm),
-		  (unsigned)s_bc_adc_min, (unsigned)s_bc_adc_max, (unsigned)BC_BLACK_ADC);
+	tm_printf((UB*)TAG "  BARCODE (narrow bar measured %s mm; left sensor raw %u..%u, black "
+		  ">= %u, white <= %u)\n", f1(b1, module_mm), (unsigned)s_bc_adc_min,
+		  (unsigned)s_bc_adc_max, (unsigned)BC_BLACK_ADC, (unsigned)BC_WHITE_ADC);
+	if (LF_BC_SLOW > 0)
+		tm_printf((UB*)TAG "  slow-down: %u x to %u cm/s, %s mm driven slowly (full speed "
+			  "%u cm/s)\n", s_bc_slowdowns, (unsigned)LF_BC_SLOW, f1(b1, s_bc_slow_mm),
+			  (unsigned)SPEED);
 	for (i = 0U; i < BC_DECODERS; i++) {
 		const barcode_stats_t *st = barcode_scanner_get_stats(&s_bc[i].scanner);
 		barcode_scanner_config_t suggested;
@@ -511,8 +647,9 @@ static void bc_report(void)
 				  (unsigned)(st->wide.count ? st->wide.min : 0U),
 				  (unsigned)(st->wide.count ? st->wide.max : 0U));
 		if (barcode_scanner_suggest_config(&s_bc[i].scanner, &suggested))
-			tm_printf((UB*)TAG "      widths fit LF_BC_MODULE=%u best\n",
-				  (unsigned)suggested.counts_per_module);
+			tm_printf((UB*)TAG "      mean narrow width %u counts (%s mm)\n",
+				  (unsigned)suggested.counts_per_module,
+				  f1(b1, (float)suggested.counts_per_module * BC_MM_PER_COUNT));
 	}
 	if (s_bc_passes == 0U) {
 		tm_printf((UB*)TAG "  HINT: no barcode was seen. The left sensor needs raw > %u on the "
@@ -523,26 +660,39 @@ static void bc_report(void)
 	tm_printf((UB*)TAG "  over the barcode: %s mm at %s cm/s; heading swung %s deg; steering "
 		  "changed %u x, up to +/-%d cm/s\n", f1(b1, s_bc_over_mm), f1(b2, speed),
 		  f1(b3, (s_bc_h_max - s_bc_h_min) * RAD2DEG), s_bc_turn_changes, s_bc_turn_max);
-	if (speed > 0.0f)
-		tm_printf((UB*)TAG "  at %s cm/s a narrow bar lasts %s ms: A gets ~%s samples per narrow "
-			  "bar, B ~%s\n", f1(b1, speed), f1(b2, module_mm / speed * 100.0f),
-			  f1(b3, module_mm / speed * 100.0f / (float)BC_SLOW_MS),
+	if (speed > 0.0f) {
+		float a_samples = module_mm / speed * 100.0f / (float)BC_SLOW_MS;
+		/* cm/s at which the vehicle gets BC_MIN_SAMPLES per narrow bar */
+		float safe = module_mm / (BC_MIN_SAMPLES * (float)BC_SLOW_MS) * 100.0f;
+
+		tm_printf((UB*)TAG "  at %s cm/s a narrow bar lasts %s ms: A (vehicle) gets ~%s samples "
+			  "per narrow bar, B ~%s\n", f1(b1, speed), f1(b2, module_mm / speed * 100.0f),
+			  f1(b3, a_samples),
 			  f1(b4, module_mm / speed * 100.0f / (float)BC_FAST_MS));
+		tm_printf((UB*)TAG "  SPEED: for >= %u vehicle samples per narrow bar this barcode needs "
+			  "<= %s cm/s over it -> %s\n", (unsigned)BC_MIN_SAMPLES, f1(b1, safe),
+			  a_samples >= BC_MIN_SAMPLES ? "no slow-down needed for this size" :
+			  (LF_BC_SLOW > 0 ? "still too fast: lower LF_BC_SLOW" :
+			   "SLOW DOWN over barcodes (try LF_BC_SLOW below that)"));
+	}
 	if (s_bc[2].decoded[0] && !s_bc[1].decoded[0])
 		tm_printf((UB*)TAG "  VERDICT: only C decodes -- the yaw (wiggle) distorts the bar "
 			  "widths at the off-centre sensor; measure distance at the sensor.\n");
 	else if (s_bc[1].decoded[0] && !s_bc[0].decoded[0])
-		tm_printf((UB*)TAG "  VERDICT: the fast reading decodes, the vehicle's 20 ms reading "
-			  "does not -- the vehicle samples the barcode too slowly for this speed.\n");
+		tm_printf((UB*)TAG "  VERDICT: the fast reading decodes, the vehicle's 10 ms reading "
+			  "does not -- too fast for the vehicle's sampling%s.\n",
+			  LF_BC_SLOW > 0 ? " even with the slow-down" :
+			  "; try LF_BC_SLOW (e.g. 5)");
 	else if (s_bc[0].decoded[0])
-		tm_printf((UB*)TAG "  VERDICT: the vehicle's reading decodes at this speed.\n");
+		tm_printf((UB*)TAG "  VERDICT: the vehicle's reading decodes at %s.\n",
+			  LF_BC_SLOW > 0 ? "this slow-down" : "full line-following speed");
 	else if ((s_bc_h_max - s_bc_h_min) * RAD2DEG > 10.0f)
 		tm_printf((UB*)TAG "  VERDICT: neither decodes and the heading swung over 10 deg over "
 			  "the barcode -- wiggle is a likely cause (compare the widths above).\n");
 	else
 		tm_printf((UB*)TAG "  VERDICT: neither decodes. Compare the widths with %u per narrow "
-			  "module (wide ~2-3x); try the LF_BC_MODULE suggested above, or slower "
-			  "LF_SPEED.\n", (unsigned)LF_BC_MODULE);
+			  "module (wide ~2-3x); a smaller LF_BC_MODULE, or slower LF_SPEED / "
+			  "LF_BC_SLOW.\n", (unsigned)LF_BC_MODULE);
 }
 #endif /* LF_BARCODE */
 
@@ -605,7 +755,11 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 	const uint32_t timeout_ms =
 		3000U + (uint32_t)(2.0f * (float)LF_DIST_MM / ((float)SPEED * 10.0f) * 1000.0f);
 	line_steering_t steering;
+#if LF_STRADDLE
+	straddle_t straddle;
+#endif
 	line_steering_command_t cmd;
+	float tgt_l = (float)SPEED, tgt_r = (float)SPEED;
 	wheel_speed_output_t out = { PID_BASE, PID_BASE };
 	ir_readings_t ir;
 	uint8_t pos, pos_tick;
@@ -623,25 +777,34 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 	*res = (run_result_t){ 0 };
 	res->c_min = res->r_min = 0xFFFFU;
 	if (!read_line(reader, &ir, &pos)) return RUN_SENSOR;
-	if (pos == POS_LOST) {
+	if (IS_LOST(pos)) {
 		tm_printf((UB*)TAG "  NOT ON THE LINE (both sensors white) -- place it so the "
 			  "display reads CENTRE, LEFT or RIGHT\n");
 		return RUN_LINE_LOST;
 	}
+	if (LF_STRADDLE && pos != POS_LOST)
+		tm_printf((UB*)TAG "  note: straddle mode starts best with the tape BETWEEN the "
+			  "sensors (display reads LOST = both white)\n");
 	if (!read_mm(&l0, &r0)) return RUN_ENCODER;
 	l = tl = pid_l = l0;
 	r = tr = pid_r = r0;
 
 	line_steering_reset(&steering);
 	line_steering_set_slope(&steering, LF_SLOPE != 0);
+#if LF_STRADDLE
+	sl_reset(&straddle, SPEED);
+#endif
 #if LF_BARCODE
 	if (!bc_start(reader)) return RUN_SENSOR;
 #endif
 	t0 = now_ms();
+#if LF_STRADDLE
+	cmd = sl_update(&straddle, pos, t0);
+#else
 	cmd = line_steering_update(&steering, pos, t0);
+#endif
 	if (cmd.stop_latched || !wheel_speed_control_reset(pid) ||
-	    !wheel_speed_control_set_targets(pid, (float)(cmd.linear_cm_s - cmd.turn_cm_s),
-					     (float)(cmd.linear_cm_s + cmd.turn_cm_s)))
+	    !set_targets(pid, cmd, &tgt_l, &tgt_r))
 		return RUN_PID;
 	last_turn = cmd.turn_cm_s;
 	pos_tick = pos;
@@ -650,7 +813,8 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 	next_pid = t0 + PID_PERIOD_MS;
 	drive(out.left_pwm_percent, out.right_pwm_percent);
 	if (LF_TRACE)
-		tm_printf((UB*)TAG "  t_ms  pos     turn  IRc  IRr   L cm/s R cm/s  hdg deg\n");
+		tm_printf((UB*)TAG "  t_ms  pos     turn  IRc  IRr   L cm/s R cm/s  hdg deg%s\n",
+			  LF_STRADDLE ? "  state" : "");
 
 	for (;;) {
 		float dl, dr, ds, dh;
@@ -708,6 +872,9 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 		if (r - r0 < -WRONG_WAY_MM) { status = RUN_WRONG_R; break; }
 		if (absf((l - l0) - prog_l) >= STALL_MM) { prog_l = l - l0; prog_l_ms = res->run_ms; }
 		if (absf((r - r0) - prog_r) >= STALL_MM) { prog_r = r - r0; prog_r_ms = res->run_ms; }
+		/* The inner wheel of a pivot is meant to stand still. */
+		if (tgt_l < STALL_EXEMPT_CM_S) prog_l_ms = res->run_ms;
+		if (tgt_r < STALL_EXEMPT_CM_S) prog_r_ms = res->run_ms;
 		if (res->run_ms - prog_l_ms > STALL_MS) { status = RUN_STALL_L; break; }
 		if (res->run_ms - prog_r_ms > STALL_MS) { status = RUN_STALL_R; break; }
 		if (res->dist_mm >= (float)LF_DIST_MM) break;
@@ -718,11 +885,18 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 
 			next_steer += LF_STEER_MS;
 			pos = p;
+#if LF_STRADDLE
+#if LF_BARCODE
+			/* LF_BC_SLOW: slower over a barcode, as the vehicle would. */
+			if (straddle.config.speed_cm_s != bc_speed())
+				(void)straddle_set_speed(&straddle, bc_speed());
+#endif
+			cmd = sl_update(&straddle, pos, t);
+#else
 			cmd = line_steering_update(&steering, pos, t);
+#endif
 			if (cmd.stop_latched) { status = RUN_LINE_LOST; break; }
-			if (!wheel_speed_control_set_targets(pid,
-					(float)(cmd.linear_cm_s - cmd.turn_cm_s),
-					(float)(cmd.linear_cm_s + cmd.turn_cm_s))) {
+			if (!set_targets(pid, cmd, &tgt_l, &tgt_r)) {
 				status = RUN_PID;
 				break;
 			}
@@ -746,11 +920,11 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 				res->longest_side_ms = t - side_start;
 				res->longest_side = side;
 			}
-			if (pos == POS_LOST && !in_lost) {
+			if (IS_LOST(pos) && !in_lost) {
 				in_lost = true;
 				lost_start = t;
 				res->lost_events++;
-			} else if (pos != POS_LOST && in_lost) {
+			} else if (!IS_LOST(pos) && in_lost) {
 				in_lost = false;
 				res->lost_total_ms += t - lost_start;
 				if (t - lost_start > res->lost_max_ms) res->lost_max_ms = t - lost_start;
@@ -764,12 +938,18 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 					(int16_t)__builtin_lroundf(sl * 10.0f),
 					(int16_t)__builtin_lroundf(sr * 10.0f),
 					ir.center.raw, ir.right.raw, pos, (int8_t)cmd.turn_cm_s };
-			if (LF_TRACE)
-				tm_printf((UB*)TAG "  %5u %-7s %+3d  %4u %4u  %6s %6s  %7s\n",
+			if (LF_TRACE) {
+#if LF_STRADDLE
+				const char *state_name = sl_state_name(straddle.state);
+#else
+				const char *state_name = "";
+#endif
+				tm_printf((UB*)TAG "  %5u %-7s %+3d  %4u %4u  %6s %6s  %7s  %s\n",
 					  (unsigned)res->run_ms, s_pos_name[pos & 3U],
 					  (int)cmd.turn_cm_s, (unsigned)ir.center.raw,
 					  (unsigned)ir.right.raw, f1(b1, sl), f1(b2, sr),
-					  f1(b3, h * RAD2DEG));
+					  f1(b3, h * RAD2DEG), state_name);
+			}
 		}
 
 		/* Wheel PID, at the odometry rate, as the motion task runs it. */
@@ -798,6 +978,16 @@ static run_status_t run_once(line_adc_reader_t *reader, wheel_speed_control_t *p
 		drive(out.left_pwm_percent, out.right_pwm_percent);
 	}
 	(void)motor_brake_all();
+#if LF_STRADDLE
+	res->sl_corrections = straddle.corrections;
+	res->sl_recoveries = straddle.recoveries;
+	res->sl_searches = straddle.searches;
+	res->sl_false_searches = straddle.false_searches;
+	res->sl_counters = straddle.counters;
+	res->sl_longest_correct_ms = straddle.longest_correct_ms;
+	res->sl_longest_recover_ms = straddle.longest_recover_ms;
+	res->sl_state_at_end = (uint8_t)straddle.state;
+#endif
 	if (in_lost) {
 		uint32_t d = res->run_ms - (lost_start - t0);
 		res->lost_total_ms += d;
@@ -842,7 +1032,9 @@ static const char *status_text(run_status_t s)
 {
 	switch (s) {
 	case RUN_OK:        return "distance reached";
-	case RUN_LINE_LOST: return "LINE LOST > 300 ms (steering stop latch)";
+	case RUN_LINE_LOST: return LF_STRADDLE ?
+				   "LINE LOST (pivot/search found nothing in LF_SL_PIVOT_MAX_MS)" :
+				   "LINE LOST > 300 ms (steering stop latch)";
 	case RUN_ABORT_GO:  return "stopped by GO button";
 	case RUN_TIMEOUT:   return "timeout: distance not reached";
 	case RUN_STALL_L:   return "LEFT wheel stalled";
@@ -861,10 +1053,13 @@ static void report(const run_result_t *res)
 	const float min_radius = (float)LF_TRACK_MM * (float)SPEED / (2.0f * (float)TURN);
 	const float metres = res->dist_mm / 1000.0f;
 	const float secs = (float)res->run_ms / 1000.0f;
-	const unsigned on_line = res->updates - res->pos_count[POS_LOST];
+	const unsigned on_line = LF_STRADDLE ? res->updates :
+				 res->updates - res->pos_count[POS_LOST];
 	const float net_deg = res->net_h * RAD2DEG;
 	const bool curve = absf(net_deg) >= CURVE_DEG;
-	float centred = on_line ? 100.0f * (float)res->pos_count[POS_JUNCTION] / (float)on_line : 0.0f;
+	/* Centred: both black (ramped edge following), both white (straddle). */
+	float centred = on_line ? 100.0f *
+		(float)res->pos_count[LF_STRADDLE ? POS_LOST : POS_JUNCTION] / (float)on_line : 0.0f;
 	float achieved = res->commanded_sum > 0.0f ?
 		res->achieved_sum / res->commanded_sum * 100.0f : 0.0f;
 	float zigzag = metres > 0.05f ?
@@ -880,9 +1075,16 @@ static void report(const run_result_t *res)
 		  net_deg > 0.05f ? "L" : (net_deg < -0.05f ? "R" : ""), f1(b2, absf(net_deg)),
 		  curve ? "CURVE" : "STRAIGHT");
 	if (res->updates == 0U) return;
-	tm_printf((UB*)TAG "  position: CENTRE %u  LEFT %u  RIGHT %u  LOST %u  (centred %s%% "
-		  "of on-line time)\n", res->pos_count[POS_JUNCTION], res->pos_count[POS_LEFT],
-		  res->pos_count[POS_RIGHT], res->pos_count[POS_LOST], f1(b1, centred));
+	if (LF_STRADDLE)
+		tm_printf((UB*)TAG "  position: GAP (both white) %u  LEFT %u  RIGHT %u  BOTH BLACK "
+			  "%u  (tape in the gap %s%% of the time)\n", res->pos_count[POS_LOST],
+			  res->pos_count[POS_LEFT], res->pos_count[POS_RIGHT],
+			  res->pos_count[POS_JUNCTION], f1(b1, centred));
+	else
+		tm_printf((UB*)TAG "  position: CENTRE %u  LEFT %u  RIGHT %u  LOST %u  (centred %s%% "
+			  "of on-line time)\n", res->pos_count[POS_JUNCTION],
+			  res->pos_count[POS_LEFT], res->pos_count[POS_RIGHT],
+			  res->pos_count[POS_LOST], f1(b1, centred));
 	tm_printf((UB*)TAG "  IR raw range: centre %u..%u  right %u..%u  (black > %u)\n",
 		  (unsigned)res->c_min, (unsigned)res->c_max, (unsigned)res->r_min,
 		  (unsigned)res->r_max, (unsigned)LINE_ADC_LINE_BLACK_THRESHOLD);
@@ -904,7 +1106,16 @@ static void report(const run_result_t *res)
 		straight_swing(res, &swing, &hdev);
 		tm_printf((UB*)TAG "          centre swings %s mm peak-to-peak; heading strays up "
 			  "to %s deg off the line\n", f1(b1, swing), f1(b2, hdev));
-		if (swing > WIGGLE_SWING_MM || hdev > WIGGLE_HDG_DEG) {
+		if (LF_STRADDLE && (swing > WIGGLE_SWING_MM || hdev > WIGGLE_HDG_DEG)) {
+			tm_printf((UB*)TAG "  HINT: WIGGLING on a straight (%u corrections, %u "
+				  "overshoot pivots, %u searches). Pivots on a straight mean "
+				  "LF_SL_OVERSHOOT_MS=%u is too short -- try %u; many searches mean "
+				  "LF_SL_BLIND_MS=%u is too short. Otherwise lower LF_SL_TURN or widen "
+				  "the sensor gap.\n", res->sl_corrections, res->sl_recoveries,
+				  res->sl_searches, (unsigned)LF_SL_OVERSHOOT_MS,
+				  (unsigned)LF_SL_OVERSHOOT_MS + 100U, (unsigned)LF_SL_BLIND_MS);
+			hinted = true;
+		} else if (swing > WIGGLE_SWING_MM || hdev > WIGGLE_HDG_DEG) {
 			tm_printf((UB*)TAG "  HINT: WIGGLING on a straight. Corrections start at "
 				  "+/-%u cm/s and build to %u over %u ms; the robot still overshoots "
 				  "until the other sensor sees the line.\n", (unsigned)TMIN,
@@ -915,7 +1126,17 @@ static void report(const run_result_t *res)
 			hinted = true;
 		}
 	}
-	if (centred < CENTRED_MIN_PCT && on_line > 30U) {
+	if (LF_STRADDLE) {
+		unsigned both_black = res->pos_count[POS_JUNCTION];
+
+		if (both_black * 5U > res->updates && res->updates > 30U) {
+			tm_printf((UB*)TAG "  HINT: both sensors black %u of %u updates: the sensors "
+				  "are CLOSER than the tape is wide. Move them apart so the tape fits "
+				  "between them (display reads LOST when centred).\n", both_black,
+				  res->updates);
+			hinted = true;
+		}
+	} else if (centred < CENTRED_MIN_PCT && on_line > 30U) {
 		tm_printf((UB*)TAG "  HINT: rarely CENTRE (%s%%). CENTRE = drive straight needs BOTH "
 			  "sensors black. If the tape is narrower than the centre-right sensor gap, "
 			  "the robot can only ever be LEFT or RIGHT, so it zig-zags forever. Place it "
@@ -932,6 +1153,53 @@ static void report(const run_result_t *res)
 	}
 
 	/* --- curves --- */
+#if LF_STRADDLE
+	{
+		const float rec_inner = (float)(LF_SL_REC_SPEED - LF_SL_REC_TURN);
+		const float rec_outer = (float)(LF_SL_REC_SPEED + LF_SL_REC_TURN);
+		const float rec_radius = rec_inner <= 0.0f ? (float)LF_TRACK_MM * 0.5f :
+			(float)LF_TRACK_MM * (float)LF_SL_REC_SPEED / (2.0f * (float)LF_SL_REC_TURN);
+
+		tm_printf((UB*)TAG "  STRADDLE: gentle turn %u cm/s (radius ~%s mm); pivot wheels "
+			  "%s/%s cm/s (radius ~%s mm)\n", (unsigned)LF_SL_TURN, f1(b1, min_radius),
+			  f1(b2, rec_inner > 0.0f ? rec_inner : 0.0f), f1(b3, rec_outer),
+			  f1(b1, rec_radius));
+		tm_printf((UB*)TAG "          %u corrections (longest %u ms), %u overshoot pivots "
+			  "(longest %u ms), %u blind searches (%u false: tape was in the gap)\n",
+			  res->sl_corrections, (unsigned)res->sl_longest_correct_ms,
+			  res->sl_recoveries, (unsigned)res->sl_longest_recover_ms,
+			  res->sl_searches, res->sl_false_searches);
+		tm_printf((UB*)TAG "          %u counter-steers (%u%% of each correction, max %u ms)"
+			  "; wheels delivered %s%% of the commanded turn\n", res->sl_counters,
+			  (unsigned)LF_SL_COUNTER_PCT, (unsigned)LF_SL_COUNTER_MAX_MS,
+			  f1(b1, achieved));
+		if (res->updates > 30U && res->pos_count[POS_LOST] * 2U < res->updates)
+			tm_printf((UB*)TAG "  HINT: the tape was in the gap only %s%% of the time and "
+				  "went LEFT<->RIGHT %u times: the gap between the sensors is too "
+				  "small for the robot's yaw. Move the sensors further apart.\n",
+				  f1(b2, centred), res->flips);
+		if (curve) {
+			float radius = absf(res->net_h) > 0.01f ? res->dist_mm / absf(res->net_h) : 0.0f;
+			tm_printf((UB*)TAG "          drove an average radius of ~%s mm round the "
+				  "curve\n", f1(b1, radius));
+		}
+		if (res->sl_searches > 0U && res->sl_false_searches * 2U > res->sl_searches) {
+			tm_printf((UB*)TAG "  HINT: most searches were false alarms -- the tape was in "
+				  "the gap. Raise LF_SL_BLIND_MS (now %u) if they make it wobble.\n",
+				  (unsigned)LF_SL_BLIND_MS);
+			hinted = true;
+		}
+		if (res->status == RUN_LINE_LOST) {
+			tm_printf((UB*)TAG "  HINT: ended in %s: it pivoted %u ms without the tape "
+				  "coming back. If it ran off a sharp bend first, lower LF_SL_BLIND_MS "
+				  "(now %u) so it searches sooner%s.\n",
+				  sl_state_name(res->sl_state_at_end), (unsigned)LF_SL_PIVOT_MAX_MS,
+				  (unsigned)LF_SL_BLIND_MS,
+				  LF_SL_BLIND_MS == 0U ? " (it is OFF)" : "");
+			hinted = true;
+		}
+	}
+#else
 	tm_printf((UB*)TAG "  TURNING: full turn %u cm/s -> tightest radius ~%s mm at %u cm/s; "
 		  "wheels delivered %s%% of the commanded turn\n", (unsigned)TURN,
 		  f1(b1, min_radius), (unsigned)SPEED, f1(b2, achieved));
@@ -980,6 +1248,7 @@ static void report(const run_result_t *res)
 		}
 		hinted = true;
 	}
+#endif /* LF_STRADDLE */
 	/* The first ~1 s is the wheels spinning up from rest; too short to judge. */
 	if (res->run_ms >= MIN_JUDGE_MS && res->achieved_n > 10U && achieved < ACHIEVED_MIN_PCT) {
 		tm_printf((UB*)TAG "  HINT: the wheels deliver only %s%% of the turn asked for: "
@@ -987,7 +1256,7 @@ static void report(const run_result_t *res)
 			  "robot turns less than LF_TURN suggests.\n", f1(b1, achieved));
 		hinted = true;
 	}
-#if LF_CURVE_R_MM > 0
+#if LF_CURVE_R_MM > 0 && !LF_STRADDLE
 	{
 		float need = (float)LF_TRACK_MM * (float)SPEED / (2.0f * (float)LF_CURVE_R_MM);
 		float need_margin = need * 1.3f;   /* steering is only on part of the time */
@@ -1076,12 +1345,38 @@ void line_follow_hwtest_run(void)
 		  (unsigned)(SPEED - TURN), (unsigned)(SPEED + TURN), (unsigned)LF_STEER_MS,
 		  (unsigned)LF_DIST_MM, (unsigned)LF_TRACK_MM);
 	if (LF_BARCODE)
-		tm_printf((UB*)TAG "barcode decoding ON: decoder A as the vehicle (20 ms, black > %u), "
-			  "B fast (2 ms, hysteresis %u/%u), C as B measured at the sensor; %u counts per narrow module\n",
-			  (unsigned)LINE_ADC_BARCODE_BLACK_THRESHOLD,
+		tm_printf((UB*)TAG "barcode decoding ON: decoder A exactly as the vehicle (10 ms, "
+			  "hysteresis %u/%u, debounce 4, 50 ms odometry), B fast (2 ms), C as B measured "
+			  "at the sensor; smallest narrow module %u counts (bigger adapts)\n",
 			  (unsigned)LINE_ADC_BARCODE_BLACK_THRESHOLD, 600U, (unsigned)LF_BC_MODULE);
-	tm_printf((UB*)TAG "steering profile: %s\n", LF_SLOPE ?
-		  "SLOPE (ramp mode, forced for the whole run)" : "NORMAL");
+	if (LF_BC_SLOW > 0)
+		tm_printf((UB*)TAG "barcode slow-down ON: %u cm/s from the first black on the barcode "
+			  "sensor until %u mm of white\n", (unsigned)LF_BC_SLOW,
+			  (unsigned)LF_BC_SLOW_MM);
+	if (LF_STRADDLE)
+		tm_printf((UB*)TAG "speed %u cm/s, turn %u, pivot %u/%u: %s the main robot's "
+			  "(vehicle_controller_task.h: %u cm/s, turn %u, pivot %u/%u)\n",
+			  (unsigned)SPEED, (unsigned)LF_SL_TURN, (unsigned)LF_SL_REC_SPEED,
+			  (unsigned)LF_SL_REC_TURN,
+			  SPEED == VEHICLE_LINE_SPEED_CM_S && LF_SL_TURN == VEHICLE_LINE_TURN_CM_S &&
+			  LF_SL_REC_SPEED == VEHICLE_LINE_PIVOT_SPEED_CM_S &&
+			  LF_SL_REC_TURN == VEHICLE_LINE_PIVOT_TURN_CM_S ? "SAME AS" : "DIFFERENT FROM",
+			  (unsigned)VEHICLE_LINE_SPEED_CM_S, (unsigned)VEHICLE_LINE_TURN_CM_S,
+			  (unsigned)VEHICLE_LINE_PIVOT_SPEED_CM_S, (unsigned)VEHICLE_LINE_PIVOT_TURN_CM_S);
+	if (LF_STRADDLE)
+		tm_printf((UB*)TAG "steering: STRADDLE (test-only, line_steering.c NOT used): "
+			  "tape between the sensors = straight; one sensor = turn %u cm/s; held "
+			  "> %u ms = pivot %d/%d cm/s; both white > %u ms = search (0 = off); "
+			  "pivot > %u ms = lost; counter-steer %u%%; IR black >= %u / white <= %u"
+			  "\n", (unsigned)LF_SL_TURN,
+			  (unsigned)LF_SL_OVERSHOOT_MS,
+			  LF_SL_REC_SPEED - LF_SL_REC_TURN > 0 ? LF_SL_REC_SPEED - LF_SL_REC_TURN : 0,
+			  LF_SL_REC_SPEED + LF_SL_REC_TURN, (unsigned)LF_SL_BLIND_MS,
+			  (unsigned)LF_SL_PIVOT_MAX_MS, (unsigned)LF_SL_COUNTER_PCT,
+			  (unsigned)LF_SL_BLACK_ADC, (unsigned)LF_SL_WHITE_ADC);
+	else
+		tm_printf((UB*)TAG "steering profile: %s\n", LF_SLOPE ?
+			  "SLOPE (ramp mode, forced for the whole run)" : "NORMAL");
 	tm_printf((UB*)TAG "wheel feed-forward %s %%PWM per cm/s around %u%% at 15 cm/s%s\n",
 		  f1(b1, (float)(LF_FF)), (unsigned)PID_BASE,
 		  (float)(LF_FF) > 0.0f ? "" : " (OFF: flat base, as before)");

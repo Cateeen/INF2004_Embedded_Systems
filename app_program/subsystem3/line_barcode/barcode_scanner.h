@@ -22,7 +22,13 @@ typedef enum
 } barcode_reject_t;
 
 /* counts_per_module must be positive; tolerance must be 0..50. The last
- * three fields use derived defaults when zero; a nonzero ratio must be >=100. */
+ * three fields use derived defaults when zero; a nonzero ratio must be >=100.
+ *
+ * Barcode size is learned per frame: characters are classified by their own
+ * relative widths, and the default gap limit scales with the narrow width
+ * measured from the frame's characters. counts_per_module only matters before
+ * a frame starts (and for the default glitch limit), so set it to the
+ * SMALLEST narrow module you expect; larger barcodes then work unchanged. */
 typedef struct
 {
     uint32_t counts_per_module;
@@ -95,6 +101,8 @@ typedef struct
     uint8_t payload[BARCODE_MAX_PAYLOAD];
     uint8_t payload_length;
     uint32_t gap_counts;
+    uint64_t frame_narrow_sum;    /* narrow widths of this frame's characters */
+    uint16_t frame_narrow_count;
     barcode_edge_t edge;
     barcode_char_info_t event;
     bool event_pending;
@@ -117,6 +125,8 @@ bool barcode_scanner_set_config(barcode_scanner_t *scanner,
                                 const barcode_scanner_config_t *config);
 uint32_t barcode_scanner_min_run_counts(const barcode_scanner_t *scanner);
 uint32_t barcode_scanner_max_gap_counts(const barcode_scanner_t *scanner);
+/* Narrow module in counts: measured from the current frame, else the config. */
+uint32_t barcode_scanner_module_counts(const barcode_scanner_t *scanner);
 uint8_t barcode_scanner_wide_ratio_percent(const barcode_scanner_t *scanner);
 bool barcode_scanner_get_edge(const barcode_scanner_t *scanner,
                               barcode_edge_t *edge);
@@ -127,5 +137,8 @@ void barcode_scanner_reset_stats(barcode_scanner_t *scanner);
 bool barcode_scanner_suggest_config(const barcode_scanner_t *scanner,
                                     barcode_scanner_config_t *suggested);
 const char *barcode_reject_name(barcode_reject_t reject);
+/* The 9-element Code 39 pattern ("nwnnwnwnn" for '*'), bar first; NULL if
+ * the symbol is not Code 39 (upper case only). */
+const char *barcode_code39_pattern(char symbol);
 
 #endif

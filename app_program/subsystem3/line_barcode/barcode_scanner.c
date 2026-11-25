@@ -69,6 +69,23 @@ uint32_t barcode_scanner_min_run_counts(const barcode_scanner_t *scanner)
     return (limit < 1U) ? 1U : (uint32_t)limit;
 }
 
+uint32_t barcode_scanner_module_counts(const barcode_scanner_t *scanner)
+{
+    uint64_t module;
+
+    if (!scanner->in_frame || (scanner->frame_narrow_count == 0U))
+    {
+        return scanner->config.counts_per_module;
+    }
+    module = scanner->frame_narrow_sum / scanner->frame_narrow_count;
+    return (module < 1U) ? 1U : (uint32_t)module;
+}
+
+/*
+ * The inter-character gap is about one narrow module of the barcode being
+ * read, so the default limit scales with the module measured in this frame
+ * rather than a fixed calibration: bigger or smaller labels both work.
+ */
 uint32_t barcode_scanner_max_gap_counts(const barcode_scanner_t *scanner)
 {
     uint64_t limit;
@@ -77,7 +94,7 @@ uint32_t barcode_scanner_max_gap_counts(const barcode_scanner_t *scanner)
     {
         return scanner->config.max_gap_counts;
     }
-    limit = (uint64_t)scanner->config.counts_per_module *
+    limit = (uint64_t)barcode_scanner_module_counts(scanner) *
             DEFAULT_MAX_GAP_MODULES;
     return (limit > UINT32_MAX) ? UINT32_MAX : (uint32_t)limit;
 }
@@ -205,6 +222,24 @@ static int find_pattern(const char *pattern)
 static char symbol_for_index(int index)
 {
     return (index == (int)CODE39_STAR_INDEX) ? '*' : code39_characters[index];
+}
+
+const char *barcode_code39_pattern(char symbol)
+{
+    uint8_t i;
+
+    if (symbol == '*')
+    {
+        return code39_patterns[CODE39_STAR_INDEX];
+    }
+    for (i = 0U; i < CODE39_STAR_INDEX; i++)
+    {
+        if (code39_characters[i] == symbol)
+        {
+            return code39_patterns[i];
+        }
+    }
+    return NULL;
 }
 
 typedef struct
@@ -481,6 +516,34 @@ static void update_ok_stats(
     }
 }
 
+/* Learn the barcode's module size from every accepted character in a frame
+ * (starting with the start '*'), restarting when a new frame begins. */
+static void update_frame_module(
+    barcode_scanner_t *scanner,
+    const barcode_char_info_t *info,
+    bool was_in_frame)
+{
+    uint8_t i;
+
+    if (!scanner->in_frame)
+    {
+        return;
+    }
+    if (!was_in_frame)
+    {
+        scanner->frame_narrow_sum = 0U;
+        scanner->frame_narrow_count = 0U;
+    }
+    for (i = 0U; i < BARCODE_ELEMENTS; i++)
+    {
+        if (info->raw_pattern[i] == 'n')
+        {
+            scanner->frame_narrow_sum += info->run_counts[i];
+            scanner->frame_narrow_count++;
+        }
+    }
+}
+
 static void finish_character(barcode_scanner_t *scanner)
 {
     barcode_char_info_t info;
@@ -516,6 +579,7 @@ static void finish_character(barcode_scanner_t *scanner)
             reject = BARCODE_REJECT_OVERFLOW;
             info.aborted_frame = true;
         }
+        update_frame_module(scanner, &info, was_in_frame);
     }
     else
     {

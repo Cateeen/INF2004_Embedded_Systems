@@ -42,7 +42,7 @@
 
       <section class="panel controls">
         <div class="sectionheading"><div><div class="eyebrow">OPERATOR CONSOLE</div><h2>Run control</h2></div><span class="tag warning" id="link-tag">LIVE MQTT</span></div>
-        <div class="controls-grid"><button id="robot-start" class="action-primary">▶ Start run</button><button id="robot-stop" class="action-stop">■ Stop</button></div>
+        <div class="controls-grid"><button id="robot-toggle" class="action-primary robot-toggle">▶ Start run</button></div>
         <div class="separator"></div>
         <div class="sectionheading tight"><div class="smalllabel">RECENT BARCODES</div><button class="textbutton" id="reset-run">↺ Reset run</button></div>
         <div class="barcode-list" id="barcode-list"><div class="emptylog">No barcodes read this run</div></div>
@@ -53,7 +53,7 @@
       <div class="panel card">
         <div class="cardhead"><span class="sensorbadge">IR</span><div><strong>Line following</strong><small>Buddy 3</small></div><span class="chip" id="line-chip">—</span></div>
         <div class="bigstat word" id="line-word">—</div>
-        <dl class="facts"><dt>Line lost</dt><dd id="line-losses">—</dd><dt>IR (L / C / R)</dt><dd id="ir-raw">not sent</dd></dl>
+        <dl class="facts"><dt>Line lost</dt><dd id="line-losses">—</dd><dt>Bend pivots</dt><dd id="line-pivots">—</dd><dt>Line searches</dt><dd id="line-searches">—</dd><dt>IR (L / C / R)</dt><dd id="ir-raw">not sent</dd></dl>
       </div>
       <div class="panel card">
         <div class="cardhead"><span class="sensorbadge">IMU</span><div><strong>Hump / terrain</strong><small>Buddy 4</small></div><span class="chip" id="terrain-chip">—</span></div>

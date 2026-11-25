@@ -266,12 +266,18 @@ static BOOL control_fault_test(void)
 	message = control_odometry(1U, 100U, 0, 0);
 	ok = motion_control_step(&control, &message, 100U, &output) ==
 	     MOTION_CONTROL_WAITING && ok;
+	/* One count back (-0.08 cm/s: a stopped wheel rocking, or encoder
+	 * noise) counts as stopped, not a fault. */
 	message = control_odometry(2U, 200U, -1, 1);
-	ok = motion_control_step(&control, &message, 200U, &output) == MOTION_CONTROL_FAULT &&
+	ok = motion_control_step(&control, &message, 200U, &output) == MOTION_CONTROL_READY &&
+	     !control.faulted && control.left_speed_cm_s == 0.0f && ok;
+	/* Clearly backwards (-125 counts in 100 ms = -10 cm/s) is a fault. */
+	message = control_odometry(3U, 300U, -126, 2);
+	ok = motion_control_step(&control, &message, 300U, &output) == MOTION_CONTROL_FAULT &&
 	     control.faulted && !control.running && output.left_pwm_percent == 0U &&
 	     output.right_pwm_percent == 0U && control.speed.left_pid.first_update && ok;
-	message = control_odometry(3U, 201U, 0, 0);
-	ok = motion_control_step(&control, &message, 201U, &output) == MOTION_CONTROL_FAULT && ok;
+	message = control_odometry(4U, 301U, 0, 0);
+	ok = motion_control_step(&control, &message, 301U, &output) == MOTION_CONTROL_FAULT && ok;
 
 	ok = motion_control_start(&control, &config, 1, 300U) && ok;
 	message = control_odometry(1U, 299U, 0, 0);

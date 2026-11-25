@@ -817,7 +817,10 @@ obstacle_bypass_config_t obstacle_bypass_default_config(void)
 	c.track_mm = 116.0f;
 	c.spin_pwm = 25U;
 	c.spin_pwm_slow = 20U;
-	c.half_deg = 60.0f;
+	/* 70: from the 20 cm stop the scan must turn ~54 deg to see a free lane
+	 * (car + margin + clearances, 320 mm) beside a 9 cm box, plus the beam
+	 * trim; 60 deg was enough from 30 cm. */
+	c.half_deg = 70.0f;
 	c.step_deg = 3.0f;
 	c.find_step_deg = 6.0f;
 	c.sensor_offset_mm = 70.0f;
@@ -825,7 +828,9 @@ obstacle_bypass_config_t obstacle_bypass_default_config(void)
 	c.lane_mm = 200.0f;
 	c.beyond_mm = 400.0f;
 	c.max_obstacle_mm = 450.0f;
-	c.trim_deg = 11.6f;
+	/* 15.0: 9 cm box from the 20 cm stop (SENSOR_TEST=spin_width at 228 mm
+	 * read 119.7 mm with 11.6, the 30 cm value; 15.0 matches 90 mm). */
+	c.trim_deg = 15.0f;
 	c.true_width_mm = 0.0f;
 	c.full_sweep = false;
 	c.bypass = true;

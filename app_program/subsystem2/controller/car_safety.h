@@ -30,6 +30,13 @@ typedef struct {
 	 * reading; arming needs every stream anyway, so this only avoids a
 	 * start-up fault. Appended: 0 in older initializers. */
 	uint32_t startup_grace_ms;
+	/* true: straddle line sensors (further apart than the tape). Centred on
+	 * the line reads both white, i.e. line_detected 0, so "line under the
+	 * sensors" cannot be checked: the line counts as clear (for arming)
+	 * whenever the robot is not lifted (picked_up 0). false: line_detected
+	 * with min_line_confidence, as before. Appended: false in older
+	 * initializers. */
+	bool straddle_line;
 } car_safety_config_t;
 
 typedef struct {

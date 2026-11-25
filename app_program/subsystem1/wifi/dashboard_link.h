@@ -72,6 +72,11 @@ ER dashboard_report_obstacle_profile(uint16_t width_mm, uint16_t clear_left_mm,
 ER dashboard_report_avoid_phase(dashboard_avoid_phase_t phase);
 ER dashboard_report_line_rejoined(void);
 
+/* ---- Subsystem 2/3: straddle line following ------------------------------ */
+/* A pivot at a bend, a search's outcome, or the line given up. Edges only
+ * (at most one per pivot / search). */
+ER dashboard_report_line_event(dashboard_line_event_t event);
+
 /* ---- From the dashboard ------------------------------------------------- */
 /* Turn to take at the next junction: the mapping of the most recently
  * decoded barcode, or DASHBOARD_DEFAULT_TURN if none has arrived since

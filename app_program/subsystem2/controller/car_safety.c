@@ -134,7 +134,9 @@ bool car_safety_line(car_safety_t *safety, const line_observation_message_t *mes
 	/* The line is required to ARM (car_safety_follow); once following, a
 	 * lost line is handled by the steering (300 ms hold, then a latched
 	 * stop) and is expected during a junction turn, so it does not disarm. */
-	safety->line_clear = message->line_detected == 1U &&
+	safety->line_clear = safety->config.straddle_line ?
+			     message->picked_up == 0U :
+			     message->line_detected == 1U &&
 			     message->confidence >= safety->config.min_line_confidence;
 	return true;
 }

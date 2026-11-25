@@ -272,7 +272,7 @@ typedef struct {
  * These limits describe the initial queue contract. They are not µT-Kernel
  * object IDs; the task startup module will create the actual message buffers.
  */
-#define VEHICLE_MB_LINE_CAPACITY       4U
+#define VEHICLE_MB_LINE_CAPACITY       8U   /* line task 10 ms, controller ~50-60 ms */
 #define VEHICLE_MB_BARCODE_CAPACITY    8U
 #define VEHICLE_MB_IMU_CAPACITY        2U
 #define VEHICLE_MB_OBSTACLE_CAPACITY   4U

@@ -125,12 +125,22 @@ static uint16_t process_sample(imu_task_state_t *state, const accel_data_t *samp
 		bool calibrating = state->level_pending;
 		const imu_state_t *p = &state->producer.processor;
 		bool was_hump = p->hump_active;
+		bool was_tilt = p->tilt_detected;
 
 		if (!imu_producer_update(&state->producer, sample, NULL, sample_ms, &estimate))
 			return VEHICLE_FAULT_CODE_IMU_PROCESSING;
 		/* Log each hump, with the angles that started it, for tuning
 		 * IMU_HUMP_START_M / IMU_HUMP_CONFIRM_MS on the robot. */
-		if (p->hump_active && !was_hump)
+		if (!calibrating && p->tilt_detected && !was_tilt)
+			tm_printf((UB*)"IMU: tilt (lifted/tipped): pitch %d, roll %d (0.1 deg), "
+				  "az %d (0.1 m/s2); limits pitch 350, roll 150, az >= 65\n",
+				  (int)(p->current_pitch_deg * 10.0f),
+				  (int)(p->current_roll_deg * 10.0f),
+				  (int)(sample->az * 10.0f));
+		if (calibrating) {
+			/* Not level-calibrated yet: the board's mounting tilt (~10
+			 * deg) still reads as a slope, so any hump now is false. */
+		} else if (p->hump_active && !was_hump)
 			tm_printf((UB*)"IMU: hump start, pitch %d, roll %d (0.1 deg), height %d mm\n",
 				  (int)(p->terrain_pitch_deg * 10.0f),
 				  (int)(p->terrain_roll_deg * 10.0f),
@@ -140,6 +150,10 @@ static uint16_t process_sample(imu_task_state_t *state, const accel_data_t *samp
 				  (int)(p->hump_peak_m * 1000.0f + 0.5f));
 		if (calibrating) {
 			estimate.tilt_detected = 1U; /* not safe to arm yet */
+			/* ...and report flat terrain (state MONITORING, height 0):
+			 * uncalibrated humps must not reach the controller (ramp
+			 * mode) or the dashboard. Bits per imu_pack_telemetry. */
+			estimate.terrain_telemetry &= (uint16_t)~((0x07U << 0) | (0x3FU << 6));
 			fault = update_level(state, sample);
 			if (fault != 0U) return fault;
 		}

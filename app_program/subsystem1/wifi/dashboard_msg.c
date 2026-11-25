@@ -238,6 +238,36 @@ uint16_t dashboard_msg_avoid_phase(dashboard_avoid_phase_t phase, char *out)
 	return finish(&writer);
 }
 
+uint16_t dashboard_msg_line_event(dashboard_line_event_t event, char *out)
+{
+	msg_writer_t writer = writer_begin(out);
+	const char *name = NULL;
+
+	switch (event) {
+	case DASHBOARD_LINE_PIVOT:
+		name = "PIVOT";
+		break;
+	case DASHBOARD_LINE_SEARCH_FOUND:
+		name = "SEARCH_FOUND";
+		break;
+	case DASHBOARD_LINE_SEARCH_CENTRED:
+		name = "SEARCH_CENTRED";
+		break;
+	case DASHBOARD_LINE_LOST:
+		name = "LOST";
+		break;
+	default:
+		break;
+	}
+	if (name == NULL) {
+		return 0U;
+	}
+	put_text(&writer, "{\"type\":\"LINE\",\"event\":\"");
+	put_text(&writer, name);
+	put_text(&writer, "\"}");
+	return finish(&writer);
+}
+
 uint16_t dashboard_msg_barcode(char letter, char *out)
 {
 	msg_writer_t writer = writer_begin(out);

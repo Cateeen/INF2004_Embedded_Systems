@@ -23,20 +23,34 @@
  * smaller full turn -- 9/5 still steers a ~10 cm radius, as tight as NORMAL,
  * for a bend right after the ramp.
  *
+ * Lost line: NORMAL keeps turning towards the side the line was last seen
+ * on, still building up as if that side were seen, for 300 ms, then latches
+ * a stop (a left curve loses the tape past the centre sensor while the
+ * build-up is often still small; a brief loss on a straight barely moves it). On the SLOPE profile (a hump, always on a straight) the sensors
+ * often lose the tape over the crest, and repeating a wiggle's turn swung
+ * the robot off: there a lost line drives STRAIGHT at the slope speed, with
+ * no stop, for up to LINE_STEERING_SLOPE_LOST_MAX_MS; seeing the line again
+ * steers normally at once. If the hump ends with the line still lost, the
+ * normal 300 ms (now straight) applies from that moment, then the stop.
+ *
  * SENSOR_TEST=line_follow may override all of these (LF_SPEED, LF_TURN,
  * LF_TURN_MIN, LF_RAMP_MS; LF_SLOPE_*; LF_SLOPE=1 runs SLOPE throughout, as
  * the test has no IMU) to tune; copy what works here. */
 #ifndef LINE_STEERING_SPEED_CM_S
-#define LINE_STEERING_SPEED_CM_S    12
+#define LINE_STEERING_SPEED_CM_S    10      /* 12 wiggled too much on the robot */
 #endif
 #ifndef LINE_STEERING_TURN_CM_S
-#define LINE_STEERING_TURN_CM_S     7       /* full turn, reached after RAMP_MS */
+#define LINE_STEERING_TURN_CM_S     6       /* full turn, reached after RAMP_MS; calm on
+						* straights. Tighter curves than this can arc
+						* are handled by the controller's line recovery
+						* (stop, spin to the line, follow on) */
 #endif
 #ifndef LINE_STEERING_TURN_MIN_CM_S
 #define LINE_STEERING_TURN_MIN_CM_S 2       /* first correction on a side */
 #endif
 #ifndef LINE_STEERING_RAMP_MS
-#define LINE_STEERING_RAMP_MS       400     /* TURN_MIN -> TURN on one side */
+#define LINE_STEERING_RAMP_MS       400     /* TURN_MIN -> TURN on one side (600 built up
+						* too slowly for the first curve) */
 #endif
 
 /* SLOPE profile (on a ramp, from the IMU). */
@@ -51,6 +65,11 @@
 #endif
 #ifndef LINE_STEERING_SLOPE_RAMP_MS
 #define LINE_STEERING_SLOPE_RAMP_MS       400
+#endif
+/* Longest blind straight on a hump (~18 cm at 9 cm/s): a cap in case the
+ * IMU wrongly stays on "hump" with the line gone. */
+#ifndef LINE_STEERING_SLOPE_LOST_MAX_MS
+#define LINE_STEERING_SLOPE_LOST_MAX_MS   2000
 #endif
 
 _Static_assert(LINE_STEERING_TURN_MIN_CM_S >= 1 &&
@@ -92,6 +111,11 @@ typedef struct {
 	bool have_last;
 	bool slope;             /* SLOPE profile active */
 	bool line_lost;
+	bool slope_lost;        /* lost while on SLOPE: driving straight blind */
+	/* Build-up (ms on one side) when the line was lost: high on a curve
+	 * (one side held), low on a straight (sides flip every 150-250 ms). */
+	uint32_t lost_ramp_ms;
+	uint32_t slope_lost_since_ms;
 	bool stop_latched;
 } line_steering_t;
 

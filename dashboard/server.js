@@ -19,13 +19,13 @@ const MOVEMENTS = ['forward', 'left', 'right', 'uturn'];
 const DEFAULT_JUNCTION = 'left'; /* used until the first barcode is decoded */
 
 /* Barcode letter -> movement. Editable live from the dashboard; cleared back
- * to forward when a run ends (Stop, car picked up, Reset run), so each run
+ * to Turn left (DEFAULT_JUNCTION) when a run ends (Stop, car picked up, Reset run), so each run
  * starts from a fresh mapping. Only ever mutated in place: preview.js holds it. */
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
-const mappings = Object.fromEntries(LETTERS.map(l => [l, 'forward']));
+const mappings = Object.fromEntries(LETTERS.map(l => [l, DEFAULT_JUNCTION]));
 
 function resetMappings() {
-  LETTERS.forEach(l => { mappings[l] = 'forward'; });
+  LETTERS.forEach(l => { mappings[l] = DEFAULT_JUNCTION; });
 }
 const clients = new Set();
 let connection = null;
@@ -41,7 +41,12 @@ function newRun() {
     hump: {peakCm: null, state: 'UNKNOWN'},
     obstacle: {distanceMm: null, widthMm: null, clearLeftMm: null, clearRightMm: null,
       side: null, phase: 'IDLE', seenDuringRun: false, lostLineSinceObstacle: false},
-    line: {state: 'UNKNOWN', losses: 0},
+    /* Straddle line sensors: the tape runs BETWEEN them, so "both white" is
+     * on the line. LOST = the car gave up (stopped). pivots = overshot a bend
+     * and turned back to it; searches = the tape escaped and a search found
+     * it; centredSearches = a search that found it had been in the gap. */
+    line: {state: 'UNKNOWN', losses: 0, pivots: 0, searches: 0, centredSearches: 0,
+      lastEvent: null, lastEventAt: null},
     pickedUp: false
   };
 }
@@ -68,7 +73,7 @@ function cm(mm) { return mm == null ? null : Math.round(mm / 10 * 10) / 10; }
 function nextJunction() {
   const last = run.barcodes[0];
   if (!last) return {letter: null, action: DEFAULT_JUNCTION, at: null};
-  return {letter: last.letter, action: mappings[last.letter] || 'forward', at: last.at};
+  return {letter: last.letter, action: mappings[last.letter] || DEFAULT_JUNCTION, at: last.at};
 }
 
 function snapshot() {
@@ -205,6 +210,26 @@ function onRobotEvent(e) {
       if (e.phase) o.phase = String(e.phase).toUpperCase();
       log('ROBOT', 'Avoidance: ' + o.phase);
       break;
+    case 'LINE': {
+      const line = run.line;
+      const event = String(e.event || '').toUpperCase();
+      line.lastEvent = event; line.lastEventAt = Date.now();
+      if (event === 'PIVOT') {
+        line.pivots++;
+        log('ROBOT', 'Overshot a bend — pivoting back onto the line');
+      } else if (event === 'SEARCH_FOUND') {
+        line.searches++;
+        log('ROBOT', 'Line slipped outside the sensors — found again by searching');
+      } else if (event === 'SEARCH_CENTRED') {
+        /* Routine on long straights: counted, not logged. */
+        line.centredSearches++;
+      } else if (event === 'LOST') {
+        log('ROBOT', 'Line lost — search gave up, car stopped');
+      } else {
+        throw Error('Unknown line event');
+      }
+      break;
+    }
     case 'LINE_REJOINED':
       o.phase = 'REJOINED';
       log('ROBOT', 'Line rejoined after obstacle');
@@ -225,7 +250,7 @@ function onRobotEvent(e) {
 }
 
 function onBarcode(letter) {
-  const action = mappings[letter] || 'forward';
+  const action = mappings[letter] || DEFAULT_JUNCTION;
   startRunIfNeeded();
   run.barcodes.unshift({at: Date.now(), letter, action, status: 'sent'});
   run.barcodes = run.barcodes.slice(0, 12);
@@ -325,7 +350,12 @@ const server = http.createServer((req, res) => {
     readBody(req, body => {
       try {
         if (!body || !['start', 'stop'].includes(body.type)) throw Error('Invalid command');
-        if (body.type === 'start') { run = newRun(); run.startedAt = Date.now(); }
+        /* Only with the car connected: otherwise the command goes nowhere and
+         * the dashboard would show a run that is not happening. */
+        if (!snapshot().carConnected) throw Error('Robot not connected');
+        /* Start: a fresh run record; it begins (timer, "running") when the
+         * car's telemetry first reports RUNNING, not on the button press. */
+        if (body.type === 'start') { run = newRun(); if (PREVIEW) run.startedAt = Date.now(); }
         else endRun();
         publishCommand(body.type);
         push(); sendJson(res, 200, {ok: true});

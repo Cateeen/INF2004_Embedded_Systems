@@ -287,6 +287,56 @@ bool wheel_speed_control_update(
     return true;
 }
 
+/*
+ * PWM for the current targets from the last measured speeds, without
+ * advancing the PIDs (no integration, derivative or stored-error change):
+ * feed-forward + kp * error + ki * integral, clamped as in an update.
+ */
+bool wheel_speed_control_retarget_output(
+    const wheel_speed_control_t *controller,
+    float left_speed_cm_s,
+    float right_speed_cm_s,
+    wheel_speed_output_t *output)
+{
+    if ((controller == NULL) ||
+        (!controller->initialized) ||
+        (output == NULL) ||
+        !isfinite(left_speed_cm_s) ||
+        !isfinite(right_speed_cm_s) ||
+        (left_speed_cm_s < 0.0f) ||
+        (right_speed_cm_s < 0.0f))
+    {
+        return false;
+    }
+
+    uint8_t maximum = controller->config.max_pwm_percent;
+    float left_base = feed_forward_pwm(
+        &controller->config, controller->left_target_cm_s);
+    float right_base = feed_forward_pwm(
+        &controller->config, controller->right_target_cm_s);
+    float left_correction =
+        controller->left_pid.kp *
+            (controller->left_target_cm_s - left_speed_cm_s) +
+        controller->left_pid.ki * controller->left_pid.integral;
+    float right_correction =
+        controller->right_pid.kp *
+            (controller->right_target_cm_s - right_speed_cm_s) +
+        controller->right_pid.ki * controller->right_pid.integral;
+
+    if (!isfinite(left_correction) || !isfinite(right_correction))
+    {
+        return false;
+    }
+
+    /* calculate_pwm clamps base + correction to 0..max, which is the
+     * same as the update's correction limits. */
+    output->left_pwm_percent = calculate_pwm(
+        left_base, left_correction, maximum);
+    output->right_pwm_percent = calculate_pwm(
+        right_base, right_correction, maximum);
+    return true;
+}
+
 bool wheel_speed_control_reset(
     wheel_speed_control_t *controller)
 {

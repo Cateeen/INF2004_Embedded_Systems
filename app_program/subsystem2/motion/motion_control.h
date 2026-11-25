@@ -24,6 +24,17 @@ typedef struct {
 	int8_t direction;       /* +1 forward, -1 reverse, 0 spinning */
 	int8_t left_direction;  /* each wheel: +1 forward, -1 backward */
 	int8_t right_direction;
+	/* Last measured wheel speeds fed to the PID (direction-normalized), so
+	 * a steering change can be applied before the next odometry sample. */
+	float left_speed_cm_s;
+	float right_speed_cm_s;
+	bool have_speeds;
+	/* Why the control faulted (diagnostics): a constant string, NULL until a
+	 * fault; the wheel speeds (cm/s) when a wheel ran backwards. */
+	const char *fault_reason;
+	uint32_t fault_value;
+	float fault_left_cm_s;
+	float fault_right_cm_s;
 	bool have_output;
 	bool running;
 	bool faulted;
@@ -57,7 +68,11 @@ motion_control_result_t motion_control_step(motion_control_t *control,
 
 /* Steering: per-wheel target magnitudes in cm/s, both > 0 and in the started
  * direction (no spins). Only while running and not faulted; PID state is
- * kept. Returns false and changes nothing otherwise. */
+ * kept. When the targets change and there is already an output, the output
+ * is recomputed at once from the last measured speeds (as the line_follow
+ * bench test, whose PID runs right after each steering update), instead of
+ * waiting up to one odometry period. Returns false and changes nothing
+ * otherwise. */
 bool motion_control_set_targets(motion_control_t *control,
 				float left_cm_s, float right_cm_s);
 

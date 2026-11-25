@@ -54,6 +54,14 @@ typedef enum {
 	DASHBOARD_AVOID_REJOINED
 } dashboard_avoid_phase_t;
 
+/* Straddle line following (robot/event {"type":"LINE","event":"..."}). */
+typedef enum {
+	DASHBOARD_LINE_PIVOT = 0,       /* overshot a bend: pivoting back to it */
+	DASHBOARD_LINE_SEARCH_FOUND,    /* the tape had escaped; the search found it */
+	DASHBOARD_LINE_SEARCH_CENTRED,  /* searched, but the tape was between the sensors */
+	DASHBOARD_LINE_LOST             /* gave up: line lost, robot stopped */
+} dashboard_line_event_t;
+
 typedef enum {
 	DASHBOARD_EVENT_BARCODE_DETECTED = 0,
 	DASHBOARD_EVENT_LINE_REJOINED,
@@ -75,6 +83,7 @@ uint16_t dashboard_msg_obstacle_profile(uint16_t width_mm, uint16_t clear_left_m
 					uint16_t clear_right_mm, dashboard_side_t side,
 					char *out);
 uint16_t dashboard_msg_avoid_phase(dashboard_avoid_phase_t phase, char *out);
+uint16_t dashboard_msg_line_event(dashboard_line_event_t event, char *out);
 uint16_t dashboard_msg_barcode(char letter, char *out);
 
 /* Packs robot/heartbeat: byte 0 = (1 << 5) | (vehicle_state << 2),

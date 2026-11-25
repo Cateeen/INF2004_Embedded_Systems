@@ -80,7 +80,7 @@
 #endif
 /* Scan settings. Floats (SCAN_TRIM_DEG) may be written with decimals. */
 #ifndef SCAN_HALF_DEG
-#define SCAN_HALF_DEG 60U         /* never turn further than this either way */
+#define SCAN_HALF_DEG 70U         /* never turn further than this either way (= vehicle) */
 #endif
 #ifndef SCAN_STEP_DEG
 #define SCAN_STEP_DEG 3U          /* measuring step (sweep) */
@@ -105,7 +105,7 @@
 #define SCAN_MAX_OBSTACLE_MM 450U /* echoes farther than this are background, not the obstacle */
 #endif
 #ifndef SCAN_TRIM_DEG
-#define SCAN_TRIM_DEG 11.6        /* beam: pull each edge in by this much (best fit on the bench) */
+#define SCAN_TRIM_DEG 15.0        /* beam: pull each edge in by this much (bench, 20 cm) */
 #endif
 #ifndef SCAN_TRUE_WIDTH_MM
 #define SCAN_TRUE_WIDTH_MM 0U     /* known width: print the trim that matches it */
@@ -378,7 +378,7 @@ void spin_width_hwtest_run(void)
 		  (unsigned)LANE_MM, (unsigned)SPIN_TRACK_MM, (unsigned)SPIN_PWM,
 		  (unsigned)SPIN_PWM_SLOW, (unsigned)SCAN_SENSOR_OFFSET_MM,
 		  f1(b1, (float)(SCAN_TRIM_DEG)), SCAN_FULL ? ", FULL sweep" : "");
-	tm_printf((UB*)TAG "SETUP: robot on the floor facing the obstacle, ~30 cm from the sensor, "
+	tm_printf((UB*)TAG "SETUP: robot on the floor facing the obstacle, ~20 cm from the sensor, "
 		  "obstacle centred; clear space around; servo points ahead\n");
 	if (SCAN_BYPASS)
 		tm_printf((UB*)TAG "BYPASS on: after the scan it turns 90 deg, drives up to 500 mm "
@@ -399,7 +399,7 @@ void spin_width_hwtest_run(void)
 		if (fresh_distance(now_ms(), &mm)) {
 			if (mm != OBS_DIST_NONE)
 				tm_printf((UB*)TAG "ahead now: %u mm%s\n", (unsigned)mm,
-					  mm < 250U || mm > 350U ? "  (aim for ~300 mm: the trim depends on distance)" : "");
+					  mm < 170U || mm > 250U ? "  (aim for ~200 mm, the vehicle stop distance: the trim depends on distance)" : "");
 			else
 				tm_printf((UB*)TAG "ahead now: NONE (nothing in front?)\n");
 		}

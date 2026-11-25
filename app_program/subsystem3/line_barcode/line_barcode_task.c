@@ -1,7 +1,7 @@
 #include "../../app.h"
 #include "../../vehicle_buffers.h"
 #include "line_barcode_task.h"
-#include "junction_detector.h"
+#include "straddle_junction.h"
 
 #define LINE_BARCODE_PRIORITY 9
 #define LINE_FAULT_RETRY_MS 1000U
@@ -20,7 +20,7 @@ typedef struct {
 	int32_t half_count;
 	float count_rate;       /* mean counts per ms over the last odometry period */
 	float mm_per_count;     /* > 0 with junction.initialized: detector on */
-	junction_detector_t junction;
+	straddle_junction_t junction;
 	uint32_t line_sequence;
 	uint32_t barcode_sequence;
 	uint32_t last_sample_ms;
@@ -30,6 +30,12 @@ typedef struct {
 	bool scanner_ready;
 	bool have_sample;
 	bool was_in_frame;      /* scanner was inside a barcode frame last sample */
+	bool bc_black;          /* barcode colour after hysteresis */
+	bool bc_deb_black;      /* ... after the debounce (what the scanner sees) */
+	bool bc_deb_pending;
+	int32_t bc_deb_start;   /* count where the pending change began */
+	bool line_centre_black; /* line sensor colours after hysteresis */
+	bool line_right_black;
 	bool all_black;         /* all three sensors black ... */
 	uint32_t all_black_since_ms;    /* ... since this sample */
 } line_state_t;
@@ -144,9 +150,65 @@ static int32_t sample_count(const line_state_t *state, uint32_t timestamp_ms)
 			   (uint32_t)(int32_t)__builtin_lroundf(state->count_rate * (float)since));
 }
 
-static uint16_t process_readings(line_state_t *state, const ir_readings_t *readings,
+/* Barcode colour: the reader's threshold, or hysteresis on the raw value. */
+static bool barcode_colour(const line_barcode_task_config_t *config, bool previous,
+			   const ir_readings_t *readings)
+{
+	if (config->barcode_black_adc == 0U) return readings->barcode.black;
+	if (readings->barcode.raw >= config->barcode_black_adc) return true;
+	if (readings->barcode.raw <= config->barcode_white_adc) return false;
+	return previous;
+}
+
+/* Accept a colour change once the wheels have moved debounce_counts with it
+ * held; *edge is where it began (as the bench test), else count. */
+static bool barcode_debounce(line_state_t *state, uint32_t debounce_counts, bool black,
+			     int32_t count, int32_t *edge)
+{
+	int32_t moved;
+	uint32_t distance;
+
+	*edge = count;
+	if (debounce_counts == 0U) {
+		state->bc_deb_black = black;
+		return black;
+	}
+	if (black == state->bc_deb_black) {
+		state->bc_deb_pending = false;
+		return state->bc_deb_black;
+	}
+	if (!state->bc_deb_pending) {
+		state->bc_deb_pending = true;
+		state->bc_deb_start = count;
+	}
+	moved = (int32_t)((uint32_t)count - (uint32_t)state->bc_deb_start);
+	distance = moved < 0 ? 0U - (uint32_t)moved : (uint32_t)moved;
+	if (distance < debounce_counts) return state->bc_deb_black;
+	state->bc_deb_black = black;
+	state->bc_deb_pending = false;
+	*edge = state->bc_deb_start;
+	return black;
+}
+
+/* Line sensor colours: the reader's threshold, or hysteresis on the raw
+ * values (config line_black_adc/line_white_adc). */
+static void line_colours(const line_barcode_task_config_t *config, line_state_t *state,
+			 ir_readings_t *readings)
+{
+	if (config->line_black_adc == 0U) return;
+	if (readings->center.raw >= config->line_black_adc) state->line_centre_black = true;
+	else if (readings->center.raw <= config->line_white_adc) state->line_centre_black = false;
+	if (readings->right.raw >= config->line_black_adc) state->line_right_black = true;
+	else if (readings->right.raw <= config->line_white_adc) state->line_right_black = false;
+	readings->center.black = state->line_centre_black;
+	readings->right.black = state->line_right_black;
+}
+
+static uint16_t process_readings(line_state_t *state, const ir_readings_t *raw_readings,
 				 uint32_t timestamp_ms)
 {
+	ir_readings_t adjusted = *raw_readings;
+	const ir_readings_t *readings = &adjusted;
 	line_observation_message_t line = {0};
 	barcode_event_message_t barcode = {0};
 	uint8_t position;
@@ -160,31 +222,44 @@ static uint16_t process_readings(line_state_t *state, const ir_readings_t *readi
 		if (elapsed == 0U || elapsed > INT32_MAX)
 			return VEHICLE_FAULT_CODE_LINE_CLOCK;
 	}
+	line_colours(&s_config, state, &adjusted);
 	fault = receive_odometry(state, timestamp_ms, &odom_updated);
 	if (fault != 0U) return fault;
 	(void)odom_updated;
 	junction = false;
 	if (state->have_odom) {
 		int32_t count = sample_count(state, timestamp_ms);
+		bool black;
+
 		if (!state->scanner_ready) {
+			black = s_config.barcode_black_adc == 0U ? readings->barcode.black :
+				readings->barcode.raw >= s_config.barcode_black_adc;
 			if (!barcode_scanner_init(&state->scanner, &state->barcode_config,
-						  readings->barcode.black, count))
+						  black, count))
 				return VEHICLE_FAULT_CODE_LINE_BARCODE;
+			state->bc_black = state->bc_deb_black = black;
+			state->bc_deb_pending = false;
 			state->scanner_ready = true;
-		} else if (!barcode_scanner_update(&state->scanner, readings->barcode.black,
-						   count)) {
-			return VEHICLE_FAULT_CODE_LINE_BARCODE;
+		} else {
+			int32_t edge;
+
+			black = barcode_colour(&s_config, state->bc_black, readings);
+			state->bc_black = black;
+			black = barcode_debounce(state, s_config.barcode_debounce_counts, black,
+						 count, &edge);
+			if (!barcode_scanner_update(&state->scanner, black, edge))
+				return VEHICLE_FAULT_CODE_LINE_BARCODE;
 		}
 		if (state->scanner.in_frame && !state->was_in_frame &&
 		    s_config.barcode_started != NULL)
 			s_config.barcode_started(s_config.barcode_started_context);
 		state->was_in_frame = state->scanner.in_frame;
 		if (state->junction.initialized)
-			junction = junction_detector_update(
-				&state->junction, readings->barcode.black,
-				readings->center.black, readings->right.black,
+			junction = straddle_junction_update(
+				&state->junction, readings->center.black,
+				readings->right.black,
 				(float)count * state->mm_per_count) ==
-				JUNCTION_DETECTED;
+				STRADDLE_JUNCTION_DETECTED;
 	}
 	position = line_following_position(readings);
 	line.header.type = VEHICLE_MESSAGE_LINE_OBSERVATION;
@@ -194,8 +269,8 @@ static uint16_t process_readings(line_state_t *state, const ir_readings_t *readi
 	line.lateral_error = position == POS_LEFT ? -1 : position == POS_RIGHT ? 1 : 0;
 	line.confidence = position == POS_LOST ? 0U : 1000U;
 	line.line_detected = position != POS_LOST;
-	/* A confirmed junction (left sensor + line sensors), not "both line
-	 * sensors black", which is normal edge following. */
+	/* A confirmed junction (both line sensors black for a few mm; the
+	 * sensors straddle the tape, so only a crossing tape covers both). */
 	line.intersection_detected = junction ? 1U : 0U;
 	if (!(readings->barcode.black && readings->center.black && readings->right.black)) {
 		state->all_black = false;
@@ -326,6 +401,12 @@ ER line_barcode_task_start(const line_barcode_task_config_t *config)
 	    config->odometry_max_age_ms > INT32_MAX ||
 	    !__builtin_isfinite(config->junction_mm_per_count) ||
 	    config->junction_mm_per_count < 0.0f ||
+	    (config->barcode_black_adc != 0U &&
+	     (config->barcode_white_adc >= config->barcode_black_adc ||
+	      config->barcode_black_adc > 4095U)) ||
+	    (config->line_black_adc != 0U &&
+	     (config->line_white_adc >= config->line_black_adc ||
+	      config->line_black_adc > 4095U)) ||
 	    !barcode_scanner_init(&s_state.scanner, &config->barcode, false, 0))
 		return E_PAR;
 	if (g_mbf_line_odometry <= 0 || g_mbf_line_observations <= 0 ||
@@ -335,9 +416,10 @@ ER line_barcode_task_start(const line_barcode_task_config_t *config)
 	s_state.barcode_config = config->barcode;
 	s_state.max_age_ms = config->odometry_max_age_ms;
 	if (config->junction_mm_per_count > 0.0f) {
-		static const junction_config_t junction_config = JUNCTION_DEFAULT_CONFIG;
+		static const straddle_junction_config_t junction_config =
+			STRADDLE_JUNCTION_DEFAULT_CONFIG;
 
-		if (!junction_detector_init(&s_state.junction, &junction_config)) return E_PAR;
+		if (!straddle_junction_init(&s_state.junction, &junction_config)) return E_PAR;
 		s_state.mm_per_count = config->junction_mm_per_count;
 	}
 	task.task = (FP)line_barcode_task;
@@ -588,13 +670,13 @@ static BOOL test_sample_line(line_state_t *state, const ir_readings_t *readings,
 	       tk_rcv_mbf(g_mbf_line_observations, line, TMO_POL) == (INT)sizeof(*line);
 }
 
-/* With the detector on (1 mm per count), a tape across the path -- left
- * sensor black 20-30 mm, centre+right black 28-38 mm -- sets
- * intersection_detected in exactly one observation; both line sensors black
- * on their own (normal edge following) never does. */
+/* With the detector on (1 mm per count), a tape across the path -- centre
+ * and right black together 28-38 mm -- sets intersection_detected in exactly
+ * one observation; one line sensor at a time (straddle corrections) never
+ * does, and those observations carry the side. */
 static BOOL task_junction_test(void)
 {
-	static const junction_config_t config = JUNCTION_DEFAULT_CONFIG;
+	static const straddle_junction_config_t config = STRADDLE_JUNCTION_DEFAULT_CONFIG;
 	ir_readings_t readings = {0};
 	line_observation_message_t line;
 	unsigned junctions = 0U, centred = 0U, d;
@@ -605,26 +687,25 @@ static BOOL task_junction_test(void)
 	s_test_state.barcode_config = (barcode_scanner_config_t){10U, 0U, 0U, 0U, 0U};
 	s_test_state.max_age_ms = 50U;
 	s_test_state.mm_per_count = 1.0f;
-	if (!junction_detector_init(&s_test_state.junction, &config)) return FALSE;
-	readings.center.black = true;
+	if (!straddle_junction_init(&s_test_state.junction, &config)) return FALSE;
 	for (d = 0U; d <= 80U; d += 2U) {
-		readings.barcode.black = d >= 20U && d < 32U;
-		readings.right.black = d >= 27U && d < 39U;
+		readings.center.black = d >= 28U && d < 39U;
+		readings.right.black = d >= 28U && d < 39U;
 		if (!test_sample_line(&s_test_state, &readings, d, sequence++, timestamp, &line))
 			ok = FALSE;
 		timestamp += 20U;
 		if (line.intersection_detected != 0U) junctions++;
 	}
 	ok = junctions == 1U && ok;
-	/* Riding the edge with both line sensors black, left sensor white. */
+	/* Straddling: one line sensor at a time, then the tape in the gap. */
 	for (; d <= 160U; d += 2U) {
-		readings.barcode.black = false;
-		readings.right.black = (d / 10U) % 2U == 0U;
+		readings.center.black = (d / 10U) % 3U == 0U;
+		readings.right.black = (d / 10U) % 3U == 1U;
 		if (!test_sample_line(&s_test_state, &readings, d, sequence++, timestamp, &line))
 			ok = FALSE;
 		timestamp += 20U;
 		if (line.intersection_detected != 0U) junctions++;
-		if (line.lateral_error == 0 && line.line_detected) centred++;
+		if (line.lateral_error != 0 && line.line_detected) centred++;
 	}
 	ok = junctions == 1U && centred > 0U && ok;
 	ok = test_drain(g_mbf_line_odometry) && ok;
@@ -664,6 +745,63 @@ static BOOL task_pickup_test(void)
 	return test_drain(g_mbf_barcode_events) && ok;
 }
 
+/* Hysteresis holds the colour between the thresholds; the debounce accepts a
+ * change only after debounce_counts of travel and places the edge where it
+ * began; a blip shorter than that is ignored. */
+static BOOL task_barcode_filter_test(void)
+{
+	line_barcode_task_config_t cfg = {0};
+	ir_readings_t r = {0};
+	line_state_t st = {0};
+	int32_t edge;
+	BOOL ok;
+
+	cfg.barcode_black_adc = 1000U;
+	cfg.barcode_white_adc = 600U;
+	r.barcode.raw = 1100U;
+	ok = barcode_colour(&cfg, false, &r);
+	r.barcode.raw = 800U;
+	ok = barcode_colour(&cfg, true, &r) && !barcode_colour(&cfg, false, &r) && ok;
+	r.barcode.raw = 500U;
+	ok = !barcode_colour(&cfg, true, &r) && ok;
+	cfg.barcode_black_adc = 0U;     /* off: the reader's colour */
+	r.barcode.black = true;
+	ok = barcode_colour(&cfg, false, &r) && ok;
+
+	st.bc_deb_black = false;
+	ok = !barcode_debounce(&st, 4U, true, 102, &edge) && edge == 102 && ok;
+	ok = !barcode_debounce(&st, 4U, true, 105, &edge) && ok;        /* 3 counts */
+	ok = barcode_debounce(&st, 4U, true, 106, &edge) && edge == 102 && ok;
+	ok = barcode_debounce(&st, 4U, false, 110, &edge) && ok;        /* blip starts */
+	ok = barcode_debounce(&st, 4U, true, 112, &edge) && !st.bc_deb_pending && ok;
+	ok = barcode_debounce(&st, 4U, false, 120, &edge) && ok;
+	ok = !barcode_debounce(&st, 4U, false, 124, &edge) && edge == 120 && ok;
+	ok = barcode_debounce(&st, 0U, true, 130, &edge) && edge == 130 && ok;  /* off */
+
+	/* Line sensors: black at >= 1500, white again only at <= 900. */
+	cfg.line_black_adc = 1500U;
+	cfg.line_white_adc = 900U;
+	st = (line_state_t){0};
+	{
+		static const uint16_t raw[] = { 200U, 1250U, 1600U, 1250U, 950U, 880U, 1250U };
+		static const bool want[] = { false, false, true, true, true, false, false };
+
+		for (unsigned i = 0U; i < sizeof(raw) / sizeof(raw[0]); i++) {
+			r = (ir_readings_t){0};
+			r.center.raw = raw[i];
+			r.right.raw = 200U;
+			r.right.black = true;           /* the reader's flag is replaced */
+			line_colours(&cfg, &st, &r);
+			ok = r.center.black == want[i] && !r.right.black && ok;
+		}
+	}
+	cfg.line_black_adc = 0U;        /* off: the reader's colours */
+	r.right.black = true;
+	line_colours(&cfg, &st, &r);
+	ok = r.right.black && ok;
+	return ok;
+}
+
 static unsigned s_test_started;
 
 static void test_barcode_started(void *context)
@@ -690,6 +828,7 @@ BOOL line_barcode_task_test(void)
 {
 	BOOL pickup_ok;
 	BOOL started_ok;
+	BOOL filter_ok;
 	BOOL frame_ok;
 	BOOL mean_ok;
 	BOOL fault_ok;
@@ -710,13 +849,15 @@ BOOL line_barcode_task_test(void)
 	TEST_CHECK("LB-U02", mean_ok, "wheel-count and sequence wrap");
 	TEST_CHECK("LB-U03", fault_ok, "odometry synchronization and full queues");
 	TEST_CHECK("LB-U04", estimate_ok, "wheel count estimated between odometry updates");
-	TEST_CHECK("LB-U05", junction_ok, "a tape across the path flags one junction; both line sensors black alone does not");
+	TEST_CHECK("LB-U05", junction_ok, "a tape across both line sensors flags one junction; one sensor at a time does not");
 	pickup_ok = task_pickup_test();
 	started_ok = task_started_test();
 	TEST_CHECK("LB-U06", pickup_ok, "all three sensors black for LINE_PICKUP_MS reports picked_up; floor clears it");
 	TEST_CHECK("LB-U07", started_ok, "barcode_started hook runs once per barcode frame");
+	filter_ok = task_barcode_filter_test();
+	TEST_CHECK("LB-U08", filter_ok, "barcode hysteresis and debounce as the bench barcode test; line sensor hysteresis");
 	TEST_SUMMARY("line/barcode task");
 	return frame_ok && mean_ok && fault_ok && estimate_ok && junction_ok &&
-	       pickup_ok && started_ok;
+	       pickup_ok && started_ok && filter_ok;
 }
 #endif

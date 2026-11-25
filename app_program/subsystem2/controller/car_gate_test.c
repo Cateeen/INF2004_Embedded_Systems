@@ -99,6 +99,28 @@ static BOOL safety_rearm_test(void)
 	return ok;
 }
 
+/* Straddle line sensors: centred reads no line (both white), so arming
+ * needs only the floor under the robot (not picked up). */
+static BOOL safety_straddle_test(void)
+{
+	car_safety_config_t config = safety_config;
+	car_safety_t safety = {0};
+	line_observation_message_t line;
+	BOOL ok;
+
+	config.straddle_line = true;
+	ok = car_safety_init(&safety, &config, 100U) && safety_inputs(&safety, 1U, 100U);
+	line = safety_line(2U, 101U, 0U);                       /* tape in the gap */
+	ok = car_safety_line(&safety, &line, 101U) && safety.line_clear &&
+	     car_safety_follow(&safety, 101U, true, true, false) && ok;
+	ok = !car_safety_follow(&safety, 101U, false, false, false) && ok;
+	line = safety_line(3U, 102U, 0U);
+	line.picked_up = 1U;                                    /* lifted */
+	ok = car_safety_line(&safety, &line, 102U) && !safety.line_clear &&
+	     !car_safety_follow(&safety, 102U, true, true, false) && ok;
+	return ok;
+}
+
 static BOOL safety_scan_test(void)
 {
 	car_safety_t safety = {0};
@@ -330,6 +352,7 @@ BOOL car_gate_test(void)
 	BOOL state_flow_ok;
 	BOOL state_fault_ok;
 	BOOL state_scan_ok;
+	BOOL straddle_ok;
 	TEST_INIT();
 
 	motion_ok = car_gate_motion(true, false, 0U) &&
@@ -357,6 +380,7 @@ BOOL car_gate_test(void)
 	state_flow_ok = controller_state_flow_test();
 	state_fault_ok = controller_state_fault_test();
 	state_scan_ok = controller_state_scan_test();
+	straddle_ok = safety_straddle_test();
 
 	TEST_CHECK("VC-U01", motion_ok, "stop, emergency and fault veto motion");
 	TEST_CHECK("VC-U02", follow_ok, "obstacle vetoes line following");
@@ -368,8 +392,9 @@ BOOL car_gate_test(void)
 	TEST_CHECK("VC-U10", state_flow_ok, "state transitions and fresh go edges");
 	TEST_CHECK("VC-U11", state_fault_ok, "state faults, emergency latch and clock wrap");
 	TEST_CHECK("VC-U12", state_scan_ok, "scan state and ahead reacquisition");
+	TEST_CHECK("VC-U35", straddle_ok, "straddle line sensors: arming needs the floor (not lifted), not the tape under a sensor");
 	TEST_SUMMARY("controller gate");
 	return motion_ok && follow_ok && rearm_ok && safety_ok && scan_ok && fault_ok &&
-	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok;
+	       wrap_ok && state_flow_ok && state_fault_ok && state_scan_ok && straddle_ok;
 }
 #endif

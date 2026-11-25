@@ -41,7 +41,7 @@ typedef struct {
 	uint8_t spin_pwm;            /* 25 % */
 	uint8_t spin_pwm_slow;       /* 20 %, last 15 deg of a turn */
 	/* Scan. */
-	float half_deg;              /* never turn further than this either way: 60 */
+	float half_deg;              /* never turn further than this either way: 70 */
 	float step_deg;              /* measuring step: 3 */
 	float find_step_deg;         /* edge-finding step: 6 */
 	float sensor_offset_mm;      /* axle to sensor face: 70 */
@@ -50,7 +50,7 @@ typedef struct {
 				      * margin + 2 x clearance when bypassing): 200 */
 	float beyond_mm;             /* side objects farther beyond it are ignored: 400 */
 	float max_obstacle_mm;       /* farther echoes are background: 450 */
-	float trim_deg;              /* beam correction: 11.6 (bench, 30 cm) */
+	float trim_deg;              /* beam correction: 15.0 (bench, 9 cm box at 20 cm) */
 	float true_width_mm;         /* known width: print the matching trim (0 = off) */
 	bool full_sweep;             /* always sweep R..L half_deg */
 	/* Bypass. */

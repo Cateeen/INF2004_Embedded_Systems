@@ -175,7 +175,7 @@ The reader exclusively opens the kernel ADC, configures only the explicitly
 selected GP26–GP28 inputs, and requires per-sensor thresholds and polarity.
 Its `line_adc_reader_default_config()` imports the original repository's
 barcode/center/right ADC channels (2/1/0), black thresholds (barcode 1000,
-center and right 1500 counts; `LINE_ADC_*_BLACK_THRESHOLD`), and
+center and right 1200 counts; `LINE_ADC_*_BLACK_THRESHOLD`), and
 black-above polarity; callers still choose the acquisition-span limit.
 The supplied pin map assigns left to GP28 (ADC2), center to GP27
 (ADC1), and right to GP26 (ADC0); the GPIO numbers were confirmed despite
@@ -468,7 +468,7 @@ controller exclusively consumes those buffers, so do not start it alongside
 hardware-tested (VC-H01).
 
 Obstacles (`obstacle_bypass` in the controller config, on with `VEHICLE=1`):
-an ahead reading at or under 300 mm while `FOLLOWING` stops the robot as
+an ahead reading at or under 200 mm while `FOLLOWING` stops the robot as
 before, but instead of waiting for GO the controller waits until the motion
 task reports idle and hands the motors to the `vehicle_bypass` task (core 0,
 `subsystem2/controller/vehicle_bypass.c`). That task runs exactly the
@@ -479,9 +479,12 @@ and rejoin the line. The controller forwards the ahead readings to it and keeps
 every safety check running; a fault, or GO pressed to stop, aborts it and
 brakes the motors. When it finishes, the robot is re-armed with the same checks
 as a GO press (line seen, ahead clear, IMU clear) and line following resumes;
-otherwise it stays stopped and GO off/on resumes by hand. The obstacle task's
-emergency distance is 120 mm (a latched fault), well below the 300 mm stop
-distance, so the bypass can work 20-30 cm from the obstacle. Log lines start
+otherwise it stays stopped and one GO press resumes by hand. The obstacle
+task's emergency distance is 120 mm (stops at once, never latches), below the
+200 mm stop distance, so the bypass starts about 20 cm from the obstacle; its
+sweep limit is 70 degrees so it still sees a free lane beside the obstacle from
+that close. An obstacle first seen at 125 mm or closer (e.g. a hand) is not
+bypassed: the robot just stops. Log lines start
 with `[BYPASS]`. Hardware test: OBS-H04.
 
 With `VEHICLE=1`, the local GO input is a momentary button between GP20 and
@@ -680,8 +683,9 @@ Pressing GO during a turn stops it; a timeout, stall, wrong-way turn or
 overtravel past 135 degrees also stops the motors and ends the test.
 
 Step 2 is `make SENSOR_TEST=spin_width` (**drives the motors**): place the
-robot facing the obstacle about 30 cm from the sensor (the vehicle stops at
-300 mm, and the beam correction depends on distance). Each GO press first
+robot facing the obstacle about 20 cm from the sensor (the vehicle stops at
+200 mm, and the beam correction depends on distance: re-check `SCAN_TRIM_DEG`
+there with `SCAN_TRUE_WIDTH_MM`; 15.0 is calibrated at 20 cm). Each GO press first
 finds the right edge: from straight ahead it steps right in
 `SCAN_FIND_STEP_DEG` (6) degree steps until the obstacle is lost for two
 readings in a row (these readings are not used). It then measures in one
@@ -690,19 +694,20 @@ direction only: from just past the right edge it steps left in about
 reading tagged with the encoder heading) across the obstacle until it is lost
 on the left. On each side it keeps going far enough to see a free gap of
 `SCAN_LANE_MM` (200: robot width plus clearance) beside the obstacle, and never
-turns past `SCAN_HALF_DEG` (60). A reading with no echo is read once more, and a
+turns past `SCAN_HALF_DEG` (70). A reading with no echo is read once more, and a
 single missed reading inside the obstacle is bridged, so one dropped echo does
 not split the obstacle. If nothing is heard straight ahead at the start, or with
-`SCAN_FULL=1`, it sweeps the whole R60 to L60 instead. It turns back to the
+`SCAN_FULL=1`, it sweeps the whole R70 to L70 instead. It turns back to the
 start, braking early to allow for the coast (learnt from each scan's landing
 error, starting at 3.5 degrees), and prints every reading, the angles where the obstacle was heard, the
 raw width, the width after pulling each edge in by the beam correction
-`SCAN_TRIM_DEG` (default 11.6), the free gap on each side with a `PASSABLE`
+`SCAN_TRIM_DEG` (default 15.0), the free gap on each side with a `PASSABLE`
 verdict, and a `CSV,` line. Side objects more than `SCAN_BEYOND_MM` (400:
 assumed depth plus robot length plus margin) beyond the obstacle are past the
 bypass and ignored. Calibrated on the mat with a 9 cm box at 30 cm:
-`SCAN_TRIM_DEG=11.6` keeps centred and 5 cm off-centre boxes within about
-±75 mm. The beam hears a flat face over a wider angle when it is straight
+`SCAN_TRIM_DEG=11.6` kept centred and 5 cm off-centre boxes within about
+±75 mm; from the vehicle's 20 cm stop a centred box needs 15.0 (the
+default now: 119.7 mm read with 11.6 for a 90 mm box at 228 mm). The beam hears a flat face over a wider angle when it is straight
 ahead (mirror-like echo), so centred boxes read wide and off-centre ones
 narrow. With `SCAN_BYPASS=1` (default) it then pulls out: it bypasses on the
 right unless the obstacle sticks out more than 1 cm further right than left,

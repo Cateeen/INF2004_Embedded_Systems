@@ -30,26 +30,49 @@ motion_feedback_result_t motion_feedback_update(motion_feedback_t *feedback,
 	int32_t left_delta, right_delta;
 
 	if (feedback == NULL || message == NULL || speeds == NULL ||
-	    !feedback->initialized ||
-	    message->header.type != VEHICLE_MESSAGE_WHEEL_ODOMETRY ||
-	    message->header.version != VEHICLE_MESSAGE_VERSION || message->valid != 1U ||
-	    now_ms - message->header.timestamp_ms > feedback->config.max_age_ms)
+	    !feedback->initialized)
 		return MOTION_FEEDBACK_INVALID;
+	if (message->header.type != VEHICLE_MESSAGE_WHEEL_ODOMETRY ||
+	    message->header.version != VEHICLE_MESSAGE_VERSION) {
+		feedback->reject_reason = "odometry message of the wrong type";
+		return MOTION_FEEDBACK_INVALID;
+	}
+	if (message->valid != 1U) {
+		feedback->reject_reason = "odometry marked invalid (encoder fault)";
+		return MOTION_FEEDBACK_INVALID;
+	}
+	if (now_ms - message->header.timestamp_ms > feedback->config.max_age_ms) {
+		feedback->reject_reason = "odometry sample too old (ms)";
+		feedback->reject_value = now_ms - message->header.timestamp_ms;
+		return MOTION_FEEDBACK_INVALID;
+	}
 	left_count = (uint32_t)message->left_count;
 	right_count = (uint32_t)message->right_count;
 	if (feedback->have_baseline) {
 		elapsed = message->header.timestamp_ms - feedback->last_timestamp_ms;
-		if (message->header.sequence - feedback->last_sequence != 1U ||
-		    elapsed == 0U || elapsed > feedback->config.max_interval_ms ||
-		    !wheel_odometry_count_delta(left_count, feedback->last_left, &left_delta) ||
-		    !wheel_odometry_count_delta(right_count, feedback->last_right, &right_delta))
+		if (message->header.sequence - feedback->last_sequence != 1U) {
+			feedback->reject_reason = "odometry sequence gap (messages skipped)";
+			feedback->reject_value = message->header.sequence - feedback->last_sequence;
 			return MOTION_FEEDBACK_INVALID;
+		}
+		if (elapsed == 0U || elapsed > feedback->config.max_interval_ms) {
+			feedback->reject_reason = "odometry interval zero or too long (ms)";
+			feedback->reject_value = elapsed;
+			return MOTION_FEEDBACK_INVALID;
+		}
+		if (!wheel_odometry_count_delta(left_count, feedback->last_left, &left_delta) ||
+		    !wheel_odometry_count_delta(right_count, feedback->last_right, &right_delta)) {
+			feedback->reject_reason = "encoder count jump out of range";
+			return MOTION_FEEDBACK_INVALID;
+		}
 		next.elapsed_seconds = (float)elapsed / 1000.0f;
 		if (!wheel_odometry_calculate(&feedback->config.left, left_delta,
 					       next.elapsed_seconds, &left) ||
 		    !wheel_odometry_calculate(&feedback->config.right, right_delta,
-					       next.elapsed_seconds, &right))
+					       next.elapsed_seconds, &right)) {
+			feedback->reject_reason = "wheel speed calculation failed";
 			return MOTION_FEEDBACK_INVALID;
+		}
 		next.timestamp_ms = message->header.timestamp_ms;
 		next.left_cm_per_second = left.speed_cm_per_second;
 		next.right_cm_per_second = right.speed_cm_per_second;

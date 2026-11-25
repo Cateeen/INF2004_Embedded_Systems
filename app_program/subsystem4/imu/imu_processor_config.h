@@ -13,6 +13,13 @@
  * for this long, so the robot can be started again after being put down
  * (the controller still needs a fresh GO press). */
 #define IMU_TILT_CLEAR_MS 1000U
+/* Vehicle: lifted/overturned only counts once the raw attitude has stayed
+ * past the limits this long (4 samples). The check uses the unfiltered
+ * reading, and a bump over a tape seam, the caster jolting or the jerk of a
+ * junction spin can put one sample past them (az < 6.5, roll > 15 deg) and
+ * stopped the run; a real lift lasts far longer (and pick-up is also caught
+ * by the line sensors). */
+#define IMU_TILT_CONFIRM_MS 200U
 
 /* Robot geometry: two rear drive wheels and one front-centre ball caster.
  * Measured between ground contact points. */

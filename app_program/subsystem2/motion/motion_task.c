@@ -465,6 +465,22 @@ static void report_fault(uint16_t code, uint32_t now)
 	fault.code = code;
 	fault.recoverable = 0U;
 	tm_printf((UB*)"motion task fault; code %u\n", (unsigned)code);
+	if (code == VEHICLE_FAULT_CODE_MOTION_ODOMETRY) {
+		const motion_control_t *c = &s_state.control;
+
+		if (c->fault_reason == NULL)
+			tm_printf((UB*)"  motion odometry fault: odometry message of the wrong size\n");
+		else if (c->fault_left_cm_s != 0.0f || c->fault_right_cm_s != 0.0f)
+			tm_printf((UB*)"  motion odometry fault: %s (left %d, right %d mm/s; "
+				  "targets %d, %d mm/s)\n", c->fault_reason,
+				  (int)(c->fault_left_cm_s * 10.0f),
+				  (int)(c->fault_right_cm_s * 10.0f),
+				  (int)(c->speed.left_target_cm_s * 10.0f),
+				  (int)(c->speed.right_target_cm_s * 10.0f));
+		else
+			tm_printf((UB*)"  motion odometry fault: %s (%u)\n", c->fault_reason,
+				  (unsigned)c->fault_value);
+	}
 	for (;;) {
 		ER er;
 		if (!sent) {
@@ -855,7 +871,11 @@ static BOOL simulation_steering_test(void)
 	     state.active && state.issued_ms == 201U &&
 	     state.control.speed.left_target_cm_s == 14.0f &&
 	     state.control.speed.right_target_cm_s == 10.0f &&
-	     !state.control.speed.left_pid.first_update && ok;
+	     !state.control.speed.left_pid.first_update &&
+	     /* The new steering acts at once (no odometry since): left now
+	      * gets the larger PWM, as its target is the larger. */
+	     state.control.output.left_pwm_percent >
+		     state.control.output.right_pwm_percent && ok;
 	command = test_command(3U, 202U, VEHICLE_MOTION_VELOCITY, -10, 300U);
 	ok = send_command(&command) &&
 	     run_cycle(&state, &test_config, 202U) == VEHICLE_FAULT_CODE_MOTION_COMMAND && ok;

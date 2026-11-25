@@ -41,6 +41,21 @@
  * Safety: nothing moves until GO (GP20); GO during a run stops the motors.
  * Runs also stop on timeout, a stalled wheel, a wheel turning the wrong way,
  * or an encoder fault.
+ *
+ * LF_STRADDLE=1 (test-only, see straddle_hwtest.h): for the layout with the
+ * two line sensors further apart than the tape and the left/barcode sensor
+ * moved behind them. Following uses the straddle steering instead of
+ * line_steering, and a junction is the centre AND right sensors black
+ * together for JN_BOTH_MIN_MM (they can only both see tape at a crossing).
+ * The left sensor and the JN_LEFT_MIN_MM, JN_LEFT_MAX_MM, JN_OFFSET_MM and
+ * JN_TOL_MM settings are not used. Both white is the normal "centred"
+ * reading, so the test cannot tell "no line" by itself: by default every run
+ * follows the line. JN_NO_LINE=1 selects the NO-LINE START instead (for a
+ * single tape laid across the mat, no "+" track): drive straight up to
+ * JN_BLIND_MM until centre+right are both black, then do JN_ACTION -- a
+ * left/right turn follows the crossing tape as the new line, a U-turn spins
+ * a fixed 180 and drives back across the same tape. If both line sensors
+ * start ON the tape it first backs off it.
  */
 #include "../../app.h"
 #include "../../subsystem6/gpio/gpio_dispatcher.h"
@@ -51,6 +66,7 @@
 #include "../motion/motor_driver.h"
 #include "../motion/wheel_speed_control.h"
 #include "line_steering.h"
+#include "straddle_hwtest.h"
 #include "junction_hwtest.h"
 
 #include <tk/syslib.h>
@@ -101,6 +117,19 @@ _Static_assert(JN_SEEK_BEFORE_DEG >= 0 && JN_SEEK_BEFORE_DEG <= 80 &&
 #define JN_BLIND_MM 200U      /* no-line start: straight drive to find the crossing */
 #endif
 _Static_assert(JN_BLIND_MM >= 50U && JN_BLIND_MM <= 1000U, "need 50 <= JN_BLIND_MM <= 1000");
+/* Straddle seek: stop the spin when the tape is IN THE GAP between the line
+ * sensors (the leading sensor went black, then white again), not as soon as
+ * the leading sensor touches it -- that left the robot a few degrees short,
+ * with the tape still under the sensor. 0 off, 1 left spins only (left turn
+ * and U-turn), 2 all spins. Stops anyway if the far sensor goes black. */
+#ifndef JN_SEEK_GAP
+#define JN_SEEK_GAP 1
+#endif
+_Static_assert(JN_SEEK_GAP >= 0 && JN_SEEK_GAP <= 2, "JN_SEEK_GAP must be 0, 1 or 2");
+#ifndef JN_NO_LINE
+#define JN_NO_LINE 0          /* straddle: 1 = no-line start (single tape across) */
+#endif
+_Static_assert(JN_NO_LINE == 0 || JN_NO_LINE == 1, "JN_NO_LINE must be 0 or 1");
 #ifndef JN_LEFT_MIN_MM
 #define JN_LEFT_MIN_MM 8
 #endif
@@ -129,7 +158,11 @@ _Static_assert(JN_RUN_MM >= 200U && JN_RUN_MM <= 5000U, "need 200 <= JN_RUN_MM <
 _Static_assert(JN_TURN_TRIM_DEG >= 0 && JN_TURN_TRIM_DEG <= 20, "need 0 <= JN_TURN_TRIM_DEG <= 20");
 _Static_assert(JN_TRACE <= 1U, "JN_TRACE must be 0 or 1");
 
+#if LF_STRADDLE
+#define SPEED              LF_SL_SPEED     /* = the vehicle's unless overridden */
+#else
 #define SPEED              LINE_STEERING_SPEED_CM_S
+#endif
 
 /* Wheel speed PID: same as motion_config in app_main.c. */
 #define PID_KP             2.0f
@@ -165,6 +198,8 @@ _Static_assert(JN_TRACE <= 1U, "JN_TRACE must be 0 or 1");
 #define STALL_MM           2.0f
 #define WRONG_WAY_MM       20.0f
 #define MAX_EVENTS         16U
+#define MIN_WHEEL_CM_S     0.5f    /* PID needs targets > 0: "stopped" inner wheel */
+#define STALL_EXEMPT_CM_S  3.0f    /* a wheel asked for less is not stall-checked */
 
 #define BACKOFF_PWM        20      /* % reversing off the tape (no-line start) */
 #define BACKOFF_PAST_MM    8.0f    /* stop this far past the tape's edge */
@@ -193,8 +228,13 @@ static const char *const s_pos_name[4] = {
 	[POS_LOST] = "LOST"
 };
 static const char *const s_event_name[5] = {
-	"-", "JUNCTION", "narrow (barcode bar?)", "too wide", "unconfirmed"
+	"-", "JUNCTION",
+	LF_STRADDLE ? "narrow (both black too short)" : "narrow (barcode bar?)",
+	"too wide", "unconfirmed"
 };
+#if LF_STRADDLE
+static straddle_junction_t s_sj;
+#endif
 static const char *const s_action_name[5] = { "stop", "straight", "left", "right", "uturn" };
 
 static float absf(float v) { return v < 0.0f ? -v : v; }
@@ -251,11 +291,39 @@ static const char *f1(char *buf, float v)
 	return buf;
 }
 
+/* One sample to the junction detector in use; straddle events are mapped to
+ * the junction_detector ones so the logging and report are shared. */
+static junction_event_t detect(const ir_readings_t *ir, float d)
+{
+#if LF_STRADDLE
+	switch (sj_update(&s_sj, ir->center.black, ir->right.black, d)) {
+	case SJ_DETECTED: return JUNCTION_DETECTED;
+	case SJ_NARROW:   return JUNCTION_REJECT_NARROW;
+	default:          return JUNCTION_NONE;
+	}
+#else
+	return junction_detector_update(&s_det, ir->barcode.black, ir->center.black,
+					ir->right.black, d);
+#endif
+}
+
+static void detector_reset(void)
+{
+#if LF_STRADDLE
+	sj_reset(&s_sj, (float)JN_BOTH_MIN_MM);
+#else
+	junction_detector_reset(&s_det);
+#endif
+}
+
 static bool read_ir(line_adc_reader_t *reader, ir_readings_t *ir, uint8_t *pos)
 {
 	uint32_t ts;
 
 	if (line_adc_reader_read(reader, ir, &ts) != E_OK) return false;
+#if LF_STRADDLE
+	sl_hysteresis(ir);
+#endif
 	*pos = line_following_position(ir);
 	return true;
 }
@@ -313,18 +381,39 @@ static void log_event(junction_event_t e, float at_mm)
 	char b1[16], b2[16], b3[16];
 	float left_mm, both_mm;
 
+#if LF_STRADDLE
+	left_mm = 0.0f;
+	both_mm = s_sj.both_mm;
+#else
 	junction_detector_last(&s_det, &left_mm, &both_mm);
+#endif
 	s_kind_count[e]++;
 	if (s_event_count < MAX_EVENTS)
 		s_events[s_event_count++] = (event_log_t){ e, at_mm, left_mm, both_mm };
-	tm_printf((UB*)TAG "  >> %s at %s mm: left black %s mm, centre+right black %s mm "
-		  "in window\n", s_event_name[e], f1(b1, at_mm), f1(b2, left_mm), f1(b3, both_mm));
+	if (LF_STRADDLE)
+		tm_printf((UB*)TAG "  >> %s at %s mm: centre+right both black %s mm\n",
+			  s_event_name[e], f1(b1, at_mm), f1(b3, both_mm));
+	else
+		tm_printf((UB*)TAG "  >> %s at %s mm: left black %s mm, centre+right black %s mm "
+			  "in window\n", s_event_name[e], f1(b1, at_mm), f1(b2, left_mm),
+			  f1(b3, both_mm));
 }
 
 /* Distance travelled this run (mean of both wheels, forward-positive). */
 static float run_distance(float l, float r)
 {
 	return ((l - s_dist0_l) + (r - s_dist0_r)) * 0.5f;
+}
+
+/* Wheel targets from a speed/turn command; a wheel asked to stop or reverse
+ * (straddle pivot) is held at MIN_WHEEL_CM_S: the PID only drives forward. */
+static bool set_targets(line_steering_command_t c, float *left, float *right)
+{
+	*left = (float)(c.linear_cm_s - c.turn_cm_s);
+	*right = (float)(c.linear_cm_s + c.turn_cm_s);
+	if (*left < MIN_WHEEL_CM_S) *left = MIN_WHEEL_CM_S;
+	if (*right < MIN_WHEEL_CM_S) *right = MIN_WHEEL_CM_S;
+	return wheel_speed_control_set_targets(&s_pid, *left, *right);
 }
 
 /*
@@ -338,24 +427,32 @@ static end_t follow(line_adc_reader_t *reader, float max_mm, bool stop_at_juncti
 	const uint32_t timeout_ms =
 		4000U + (uint32_t)(2.0f * max_mm / ((float)SPEED * 10.0f) * 1000.0f);
 	line_steering_t steering;
+#if LF_STRADDLE
+	straddle_t straddle;
+#endif
 	line_steering_command_t cmd;
 	ir_readings_t ir;
 	uint8_t pos;
 	float l, r, l0, r0, pl, pr, prog_l = 0.0f, prog_r = 0.0f, sl = 0.0f, sr = 0.0f;
+	float tgt_l = (float)SPEED, tgt_r = (float)SPEED;
 	uint32_t t0, t, next_steer, next_pid, last_pid, prog_l_ms = 0U, prog_r_ms = 0U;
 	char b1[16], b2[16], b3[16];
 
 	if (!read_ir(reader, &ir, &pos)) return END_SENSOR;
-	if (pos == POS_LOST) return END_NOT_ON_LINE;
+	if (!LF_STRADDLE && pos == POS_LOST) return END_NOT_ON_LINE;
 	if (!read_mm(&l0, &r0)) return END_ENCODER;
 	pl = l0;
 	pr = r0;
 	line_steering_reset(&steering);
 	t0 = now_ms();
+#if LF_STRADDLE
+	sl_reset(&straddle, SPEED);
+	cmd = sl_update(&straddle, pos, t0);
+#else
 	cmd = line_steering_update(&steering, pos, t0);
+#endif
 	if (cmd.stop_latched || !wheel_speed_control_reset(&s_pid) ||
-	    !wheel_speed_control_set_targets(&s_pid, (float)(cmd.linear_cm_s - cmd.turn_cm_s),
-					     (float)(cmd.linear_cm_s + cmd.turn_cm_s)))
+	    !set_targets(cmd, &tgt_l, &tgt_r))
 		return END_PID;
 	s_out = (wheel_speed_output_t){ PID_BASE, PID_BASE };
 	next_steer = t0 + STEER_MS;
@@ -374,8 +471,7 @@ static end_t follow(line_adc_reader_t *reader, float max_mm, bool stop_at_juncti
 		d = run_distance(l, r);
 		leg = ((l - l0) + (r - r0)) * 0.5f;
 
-		e = junction_detector_update(&s_det, ir.barcode.black, ir.center.black,
-					     ir.right.black, d);
+		e = detect(&ir, d);
 		if (e != JUNCTION_NONE) {
 			log_event(e, d);
 			if (e == JUNCTION_DETECTED) {
@@ -389,24 +485,35 @@ static end_t follow(line_adc_reader_t *reader, float max_mm, bool stop_at_juncti
 		if (l - l0 < -WRONG_WAY_MM || r - r0 < -WRONG_WAY_MM) return END_WRONG_WAY;
 		if (absf((l - l0) - prog_l) >= STALL_MM) { prog_l = l - l0; prog_l_ms = t - t0; }
 		if (absf((r - r0) - prog_r) >= STALL_MM) { prog_r = r - r0; prog_r_ms = t - t0; }
+		/* The inner wheel of a straddle pivot is meant to stand still. */
+		if (tgt_l < STALL_EXEMPT_CM_S) prog_l_ms = t - t0;
+		if (tgt_r < STALL_EXEMPT_CM_S) prog_r_ms = t - t0;
 		if (t - t0 - prog_l_ms > STALL_MS || t - t0 - prog_r_ms > STALL_MS)
 			return END_STALL;
 		if (leg >= max_mm) return END_DIST;
 
 		if ((int32_t)(t - next_steer) >= 0) {
 			next_steer += STEER_MS;
+#if LF_STRADDLE
+			cmd = sl_update(&straddle, pos, t);
+#else
 			cmd = line_steering_update(&steering, pos, t);
+#endif
 			if (cmd.stop_latched) return END_LOST;
-			if (!wheel_speed_control_set_targets(&s_pid,
-					(float)(cmd.linear_cm_s - cmd.turn_cm_s),
-					(float)(cmd.linear_cm_s + cmd.turn_cm_s)))
-				return END_PID;
-			if (JN_TRACE)
+			if (!set_targets(cmd, &tgt_l, &tgt_r)) return END_PID;
+			if (JN_TRACE) {
+#if LF_STRADDLE
+				const char *state_name = sl_state_name(straddle.state);
+#else
+				const char *state_name = "";
+#endif
 				tm_printf((UB*)TAG "  %5u %-6s %+3d  L %4u C %4u R %4u  %6s mm  "
-					  "%s/%s cm/s\n", (unsigned)(t - t0), s_pos_name[pos & 3U],
-					  (int)cmd.turn_cm_s, (unsigned)ir.barcode.raw,
-					  (unsigned)ir.center.raw, (unsigned)ir.right.raw,
-					  f1(b1, d), f1(b2, sl), f1(b3, sr));
+					  "%s/%s cm/s  %s\n", (unsigned)(t - t0),
+					  s_pos_name[pos & 3U], (int)cmd.turn_cm_s,
+					  (unsigned)ir.barcode.raw, (unsigned)ir.center.raw,
+					  (unsigned)ir.right.raw, f1(b1, d), f1(b2, sl), f1(b3, sr),
+					  state_name);
+			}
 		}
 		if ((int32_t)(t - next_pid) >= 0) {
 			float dt = (float)(t - last_pid) / 1000.0f;
@@ -468,8 +575,7 @@ static end_t drive_straight(line_adc_reader_t *reader, float mm, bool from_rest,
 
 			if (!read_ir(reader, &ir, &pos)) return END_SENSOR;
 			d = run_distance(l, r);
-			e = junction_detector_update(&s_det, ir.barcode.black, ir.center.black,
-						     ir.right.black, d);
+			e = detect(&ir, d);
 			if (e != JUNCTION_NONE) {
 				log_event(e, d);
 				if (e == JUNCTION_DETECTED) {
@@ -533,7 +639,9 @@ static end_t back_off_tape(line_adc_reader_t *reader)
 		if (!read_mm(&l, &r)) { end = END_ENCODER; break; }
 		if (!read_ir(reader, &ir, &pos)) { end = END_SENSOR; break; }
 		back = -((l - l0) + (r - r0)) * 0.5f;
-		if (white_at < 0.0f && !ir.barcode.black) white_at = back;
+		if (white_at < 0.0f &&
+		    (LF_STRADDLE ? !ir.center.black && !ir.right.black : !ir.barcode.black))
+			white_at = back;
 		if (white_at >= 0.0f && back - white_at >= BACKOFF_PAST_MM) break;
 		if (go_pressed_raw()) { end = END_GO; break; }
 		if (back >= BACKOFF_MAX_MM) { end = END_BACKOFF; break; }
@@ -544,8 +652,8 @@ static end_t back_off_tape(line_adc_reader_t *reader)
 	(void)motor_brake_all();
 	tk_dly_tsk(SETTLE_MS);
 	if (end == END_DIST)
-		tm_printf((UB*)TAG "  backed off %s mm: left sensor now just before the tape\n",
-			  f1(b1, back));
+		tm_printf((UB*)TAG "  backed off %s mm: %s now just before the tape\n",
+			  f1(b1, back), LF_STRADDLE ? "line sensors" : "left sensor");
 	return end;
 }
 
@@ -570,6 +678,9 @@ static end_t spin(line_adc_reader_t *reader, float deg, float *done_deg)
 	float l0, r0, l, r, h = 0.0f, progress = 0.0f;
 	uint32_t t0, t, progress_ms = 0U;
 	end_t end = END_DIST;
+	/* Leading sensor for this spin: the centre (left) one spinning left. */
+	const bool gap_seek = LF_STRADDLE && (JN_SEEK_GAP == 2 || (JN_SEEK_GAP == 1 && dir > 0));
+	bool lead_seen = false;
 
 	*done_deg = 0.0f;
 	if (!read_mm(&l0, &r0)) return END_ENCODER;
@@ -585,7 +696,16 @@ static end_t spin(line_adc_reader_t *reader, float deg, float *done_deg)
 				uint8_t pos;
 
 				if (!read_ir(reader, &ir, &pos)) { end = END_SENSOR; break; }
-				if (ir.center.black || ir.right.black) break;   /* found it */
+				if (gap_seek) {
+					bool lead = dir > 0 ? ir.center.black : ir.right.black;
+					bool far = dir > 0 ? ir.right.black : ir.center.black;
+
+					if (far) break;                 /* past the gap: stop */
+					if (lead) lead_seen = true;
+					else if (lead_seen) break;      /* tape now in the gap */
+				} else if (ir.center.black || ir.right.black) {
+					break;                          /* found it */
+				}
 				if (h >= seek_to) { end = END_SEEK_FAIL; break; }
 				remaining = 0.0f;                              /* slow */
 			} else {
@@ -616,7 +736,9 @@ static const char *end_text(end_t e)
 	switch (e) {
 	case END_DIST:        return "distance reached";
 	case END_JUNCTION:    return "stopped at the junction";
-	case END_LOST:        return "LINE LOST > 300 ms";
+	case END_LOST:        return LF_STRADDLE ?
+				       "LINE LOST (straddle pivot/search found nothing)" :
+				       "LINE LOST > 300 ms";
 	case END_NOT_ON_LINE: return "NOT ON THE LINE (both line sensors white)";
 	case END_GO:          return "stopped by GO button";
 	case END_TIMEOUT:     return "timeout";
@@ -625,7 +747,9 @@ static const char *end_text(end_t e)
 	case END_ENCODER:     return "encoder INVALID";
 	case END_SENSOR:      return "IR ADC read failed";
 	case END_PID:         return "PID rejected its inputs";
-	case END_BACKOFF:     return "left sensor still black after backing off 80 mm";
+	case END_BACKOFF:     return LF_STRADDLE ?
+				       "a line sensor still black after backing off 80 mm" :
+				       "left sensor still black after backing off 80 mm";
 	case END_SEEK_FAIL:   return "turned past the target and the line sensors never found the line";
 	default:              return "?";
 	}
@@ -641,6 +765,28 @@ static void report(const junction_config_t *cfg, unsigned junctions)
 {
 	char b1[16], b2[16], b3[16];
 	unsigned i;
+
+#if LF_STRADDLE
+	(void)cfg;
+	(void)b2;
+	tm_printf((UB*)TAG "  both-black events: %u junction, %u narrow\n",
+		  s_kind_count[JUNCTION_DETECTED], s_kind_count[JUNCTION_REJECT_NARROW]);
+	for (i = 0U; i < s_event_count; i++)
+		tm_printf((UB*)TAG "    %2u. %-30s at %6s mm  both %5s mm\n", i + 1U,
+			  s_event_name[s_events[i].event], f1(b1, s_events[i].at_mm),
+			  f1(b3, s_events[i].both_mm));
+	if (junctions == 0U && s_kind_count[JUNCTION_REJECT_NARROW] != 0U)
+		tm_printf((UB*)TAG "  HINT: centre+right were black together but for less than "
+			  "%u mm. If that was the crossing, lower JN_BOTH_MIN_MM, or raise JN_GAP_MM "
+			  "(now %u) if the trace shows them flickering.\n",
+			  (unsigned)JN_BOTH_MIN_MM, (unsigned)JN_GAP_MM);
+	if (junctions == 0U && s_event_count == 0U)
+		tm_printf((UB*)TAG "  HINT: centre and right were never black together. Over the "
+			  "crossing tape both must read > %u; check the trace C/R columns and that "
+			  "the crossing tape spans both sensors.\n",
+			  (unsigned)LINE_ADC_LINE_BLACK_THRESHOLD);
+	return;
+#endif
 
 	tm_printf((UB*)TAG "  left-sensor events: %u junction, %u narrow, %u too wide, "
 		  "%u unconfirmed\n", s_kind_count[JUNCTION_DETECTED],
@@ -705,10 +851,17 @@ void junction_hwtest_run(void)
 
 	tm_printf((UB*)TAG "junction test: action %s, line following at %u cm/s (line_steering.h)\n",
 		  s_action_name[JN_ACTION], (unsigned)SPEED);
-	tm_printf((UB*)TAG "junction = left black %s..%s mm, then centre+right both black >= %s mm "
-		  "from %s mm after it (+/- %u mm)\n", f1(b1, jn_config.left_min_mm),
-		  f1(b2, jn_config.left_max_mm), f1(b3, jn_config.both_min_mm),
-		  f1(b4, jn_config.offset_mm), (unsigned)JN_TOL_MM);
+	if (LF_STRADDLE)
+		tm_printf((UB*)TAG "STRADDLE mode (test-only): straddle steering; junction = centre+"
+			  "right both black >= %u mm (gaps < %u mm bridged, re-armed after %u mm); "
+			  "left sensor not used\n", (unsigned)JN_BOTH_MIN_MM, (unsigned)JN_GAP_MM,
+			  (unsigned)JN_REARM_MM);
+	else
+		tm_printf((UB*)TAG "junction = left black %s..%s mm, then centre+right both black "
+			  ">= %s mm from %s mm after it (+/- %u mm)\n",
+			  f1(b1, jn_config.left_min_mm), f1(b2, jn_config.left_max_mm),
+			  f1(b3, jn_config.both_min_mm), f1(b4, jn_config.offset_mm),
+			  (unsigned)JN_TOL_MM);
 	if (JN_ACTION >= 2 && JN_SEEK)
 		tm_printf((UB*)TAG "turn: forward %u mm, then spin %s until a line sensor finds the "
 			  "line (looking from %u to %u deg), then follow %u mm\n",
@@ -722,7 +875,14 @@ void junction_hwtest_run(void)
 			  "then follow %u mm\n", (unsigned)JN_FORWARD_ACTION_MM,
 			  JN_ACTION == 4 ? "180" : (JN_ACTION == 2 ? "+90" : "-90"),
 			  (unsigned)JN_TURN_TRIM_DEG, (unsigned)JN_AFTER_MM);
-	tm_printf((UB*)TAG "simulate a + : lay a straight piece of tape ACROSS the line ahead\n");
+	if (LF_STRADDLE && JN_NO_LINE)
+		tm_printf((UB*)TAG "NO-LINE START (JN_NO_LINE=1): lay ONE tape across the mat, place "
+			  "the robot square to it up to %u mm before it; it drives straight to it, "
+			  "then does '%s'%s\n", (unsigned)JN_BLIND_MM, s_action_name[JN_ACTION],
+			  JN_ACTION == 2 || JN_ACTION == 3 ?
+			  " and follows the tape (needs ~JN_AFTER_MM of tape that side)" : "");
+	else
+		tm_printf((UB*)TAG "simulate a + : lay a straight piece of tape ACROSS the line ahead\n");
 
 	for (;;) {
 		unsigned junctions = 0U;
@@ -743,7 +903,7 @@ void junction_hwtest_run(void)
 		s_dist0_r = r;
 		s_event_count = 0U;
 		for (unsigned k = 0U; k < 5U; k++) s_kind_count[k] = 0U;
-		junction_detector_reset(&s_det);
+		detector_reset();
 		if (JN_TRACE)
 			tm_printf((UB*)TAG "   t_ms pos    turn  raw IR (black: L>%u, C/R>%u)   "
 				  "distance  L/R wheel\n", (unsigned)LINE_ADC_BARCODE_BLACK_THRESHOLD,
@@ -755,7 +915,7 @@ void junction_hwtest_run(void)
 
 			if (!read_ir(&reader, &ir0, &pos0)) {
 				end = END_SENSOR;
-			} else if (pos0 != POS_LOST) {
+			} else if (LF_STRADDLE ? !JN_NO_LINE : pos0 != POS_LOST) {
 				end = follow(&reader, (float)JN_RUN_MM, JN_ACTION != 1, &junctions);
 			} else {
 				/* No line under the line sensors: drive straight to the
@@ -765,11 +925,13 @@ void junction_hwtest_run(void)
 					  "to find the crossing (up to %u mm)\n", (unsigned)JN_BLIND_MM);
 				no_line = true;
 				end = END_DIST;
-				if (ir0.barcode.black) {
-					tm_printf((UB*)TAG "  left sensor starts ON the tape: backing off "
-						  "it first\n");
+				if (LF_STRADDLE ? ir0.center.black || ir0.right.black :
+						  ir0.barcode.black) {
+					tm_printf((UB*)TAG "  %s starts ON the tape: backing off "
+						  "it first\n", LF_STRADDLE ? "a line sensor" :
+						  "left sensor");
 					end = back_off_tape(&reader);
-					junction_detector_reset(&s_det);
+					detector_reset();
 				}
 				if (end == END_DIST)
 					end = drive_straight(&reader, (float)JN_BLIND_MM, true, true,
@@ -801,7 +963,11 @@ void junction_hwtest_run(void)
 				float want = JN_ACTION == 2 ? 90.0f : (JN_ACTION == 3 ? -90.0f : 180.0f);
 				/* No line behind in a no-line start: a U-turn spins a fixed
 				 * 180 and drives back across the same tape instead. */
-				const bool uturn_back = JN_ACTION == 4 && no_line;
+				/* Straddle: the sensors are ~JN_FORWARD_MM ahead of the axle,
+				 * so after forward + 180 the crossing tape is under the
+				 * axle and driving "back" never crosses it again. A U-turn
+				 * there seeks the line behind instead (lay a stem). */
+				const bool uturn_back = JN_ACTION == 4 && no_line && !LF_STRADDLE;
 				const bool seek = JN_SEEK && !uturn_back;
 
 				end = drive_straight(NULL, (float)JN_FORWARD_ACTION_MM, false, false,
@@ -821,13 +987,20 @@ void junction_hwtest_run(void)
 						tm_printf((UB*)TAG "  spin: wanted %s deg, encoders say %s "
 							  "deg -- compare with the real angle\n",
 							  f1(b1, want), f1(b2, done));
-					if (end == END_SEEK_FAIL)
-						tm_printf((UB*)TAG "  HINT: %s\n", JN_ACTION == 4 ?
-							  "expected after a U-turn when there is no line "
-							  "behind (single crossing tape)." :
-							  "the sensors never crossed the new line: the wheels "
-							  "were too far from it when spinning -- adjust "
-							  "JN_FORWARD_MM / JN_FORWARD_RIGHT_MM.");
+					if (end == END_SEEK_FAIL) {
+						if (JN_ACTION == 4 && LF_STRADDLE && no_line)
+							tm_printf((UB*)TAG "  HINT: a U-turn looks for the line "
+								  "BEHIND. Lay a strip of tape along the approach "
+								  "(a T with the crossing tape), with the robot "
+								  "straddling it at the start.\n");
+						else
+							tm_printf((UB*)TAG "  HINT: %s\n", JN_ACTION == 4 ?
+								  "expected after a U-turn when there is no line "
+								  "behind (single crossing tape)." :
+								  "the sensors never crossed the new line: the "
+								  "wheels were too far from it when spinning -- "
+								  "adjust JN_FORWARD_MM / JN_FORWARD_RIGHT_MM.");
+					}
 				}
 				if (end == END_DIST && uturn_back) {
 					/* Check the U-turn: heading back, the robot must cross
@@ -839,7 +1012,7 @@ void junction_hwtest_run(void)
 					if (read_mm(&l, &r)) d0 = run_distance(l, r);
 					tm_printf((UB*)TAG "  driving back to cross the same tape again (up to "
 						  "%s mm)\n", f1(b1, limit));
-					junction_detector_reset(&s_det);
+					detector_reset();
 					end = drive_straight(&reader, limit, true, true, &back);
 					(void)motor_brake_all();
 					tk_dly_tsk(SETTLE_MS);
@@ -863,7 +1036,7 @@ void junction_hwtest_run(void)
 							  "right %u -> %s\n", (unsigned)ir.barcode.raw,
 							  (unsigned)ir.center.raw, (unsigned)ir.right.raw,
 							  s_pos_name[pos & 3U]);
-					junction_detector_reset(&s_det);
+					detector_reset();
 					end = follow(&reader, (float)JN_AFTER_MM, false, &junctions);
 					if (end == END_NOT_ON_LINE && JN_ACTION == 4)
 						tm_printf((UB*)TAG "  no line after the U-turn: expected "

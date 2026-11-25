@@ -84,6 +84,29 @@ static BOOL hump_confirm_test(void)
 	return ok;
 }
 
+/* With a tilt confirmation time, a jolt shorter than it is not a tilt; a
+ * lift held for it is. */
+static BOOL tilt_confirm_test(void)
+{
+	imu_state_t state;
+	const accel_data_t flat = {.az = GRAVITY_MS2};
+	const accel_data_t jolt = {.az = 5.0f};   /* below OVERTURN_MIN_AZ */
+	BOOL ok;
+
+	ok = imu_processor_init(&state);
+	state.tilt_confirm_ms = 200U;
+	ok = imu_processor_update(&state, &flat, 0.0f, 0U) && ok;
+	ok = imu_processor_update(&state, &jolt, 0.0f, 50U) && !state.tilt_detected && ok;
+	ok = imu_processor_update(&state, &jolt, 0.0f, 150U) && !state.tilt_detected && ok;
+	ok = imu_processor_update(&state, &flat, 0.0f, 200U) && !state.tilt_detected &&
+	     !state.tilt_candidate && ok;        /* a 100 ms jolt: no tilt */
+	ok = imu_processor_update(&state, &jolt, 0.0f, 300U) && !state.tilt_detected && ok;
+	ok = imu_processor_update(&state, &jolt, 0.0f, 499U) && !state.tilt_detected && ok;
+	ok = imu_processor_update(&state, &jolt, 0.0f, 500U) && state.tilt_detected &&
+	     state.fsm_state == IMU_STATE_TILT && ok;
+	return ok;
+}
+
 static BOOL pickup_tilt_test(void)
 {
 	imu_state_t state;
@@ -557,6 +580,7 @@ BOOL imu_processor_test(void)
 	BOOL reader_ok;
 	BOOL level_filter_ok;
 	BOOL hump_confirm_ok;
+	BOOL tilt_confirm_ok;
 	TEST_INIT();
 
 	terrain_ok = terrain_test();
@@ -569,6 +593,7 @@ BOOL imu_processor_test(void)
 	reader_ok = accel_reader_test();
 	level_filter_ok = level_filter_test();
 	hump_confirm_ok = hump_confirm_test();
+	tilt_confirm_ok = tilt_confirm_test();
 	TEST_CHECK("IMU-U01", terrain_ok, "flat, ramp and hump transitions");
 	TEST_CHECK("IMU-U02", safety_ok, "tilt and invalid samples");
 	TEST_CHECK("IMU-U09", pickup_tilt_ok, "pickup roll, low vertical acceleration; tilt clears after IMU_TILT_CLEAR_MS level");
@@ -579,9 +604,10 @@ BOOL imu_processor_test(void)
 	TEST_CHECK("IMU-U08", reader_ok, "fresh accelerometer transfer and fault latch");
 	TEST_CHECK("IMU-U11", level_filter_ok, "level calibration offset and terrain pitch filter");
 	TEST_CHECK("IMU-U13", hump_confirm_ok, "a brief tilt is not a hump; one held for hump_confirm_ms is");
+	TEST_CHECK("IMU-U14", tilt_confirm_ok, "a jolt shorter than tilt_confirm_ms is not a lift; one held for it is");
 	TEST_SUMMARY("imu");
 	return terrain_ok && safety_ok && pickup_tilt_ok && hump_height_ok &&
 	       clock_ok && producer_ok && accel_ok && reader_ok && level_filter_ok &&
-	       hump_confirm_ok;
+	       hump_confirm_ok && tilt_confirm_ok;
 }
 #endif

@@ -121,6 +121,55 @@ static BOOL slope_profile_test(void)
 	return ok;
 }
 
+/* Lost on a hump: straight at the slope speed with no stop until the cap;
+ * the line seen again steers at once; the hump ending while still lost
+ * gives the normal 300 ms (straight) then the stop. */
+static BOOL slope_lost_test(void)
+{
+	const int16_t sspeed = line_steering_slope.speed_cm_s;
+	line_steering_t s;
+	line_steering_command_t c;
+	BOOL ok;
+
+	/* Turning right when the line goes on the hump: straight, not the turn. */
+	line_steering_reset(&s);
+	line_steering_set_slope(&s, true);
+	(void)line_steering_update(&s, POS_RIGHT, 1000U);
+	c = line_steering_update(&s, POS_RIGHT, 1100U);
+	ok = c.turn_cm_s < 0;
+	c = line_steering_update(&s, POS_LOST, 1150U);
+	ok = is_cmd(c, sspeed, 0) && ok;
+	c = line_steering_update(&s, POS_LOST, 1150U + 1000U);   /* past 300 ms: no stop */
+	ok = is_cmd(c, sspeed, 0) && ok;
+	/* Line again: steers at once (a new side starts at the minimum). */
+	c = line_steering_update(&s, POS_LEFT, 2200U);
+	ok = c.turn_cm_s > 0 && !c.stop_latched && ok;
+
+	/* Cap: blind for LINE_STEERING_SLOPE_LOST_MAX_MS, then the stop. */
+	c = line_steering_update(&s, POS_LOST, 3000U);
+	ok = is_cmd(c, sspeed, 0) && ok;
+	c = line_steering_update(&s, POS_LOST, 3000U + LINE_STEERING_SLOPE_LOST_MAX_MS - 1U);
+	ok = is_cmd(c, sspeed, 0) && ok;
+	c = line_steering_update(&s, POS_LOST, 3000U + LINE_STEERING_SLOPE_LOST_MAX_MS);
+	ok = is_stop(c) && ok;
+
+	/* Hump ends while still lost: 300 ms straight from then, then the stop. */
+	line_steering_reset(&s);
+	line_steering_set_slope(&s, true);
+	(void)line_steering_update(&s, POS_RIGHT, 5000U);
+	(void)line_steering_update(&s, POS_LOST, 5050U);
+	c = line_steering_update(&s, POS_LOST, 5500U);
+	ok = is_cmd(c, sspeed, 0) && ok;
+	line_steering_set_slope(&s, false);
+	c = line_steering_update(&s, POS_LOST, 5550U);
+	ok = is_cmd(c, sspeed, 0) && ok;                 /* straight, not a turn */
+	c = line_steering_update(&s, POS_LOST, 5500U + 299U);
+	ok = !c.stop_latched && ok;
+	c = line_steering_update(&s, POS_LOST, 5500U + 300U);
+	ok = is_stop(c) && ok;
+	return ok;
+}
+
 BOOL line_steering_test(void)
 {
 	line_steering_t steering = {0};
@@ -131,6 +180,7 @@ BOOL line_steering_test(void)
 	BOOL invalid_position_ok;
 	BOOL ramp_ok;
 	BOOL slope_ok;
+	BOOL slope_lost_ok;
 	TEST_INIT();
 
 	line_steering_reset(&steering);
@@ -144,14 +194,22 @@ BOOL line_steering_test(void)
 	TEST_CHECK("VC-U18", positions_ok,
 		   "junction, left and right positions map to straight, left and right speed commands");
 
+	/* Lost 10 ms after a right sighting: keeps turning right and keeps
+	 * building (10 ms more), not a jump to full and not straight. */
 	command = line_steering_update(&steering, POS_LOST, 1030U);
-	lost_line_ok = is_cmd(command, SPEED, -TMIN);
+	lost_line_ok = is_cmd(command, SPEED,
+			      (int16_t)-line_steering_ramp_turn(&line_steering_normal, 10U));
+	/* Held lost for longer, it builds further (towards full). */
+	command = line_steering_update(&steering, POS_LOST, 1130U);
+	lost_line_ok = is_cmd(command, SPEED,
+			      (int16_t)-line_steering_ramp_turn(&line_steering_normal, 110U)) &&
+		       lost_line_ok;
 	command = line_steering_update(&steering, POS_LOST, 1329U);
 	lost_line_ok = !command.stop_latched && lost_line_ok;
 	command = line_steering_update(&steering, POS_LOST, 1330U);
 	lost_line_ok = is_stop(command) && lost_line_ok;
 	TEST_CHECK("VC-U19", lost_line_ok,
-		   "lost-line hold expires at 300 ms with a zero-output latch");
+		   "lost line keeps turning and building towards the last-seen side; the hold expires at 300 ms with a zero-output latch");
 
 	command = line_steering_update(&steering, POS_JUNCTION, 1400U);
 	latch_ok = is_stop(command);
@@ -177,8 +235,12 @@ BOOL line_steering_test(void)
 	TEST_CHECK("VC-U25", slope_ok,
 		   "SLOPE profile uses its own speed and turn range, switches at run time, reset returns to NORMAL");
 
+	slope_lost_ok = slope_lost_test();
+	TEST_CHECK("VC-U29", slope_lost_ok,
+		   "lost on a hump drives straight without stopping (capped), steers again on the line, normal stop after the hump");
+
 	TEST_SUMMARY("line steering");
 	return positions_ok && lost_line_ok && latch_ok && invalid_position_ok && ramp_ok &&
-	       slope_ok;
+	       slope_ok && slope_lost_ok;
 }
 #endif

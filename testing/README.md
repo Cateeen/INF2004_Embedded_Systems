@@ -112,18 +112,10 @@ or physical scan angles.
    Start the command first, then reset the Pico. Press Ctrl-C when it is done.
    On Windows with PuTTY, use *Session → Logging → All session output*.
    For manual tests, save photos or scope screenshots in `logs/` the same way
-   (keep each file under a few MB). Videos go in `videos/` instead (see below).
+   (keep each file under a few MB).
 5. **Record the result.** Add a row to the *Results* table: date, test ID,
    the commit you tested (`git rev-parse --short HEAD`), who ran it,
    PASS/FAIL, and the log file. Commit the log and the table together.
-
-## Videos of tests and demos
-
-A manual test (an LED, a motor, a sensor reacting) is best shown with a short
-video. Record 15–60 s showing the test ID and the hardware, share it as an
-**unlisted YouTube** link (the only way videos are shared), list it in
-**`videos/README.md`**, and put the link in the *Log / evidence* column of
-the test's result row. `videos/README.md` explains how.
 
 ## Rules
 
